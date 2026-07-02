@@ -49,6 +49,7 @@ from bernstein.core.agents.spawner_sandbox_session import (
     write_prompt_to_session,
 )
 from bernstein.core.agents.spawner_warm_pool import (
+    _CLAUDE_TIER_MODELS,
     _coerce_model_for_non_claude_adapter,
     _select_batch_config,
     _should_use_router,
@@ -672,13 +673,25 @@ def _render_prompt(
 
     # Use catalog system prompt when available (Agency specialist prompt),
     # otherwise fall back to role template or built-in default.
-    if catalog_system_prompt:
+    #
+    # The manager role is exempt from this substitution even if a catalog
+    # system prompt is set: templates/roles/manager.md carries the
+    # task-server task-creation instructions (POST /tasks schema, decomposition
+    # steps) that no catalog persona defines. Letting a catalog prompt replace
+    # the manager template silently breaks decomposition - the manager agent
+    # would have a persona but no idea how to create child tasks.
+    if catalog_system_prompt and role != "manager":
         role_prompt = catalog_system_prompt
     else:
         try:
             role_prompt = render_role_prompt(role, context, templates_dir=templates_dir)
         except (FileNotFoundError, TemplateError) as exc:
-            logger.debug("Template render failed for role %s, using fallback: %s", role, exc)
+            logger.warning(
+                "Template render failed for role %s (templates_dir=%s), using fallback: %s",
+                role,
+                templates_dir,
+                exc,
+            )
             role_prompt = _render_fallback(role, templates_dir, agency_catalog)
 
     sdd_dir = workdir / ".sdd"
@@ -857,8 +870,15 @@ class AgentSpawner:
         warm_pool: WarmPool | None = None,
         spawn_rate_limiter: SpawnRateLimiter | None = None,
         sandbox_session: SandboxSession | None = None,
+        default_model: str | None = None,
     ) -> None:
         self._enable_caching = enable_caching
+        # Run-level model (e.g. from ``bernstein run --model``), threaded in by
+        # the orchestrator from the CLI flag / seed config. Used to coerce
+        # Claude tier names (opus/sonnet/haiku) emitted by the heuristic
+        # selector into a model the active non-Claude adapter actually
+        # understands - see ``_coerce_model_for_non_claude_adapter``.
+        self._default_model = default_model
         self._resource_limits = resource_limits
         self._adapter_cache: dict[str, CLIAdapter] = {}
         if enable_caching:
@@ -1804,20 +1824,49 @@ class AgentSpawner:
         # the model recorded here matches what the adapter actually runs (e.g.
         # Codex gets gpt-5.4, not `codex exec -m opus`). Claude-compatible
         # adapters are returned unchanged.
-        if provider_name is None and not tasks[0].model and not role_policy.get("model"):
+        #
+        # ``tasks[0].model`` is normally an operator pin and must be left
+        # alone. But retry escalation (see defaults.py's escalation map) and
+        # manager-created child tasks both stamp internal Claude tier names
+        # ("opus"/"sonnet"/"haiku") onto ``task.model`` - those are not
+        # operator pins, they're meaningless tier labels for a non-Claude
+        # adapter. Treat a tier-named ``tasks[0].model`` as coercible too;
+        # any other value (e.g. "MiniMax-M3") is a genuine pin and is left
+        # untouched.
+        #
+        # Exception: callers that explicitly pin a tier name as a genuine
+        # comparison point (e.g. ``bernstein ab-test --model-a opus
+        # --model-b sonnet``) stamp ``metadata["pinned_model"] = True`` on
+        # the task. Coercing both sides of an A/B test to the same adapter
+        # default would silently collapse the comparison into A-vs-A, so
+        # honor the pin and skip coercion. ``metadata`` may be ``None`` on
+        # older/partial Task constructions.
+        task_metadata = tasks[0].metadata or {}
+        task_model_is_pinned = bool(task_metadata.get("pinned_model"))
+        task_model_is_tier_name = tasks[0].model in _CLAUDE_TIER_MODELS
+        if (
+            provider_name is None
+            and not role_policy.get("model")
+            and (not tasks[0].model or task_model_is_tier_name)
+            and not task_model_is_pinned
+        ):
             model_config = _coerce_model_for_non_claude_adapter(
                 model_config,
                 adapter_name=self._adapter.name(),
-                adapter_default_model=getattr(self._adapter, "default_model", None),
+                adapter_default_model=self._default_model or getattr(self._adapter, "default_model", None),
             )
 
         logger.info(
-            "Model selection for role=%s: model=%s effort=%s provider=%s source=%s",
+            "Model selection for role=%s: model=%s effort=%s provider=%s source=%s "
+            "role_policy_model=%s task_model=%s base_config_model=%s",
             tasks[0].role,
             model_config.model,
             model_config.effort,
             provider_name or self._adapter.name(),
             routing_source,
+            role_policy.get("model"),
+            tasks[0].model,
+            base_config.model,
         )
 
         provider_for_rate_limit = provider_name or self._adapter.name()
@@ -2781,6 +2830,27 @@ class AgentSpawner:
             adapter=adapter,
         )
 
+        # 2b) Forward API keys to the sandbox so adapters can authenticate.
+        #     IMPORTANT: do NOT use build_filtered_env() here -- it copies
+        #     PATH and other host-specific vars that OVERRIDE the container's
+        #     own env when passed to Docker exec_run(environment=...).
+        #     Only forward the specific API keys the adapter needs.
+        import os as _os
+
+        adapter_name_lc = adapter.name().lower()
+        _env_keys: list[str] = []
+        if "claude" in adapter_name_lc:
+            _env_keys.append("ANTHROPIC_API_KEY")
+        elif "gemini" in adapter_name_lc:
+            _env_keys.extend(["GOOGLE_API_KEY", "GEMINI_API_KEY"])
+        else:
+            # OpenAI-compatible adapters (codex, qwen, generic) only.
+            # Claude/Gemini sandboxes must not receive OpenAI credentials
+            # they never use (least-privilege, same per-adapter gating as
+            # the legacy container env allowlists).
+            _env_keys.extend(["OPENAI_API_KEY", "OPENAI_BASE_URL"])
+        sandbox_env = {k: v for k in _env_keys if (v := _os.environ.get(k)) is not None}
+
         # 3) Submit the exec on a dedicated thread; the future drives
         #    liveness checks via SandboxSession-aware paths.
         handle = submit_session_exec(
@@ -2788,6 +2858,8 @@ class AgentSpawner:
             cmd=cmd,
             session_id=session_id,
             log_path=log_path,
+            env=sandbox_env,
+            workdir=self._workdir,
         )
         self._sandbox_exec_handles[session_id] = handle
 
@@ -2836,6 +2908,8 @@ class AgentSpawner:
         Returns:
             Command argument list.
         """
+        import shlex
+
         _ = prompt_file  # Part of interface; container path is reconstructed from session_id
         _ = mcp_config  # Part of interface; not used in container command
         # Map container path: host workspace is mounted at /workspace
@@ -2844,23 +2918,55 @@ class AgentSpawner:
         # Build a generic shell command that reads the prompt and pipes it
         # to the adapter CLI. This works across all adapters.
         adapter_name = adapter.name().lower()
+
+        # Resolve the actual CLI binary name. adapter.name() may return a
+        # display name like "Qwen CLI" which is not a valid command. Map
+        # known adapters to their binary names.
+        _ADAPTER_BINARY_MAP: dict[str, str] = {
+            "qwen cli": "qwen",
+            "claude code": "claude",
+            "codex cli": "codex",
+            "gemini cli": "gemini",
+            "aider": "aider",
+        }
+        cli_binary = _ADAPTER_BINARY_MAP.get(adapter_name, adapter_name.split()[0])
+
+        # Shell-quote every interpolated value. ``model`` and the role
+        # segment of ``session_id`` originate from task-server payloads
+        # (length-checked only), so unquoted interpolation into ``sh -c``
+        # would let a crafted task run arbitrary commands at container
+        # startup, outside the adapter's own tool-approval gate.
+        q_prompt = shlex.quote(container_prompt)
+        q_model = shlex.quote(str(model_config.model))
+        q_effort = shlex.quote(str(model_config.effort))
+        q_binary = shlex.quote(cli_binary)
+
         if "claude" in adapter_name:
             cmd = [
                 "sh",
                 "-c",
-                f"claude --model {model_config.model} "
-                f"--effort {model_config.effort} "
+                f"claude --model {q_model} "
+                f"--effort {q_effort} "
                 f"--max-turns 50 "
                 f"--dangerously-skip-permissions "
                 f"--output-format stream-json "
-                f'-p "$(cat {container_prompt})"',
+                f'-p "$(cat {q_prompt})"',
+            ]
+        elif "qwen" in adapter_name:
+            # Qwen CLI uses positional arg for prompt, -y for auto-approve.
+            # Inside containers, --auth-type openai is required because the
+            # default qwen auth config is not present.
+            cmd = [
+                "sh",
+                "-c",
+                f'{q_binary} -y --auth-type openai --model {q_model} "$(cat {q_prompt})"',
             ]
         else:
             # Generic: assume the adapter CLI reads from stdin or -p flag
             cmd = [
                 "sh",
                 "-c",
-                f'cat {container_prompt} | {adapter_name} -p "$(cat {container_prompt})"',
+                f'cat {q_prompt} | {q_binary} -p "$(cat {q_prompt})"',
             ]
         return cmd
 

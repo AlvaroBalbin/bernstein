@@ -571,6 +571,122 @@ class TestSpawnerWithRouter:
         assert adapter.spawn.call_count == 1
 
 
+# --- Non-Claude adapter model coercion guard (issue: MiniMax-M3 child tasks) ---
+#
+# The heuristic/batch selector and retry escalation stamp Claude tier names
+# (opus/sonnet/haiku) onto ``task.model``. For a non-Claude adapter that value
+# must be coerced to the run's actual model, not passed through literally
+# (e.g. the qwen adapter would send ``-m opus`` straight to the MiniMax API).
+# Genuine operator pins (any model name that isn't a Claude tier name) must
+# still be respected untouched.
+
+
+class TestNonClaudeAdapterModelCoercionGuard:
+    def test_tier_named_task_model_coerced_for_non_claude_adapter(
+        self, tmp_path: Path, make_task, mock_adapter_factory
+    ) -> None:
+        """A manager-stamped/retry-escalated tier name ('opus') on task.model
+        must not reach a non-Claude adapter literally - it should be coerced
+        to the run's resolved default_model."""
+        templates_dir = tmp_path / "templates" / "roles"
+        templates_dir.mkdir(parents=True)
+
+        adapter = mock_adapter_factory(pid=42)
+        adapter.name.return_value = "qwen"
+
+        spawner = AgentSpawner(
+            adapter,
+            templates_dir,
+            tmp_path,
+            use_worktrees=False,
+            default_model="MiniMax-M3",
+        )
+
+        task = make_task()
+        task.model = "opus"
+        session = spawner.spawn_for_tasks([task])
+
+        assert session.model_config.model == "MiniMax-M3"
+
+    def test_genuine_model_pin_left_untouched_for_non_claude_adapter(
+        self, tmp_path: Path, make_task, mock_adapter_factory
+    ) -> None:
+        """A real operator/task model pin that is NOT a Claude tier name must
+        never be coerced, even when a run-level default_model is set."""
+        templates_dir = tmp_path / "templates" / "roles"
+        templates_dir.mkdir(parents=True)
+
+        adapter = mock_adapter_factory(pid=42)
+        adapter.name.return_value = "qwen"
+
+        spawner = AgentSpawner(
+            adapter,
+            templates_dir,
+            tmp_path,
+            use_worktrees=False,
+            default_model="MiniMax-M3",
+        )
+
+        task = make_task()
+        task.model = "MiniMax-Text-01"
+        session = spawner.spawn_for_tasks([task])
+
+        assert session.model_config.model == "MiniMax-Text-01"
+
+    def test_claude_adapter_unaffected_by_tier_name_guard(
+        self, tmp_path: Path, make_task, mock_adapter_factory
+    ) -> None:
+        """Claude-compatible adapters must see tier names unchanged - the
+        guard extension must be a no-op on the Claude path."""
+        templates_dir = tmp_path / "templates" / "roles"
+        templates_dir.mkdir(parents=True)
+
+        adapter = mock_adapter_factory(pid=42)
+        adapter.name.return_value = "claude"
+
+        spawner = AgentSpawner(
+            adapter,
+            templates_dir,
+            tmp_path,
+            use_worktrees=False,
+            default_model="MiniMax-M3",
+        )
+
+        task = make_task()
+        task.model = "opus"
+        session = spawner.spawn_for_tasks([task])
+
+        assert session.model_config.model == "opus"
+
+    def test_pinned_tier_named_model_left_untouched_for_non_claude_adapter(
+        self, tmp_path: Path, make_task, mock_adapter_factory
+    ) -> None:
+        """A tier-named task.model with metadata['pinned_model']=True (e.g.
+        an A/B test comparing 'opus' vs 'sonnet') must not be coerced to the
+        adapter's single default model - doing so would collapse both sides
+        of the comparison onto the same model."""
+        templates_dir = tmp_path / "templates" / "roles"
+        templates_dir.mkdir(parents=True)
+
+        adapter = mock_adapter_factory(pid=42)
+        adapter.name.return_value = "qwen"
+
+        spawner = AgentSpawner(
+            adapter,
+            templates_dir,
+            tmp_path,
+            use_worktrees=False,
+            default_model="MiniMax-M3",
+        )
+
+        task = make_task()
+        task.model = "opus"
+        task.metadata = {"pinned_model": True}
+        session = spawner.spawn_for_tasks([task])
+
+        assert session.model_config.model == "opus"
+
+
 # --- _render_prompt with agency_catalog ---
 
 
@@ -1089,6 +1205,35 @@ class TestRenderPromptWithCatalogSystemPrompt:
         assert "backend-abc123" in prompt
         assert "SHUTDOWN" in prompt
 
+    def test_manager_role_ignores_catalog_system_prompt(self, tmp_path: Path, make_task) -> None:
+        """A catalog_system_prompt must never replace the manager role template.
+
+        Only the manager template contains the task-server task-creation
+        instructions (POST /tasks). No catalog persona defines these, so
+        letting a catalog prompt win for role="manager" would silently break
+        decomposition - the manager would have a persona but no idea how to
+        create child tasks.
+        """
+        # A real manager template with a sentinel line proves the template
+        # itself is rendered; asserting only on the completion-curl block
+        # would pass even with the generic fallback (the block is appended
+        # to every prompt regardless of template resolution).
+        manager_dir = tmp_path / "manager"
+        manager_dir.mkdir()
+        (manager_dir / "system_prompt.md").write_text(
+            "MANAGER-TEMPLATE-SENTINEL\nCreate child tasks via POST /tasks.\n",
+            encoding="utf-8",
+        )
+        task = make_task(role="manager", title="Decompose the goal")
+        prompt = _render_prompt(
+            [task],
+            tmp_path,
+            tmp_path,
+            catalog_system_prompt="You are the Agency project-manager persona.",
+        )
+        assert "You are the Agency project-manager persona." not in prompt
+        assert "MANAGER-TEMPLATE-SENTINEL" in prompt
+
 
 # --- AgentSpawner.spawn_for_tasks with CatalogRegistry ---
 
@@ -1219,3 +1364,29 @@ class TestSpawnForTasksWithCatalog:
         session = spawner.spawn_for_tasks([task])
 
         assert session.agent_source == "built-in"
+
+
+# --- Regression: orchestrator call site passes templates/roles/ (issue #2155) ---
+
+
+class TestOrchestratorSpawnerCallSite:
+    """The one production AgentSpawner construction must pass templates/roles/.
+
+    The original bug: the orchestrator passed the templates *root* where
+    AgentSpawner's whole internal contract expects the ``roles/`` directory,
+    so every role template lookup raised FileNotFoundError and silently fell
+    back to the generic prompt. A static source assertion is the cheapest
+    net that survives refactors of either side independently.
+    """
+
+    def test_orchestrator_appends_roles_to_templates_dir(self) -> None:
+        from pathlib import Path as _RuntimePath
+
+        import bernstein.core.orchestration.orchestrator as orch_mod
+
+        source = _RuntimePath(orch_mod.__file__).read_text(encoding="utf-8")
+        assert 'templates_dir=get_templates_dir(workdir) / "roles"' in source, (
+            "orchestrator must pass templates/roles/ to AgentSpawner "
+            "(templates root breaks every role template lookup; see #2155)"
+        )
+        assert "templates_dir=get_templates_dir(workdir),\n            adapter" not in source

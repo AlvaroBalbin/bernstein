@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 from bernstein.core.ab_test import (
     ABTestConfig,
     ABTestReport,
     ABTestResult,
+    _create_task,
     determine_winner,
 )
 
@@ -318,3 +321,61 @@ class TestABTestResult:
         assert r.passed is False
         assert r.quality_passed is False
         assert r.status == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _create_task - server payload construction
+# ---------------------------------------------------------------------------
+
+
+class TestCreateTaskPinnedModel:
+    """Tasks created by an A/B test must mark their model as pinned so the
+    non-Claude-adapter tier-coercion guard in spawner_core.py doesn't
+    collapse both variants onto the same model."""
+
+    def test_created_task_payload_marks_model_pinned(self) -> None:
+        client = MagicMock()
+        client.post.return_value.json.return_value = {"id": "task-123"}
+        client.post.return_value.raise_for_status.return_value = None
+
+        task_id = _create_task(client, "http://server", _CONFIG, "test-id", "a", "opus")
+
+        assert task_id == "task-123"
+        _, kwargs = client.post.call_args
+        payload = kwargs["json"]
+        assert payload["metadata"]["pinned_model"] is True
+        assert payload["metadata"]["ab_test_id"] == "test-id"
+        assert payload["metadata"]["ab_variant"] == "a"
+        assert payload["model"] == "opus"
+
+
+class TestPinnedModelRoundTrip:
+    """metadata must survive server JSON -> Task.from_dict.
+
+    The pinned-model guard in the spawner reads
+    ``task.metadata["pinned_model"]``; if from_dict drops metadata the
+    guard is dead in production and both A/B variants collapse onto the
+    same coerced model.
+    """
+
+    def test_from_dict_preserves_metadata(self) -> None:
+        from bernstein.core.tasks.models import Task
+
+        raw = {
+            "id": "T-42",
+            "title": "variant a",
+            "description": "ab test task",
+            "role": "backend",
+            "model": "opus",
+            "metadata": {"pinned_model": True, "ab_test_id": "test-1", "ab_variant": "a"},
+        }
+        task = Task.from_dict(raw)
+        assert task.metadata["pinned_model"] is True
+        assert task.metadata["ab_test_id"] == "test-1"
+
+    def test_from_dict_defaults_metadata_to_empty_dict(self) -> None:
+        from bernstein.core.tasks.models import Task
+
+        raw = {"id": "T-43", "title": "t", "description": "d", "role": "qa"}
+        task = Task.from_dict(raw)
+        assert task.metadata == {}
