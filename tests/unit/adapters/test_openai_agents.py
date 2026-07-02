@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+import threading
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from bernstein.core.models import ApiTier, ModelConfig, ProviderType
 
 from bernstein.adapters import openai_agents as adapter_module
+from bernstein.adapters import openai_agents_runner as runner_module
 from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
 from bernstein.adapters.openai_agents_runner import (
     EXIT_GENERIC,
@@ -21,19 +24,23 @@ from bernstein.adapters.openai_agents_runner import (
     EXIT_SDK_MISSING,
     RunnerManifest,
     _build_agent_kwargs,
+    _build_model_settings_kwargs,
     _build_run_config,
     _is_rate_limit,
+    _resolve_client_kwargs,
+    _resolve_heartbeat_dir,
+    _start_heartbeat,
     emit_event,
     load_manifest,
     main,
     run,
+    validate_api_key_env_name,
 )
-from bernstein.adapters.plugin_sdk import AdapterCapability
+from bernstein.adapters.plugin_sdk import (
+    AdapterCapability,
+    ensure_sampling_params_supported,
+)
 from bernstein.adapters.registry import get_adapter
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,6 +82,13 @@ class TestPluginInfo:
         assert AdapterCapability.MULTI_MODEL in info.capabilities
         assert AdapterCapability.RATE_LIMIT_DETECTION in info.capabilities
         assert AdapterCapability.STRUCTURED_OUTPUT in info.capabilities
+        assert AdapterCapability.SUPPORTS_SAMPLING_PARAMS in info.capabilities
+
+    def test_sampling_gate_passes_for_openai_agents(self) -> None:
+        ensure_sampling_params_supported(
+            OpenAIAgentsAdapter(),
+            {"temperature": 0.5, "base_url": "http://localhost:8000/v1"},
+        )
 
     def test_display_name(self) -> None:
         assert OpenAIAgentsAdapter().name() == "OpenAI Agents SDK"
@@ -215,6 +229,155 @@ class TestSpawnCommand:
         assert manifest["sandbox_provider"] == "e2b"
         assert manifest["tools"] == [{"name": "file_read"}]
 
+    def test_manifest_includes_sampling_overrides(self, tmp_path: Path) -> None:
+        adapter = OpenAIAgentsAdapter()
+        proc_mock = _make_popen_mock(pid=1007)
+        with patch(
+            "bernstein.adapters.openai_agents.subprocess.Popen",
+            return_value=proc_mock,
+        ):
+            adapter.spawn(
+                prompt="run tests",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5", effort="high"),
+                session_id="oai-s6",
+                mcp_config={
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                    "base_url": "http://localhost:8000/v1",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                },
+            )
+        manifest = json.loads(
+            (tmp_path / ".sdd" / "runtime" / "oai-s6.manifest.json").read_text(),
+        )
+        assert manifest["temperature"] == pytest.approx(0.2)
+        assert manifest["top_p"] == pytest.approx(0.9)
+        assert manifest["top_k"] == 40
+        assert manifest["base_url"] == "http://localhost:8000/v1"
+        assert manifest["api_key_env"] == "OPENROUTER_API_KEY"
+
+    def test_manifest_omits_absent_sampling_fields(self, tmp_path: Path) -> None:
+        adapter = OpenAIAgentsAdapter()
+        proc_mock = _make_popen_mock(pid=1008)
+        with patch(
+            "bernstein.adapters.openai_agents.subprocess.Popen",
+            return_value=proc_mock,
+        ):
+            adapter.spawn(
+                prompt="run tests",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5", effort="high"),
+                session_id="oai-s7",
+            )
+        manifest = json.loads(
+            (tmp_path / ".sdd" / "runtime" / "oai-s7.manifest.json").read_text(),
+        )
+        for key in ("temperature", "top_p", "top_k", "base_url", "api_key_env"):
+            assert key not in manifest
+
+    def test_manifest_carries_spawner_injected_heartbeat_dir(self, tmp_path: Path) -> None:
+        """The spawner-injected heartbeat_dir must reach the runner manifest.
+
+        Under default worktree isolation the spawn workdir is NOT the
+        orchestrator root, so the manifest must carry the orchestrator-root
+        heartbeat directory the HeartbeatMonitor polls.
+        """
+        orchestrator_root = tmp_path / "project"
+        worktree = orchestrator_root / ".sdd" / "worktrees" / "oai-hb1"
+        worktree.mkdir(parents=True)
+        heartbeat_dir = str(orchestrator_root / ".sdd" / "runtime" / "heartbeats")
+        adapter = OpenAIAgentsAdapter()
+        proc_mock = _make_popen_mock(pid=1009)
+        with patch(
+            "bernstein.adapters.openai_agents.subprocess.Popen",
+            return_value=proc_mock,
+        ):
+            adapter.spawn(
+                prompt="run tests",
+                workdir=worktree,
+                model_config=ModelConfig(model="gpt-5", effort="high"),
+                session_id="oai-hb1",
+                mcp_config={"heartbeat_dir": heartbeat_dir},
+            )
+        manifest = json.loads(
+            (worktree / ".sdd" / "runtime" / "oai-hb1.manifest.json").read_text(),
+        )
+        assert manifest["heartbeat_dir"] == heartbeat_dir
+        assert manifest["workdir"] == str(worktree)
+
+    def test_sampling_overrides_survive_real_mcp_merge_into_manifest(self, tmp_path: Path) -> None:
+        """End-to-end: sampling keys survive the MCPManager merge to the manifest.
+
+        Mirrors the spawner flow where the operator-provided MCP config is
+        rebuilt by ``MCPManager.build_mcp_config_for_task`` before it
+        reaches the adapter. The merged config must still deliver the
+        sampling/endpoint overrides into the runner manifest.
+        """
+        from bernstein.core.mcp_manager import MCPManager, MCPServerConfig
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 100
+        mock_proc.poll.return_value = None
+        with patch(
+            "bernstein.core.protocols.mcp_manager.subprocess.Popen",
+            return_value=mock_proc,
+        ):
+            mgr = MCPManager([MCPServerConfig(name="github", command=["npx"])])
+            mgr.start_all()
+            base = {
+                "mcpServers": {"tavily": {"command": "npx", "args": ["tavily"]}},
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "top_k": 40,
+                "base_url": "http://localhost:8000/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            }
+            merged = mgr.build_mcp_config_for_task(
+                task_mcp_servers=["github"],
+                base_config=base,
+            )
+
+        assert merged is not None
+        adapter = OpenAIAgentsAdapter()
+        proc_mock = _make_popen_mock(pid=1010)
+        with patch(
+            "bernstein.adapters.openai_agents.subprocess.Popen",
+            return_value=proc_mock,
+        ):
+            adapter.spawn(
+                prompt="run tests",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5", effort="high"),
+                session_id="oai-merge1",
+                mcp_config=merged,
+            )
+        manifest = json.loads(
+            (tmp_path / ".sdd" / "runtime" / "oai-merge1.manifest.json").read_text(),
+        )
+        assert manifest["temperature"] == pytest.approx(0.2)
+        assert manifest["top_p"] == pytest.approx(0.9)
+        assert manifest["top_k"] == 40
+        assert manifest["base_url"] == "http://localhost:8000/v1"
+        assert manifest["api_key_env"] == "OPENROUTER_API_KEY"
+        assert set(manifest["mcp_servers"]) == {"tavily", "github"}
+
+    def test_spawn_rejects_non_credential_api_key_env(self, tmp_path: Path) -> None:
+        adapter = OpenAIAgentsAdapter()
+        with (
+            patch("bernstein.adapters.openai_agents.subprocess.Popen") as popen,
+            pytest.raises(RuntimeError, match="PATH"),
+        ):
+            adapter.spawn(
+                prompt="run tests",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5", effort="high"),
+                session_id="oai-bad-env",
+                mcp_config={"api_key_env": "PATH"},
+            )
+        popen.assert_not_called()
+
     def test_log_path_uses_session_id(self, tmp_path: Path) -> None:
         adapter = OpenAIAgentsAdapter()
         proc_mock = _make_popen_mock(pid=1005)
@@ -312,6 +475,30 @@ class TestSpawnEnvIsolation:
         env = popen.call_args.kwargs.get("env", {})
         assert "ANTHROPIC_API_KEY" not in env
         assert "DATABASE_URL" not in env
+
+    def test_env_passes_api_key_env_override_through(self, tmp_path: Path) -> None:
+        adapter = OpenAIAgentsAdapter()
+        proc_mock = _make_popen_mock(pid=2003)
+        with (
+            patch(
+                "bernstein.adapters.openai_agents.subprocess.Popen",
+                return_value=proc_mock,
+            ) as popen,
+            patch.dict(
+                "os.environ",
+                {"OPENROUTER_API_KEY": "sk-proxy", "PATH": "/usr/bin"},
+                clear=True,
+            ),
+        ):
+            adapter.spawn(
+                prompt="hello",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5-mini", effort="high"),
+                session_id="oai-env3",
+                mcp_config={"api_key_env": "OPENROUTER_API_KEY"},
+            )
+        env = popen.call_args.kwargs.get("env", {})
+        assert env["OPENROUTER_API_KEY"] == "sk-proxy"
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +703,41 @@ class TestRunnerManifest:
         with pytest.raises(TypeError):
             load_manifest(path)
 
+    def test_sampling_fields_default_to_none(self) -> None:
+        manifest = RunnerManifest.from_dict(
+            {
+                "session_id": "s1",
+                "prompt": "hi",
+                "workdir": "/workspace",
+                "model": "gpt-5-mini",
+            },
+        )
+        assert manifest.temperature is None
+        assert manifest.top_p is None
+        assert manifest.top_k is None
+        assert manifest.base_url is None
+        assert manifest.api_key_env is None
+
+    def test_from_dict_parses_sampling_fields(self) -> None:
+        manifest = RunnerManifest.from_dict(
+            {
+                "session_id": "s1",
+                "prompt": "hi",
+                "workdir": "/workspace",
+                "model": "gpt-5-mini",
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "top_k": 40,
+                "base_url": "http://localhost:8000/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+        )
+        assert manifest.temperature == pytest.approx(0.2)
+        assert manifest.top_p == pytest.approx(0.9)
+        assert manifest.top_k == 40
+        assert manifest.base_url == "http://localhost:8000/v1"
+        assert manifest.api_key_env == "OPENROUTER_API_KEY"
+
 
 # ---------------------------------------------------------------------------
 # Runner helpers
@@ -565,6 +787,124 @@ class TestRunnerHelpers:
         # Defensive copy - mutating the output must not mutate manifest state.
         cfg["mcp_servers"]["other"] = {"command": "x"}
         assert "other" not in manifest.mcp_servers
+
+    def test_build_model_settings_kwargs_empty_when_absent(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+        )
+        assert _build_model_settings_kwargs(manifest) == {}
+
+    def test_build_model_settings_kwargs_maps_params(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+            temperature=0.2,
+            top_p=0.9,
+            top_k=40,
+        )
+        kwargs = _build_model_settings_kwargs(manifest)
+        assert kwargs["temperature"] == pytest.approx(0.2)
+        assert kwargs["top_p"] == pytest.approx(0.9)
+        # top_k travels via extra_args - the OpenAI API has no first-class
+        # top_k field but OpenAI-compatible endpoints accept it.
+        assert kwargs["extra_args"] == {"top_k": 40}
+
+    def test_resolve_client_kwargs_empty_by_default(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+        )
+        assert _resolve_client_kwargs(manifest) == {}
+
+    def test_resolve_client_kwargs_reads_key_from_env(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+            base_url="http://localhost:8000/v1",
+            api_key_env="OPENROUTER_API_KEY",
+        )
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-proxy"}, clear=True):
+            kwargs = _resolve_client_kwargs(manifest)
+        assert kwargs == {"base_url": "http://localhost:8000/v1", "api_key": "sk-proxy"}
+
+    def test_resolve_client_kwargs_raises_when_env_var_missing(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+            api_key_env="OPENROUTER_API_KEY",
+        )
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"),
+        ):
+            _resolve_client_kwargs(manifest)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "HF_TOKEN",
+            "DEEPSEEK_API_KEY",
+            "MISTRAL_API_KEY",
+        ],
+    )
+    def test_validate_api_key_env_name_accepts_allowlisted_names(self, name: str) -> None:
+        validate_api_key_env_name(name)
+
+    def test_validate_api_key_env_name_accepts_operator_allowed_name(self) -> None:
+        """Names outside the built-in set pass only with the host override."""
+        with patch.dict("os.environ", {"BERNSTEIN_ALLOWED_API_KEY_ENVS": "MY_PROXY_KEY, OTHER_KEY"}):
+            validate_api_key_env_name("MY_PROXY_KEY")
+            validate_api_key_env_name("OTHER_KEY")
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "PATH",
+            "HOME",
+            "LD_PRELOAD",
+            "my_proxy_key",
+            "OPENAI-API-KEY",
+            "1KEY_TOKEN",
+            "_API_KEY",
+            "SSH_AUTH_SOCK",
+            "KEY",
+            "TOKEN",
+            "GITHUB_TOKEN",
+            "AWS_SESSION_TOKEN",
+            "STRIPE_SECRET_KEY",
+            "MY_PROXY_KEY",
+        ],
+    )
+    def test_validate_api_key_env_name_rejects_non_credential_names(self, name: str) -> None:
+        with pytest.raises(RuntimeError, match="api_key_env"):
+            validate_api_key_env_name(name)
+
+    def test_resolve_client_kwargs_rejects_non_credential_name(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+            api_key_env="PATH",
+        )
+        with (
+            patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
+            pytest.raises(RuntimeError, match="PATH"),
+        ):
+            _resolve_client_kwargs(manifest)
 
     def test_is_rate_limit_detects_429_message(self) -> None:
         assert _is_rate_limit(RuntimeError("429 Too Many Requests")) is True
@@ -703,6 +1043,326 @@ class TestRunnerRun:
         assert rc == EXIT_GENERIC
         events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
         assert any(e["type"] == "error" and e["kind"] == "runtime" for e in events)
+
+    def test_run_start_event_logs_sampling_and_endpoint_params(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        manifest = RunnerManifest(
+            session_id="abc",
+            prompt="hello",
+            workdir="/workspace",
+            model="gpt-5-mini",
+            temperature=0.2,
+            top_p=0.9,
+            top_k=40,
+            base_url="http://localhost:8000/v1",
+            api_key_env="OPENROUTER_API_KEY",
+        )
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        fake_openai = MagicMock()
+        with (
+            patch.dict(sys.modules, {"agents": fake_sdk, "openai": fake_openai}),
+            patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-proxy"}, clear=True),
+        ):
+            rc = run(manifest)
+        assert rc == EXIT_OK
+        events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+        start = next(e for e in events if e["type"] == "start")
+        assert start["temperature"] == pytest.approx(0.2)
+        assert start["top_p"] == pytest.approx(0.9)
+        assert start["top_k"] == 40
+        assert start["base_url"] == "http://localhost:8000/v1"
+        # Only the env var NAME is logged - never the key value.
+        assert start["api_key_env"] == "OPENROUTER_API_KEY"
+        assert "sk-proxy" not in json.dumps(events)
+
+    def test_run_start_event_defaults_are_null(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        with patch.dict(sys.modules, {"agents": fake_sdk}):
+            run(self._manifest())
+        events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+        start = next(e for e in events if e["type"] == "start")
+        for key in ("temperature", "top_p", "top_k", "base_url", "api_key_env"):
+            assert start[key] is None
+
+    def test_run_wires_model_settings_into_agent(self) -> None:
+        manifest = RunnerManifest(
+            session_id="abc",
+            prompt="hello",
+            workdir="/workspace",
+            model="gpt-5-mini",
+            temperature=0.3,
+            top_p=0.8,
+            top_k=20,
+        )
+        settings_sentinel = object()
+        fake_agent_cls = MagicMock()
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(
+            Agent=fake_agent_cls,
+            Runner=fake_runner,
+            ModelSettings=MagicMock(return_value=settings_sentinel),
+        )
+        with patch.dict(sys.modules, {"agents": fake_sdk}):
+            rc = run(manifest)
+        assert rc == EXIT_OK
+        fake_sdk.ModelSettings.assert_called_once_with(
+            temperature=0.3,
+            top_p=0.8,
+            extra_args={"top_k": 20},
+        )
+        assert fake_agent_cls.call_args.kwargs["model_settings"] is settings_sentinel
+
+    def test_run_skips_model_settings_when_no_params(self) -> None:
+        fake_agent_cls = MagicMock()
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=fake_agent_cls, Runner=fake_runner)
+        with patch.dict(sys.modules, {"agents": fake_sdk}):
+            run(self._manifest())
+        fake_sdk.ModelSettings.assert_not_called()
+        assert "model_settings" not in fake_agent_cls.call_args.kwargs
+
+    def test_run_constructs_client_from_manifest(self) -> None:
+        manifest = RunnerManifest(
+            session_id="abc",
+            prompt="hello",
+            workdir="/workspace",
+            model="gpt-5-mini",
+            base_url="http://localhost:8000/v1",
+            api_key_env="OPENROUTER_API_KEY",
+        )
+        client_sentinel = object()
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        fake_openai = MagicMock(AsyncOpenAI=MagicMock(return_value=client_sentinel))
+        with (
+            patch.dict(sys.modules, {"agents": fake_sdk, "openai": fake_openai}),
+            patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-proxy"}, clear=True),
+        ):
+            rc = run(manifest)
+        assert rc == EXIT_OK
+        fake_openai.AsyncOpenAI.assert_called_once_with(
+            base_url="http://localhost:8000/v1",
+            api_key="sk-proxy",
+        )
+        # With a custom endpoint the client must be excluded from tracing
+        # (never send the third-party key to api.openai.com) and the SDK
+        # must use the chat-completions API (third-party endpoints do not
+        # serve /responses).
+        fake_sdk.set_default_openai_client.assert_called_once_with(
+            client_sentinel,
+            use_for_tracing=False,
+        )
+        fake_sdk.set_default_openai_api.assert_called_once_with("chat_completions")
+
+    def test_run_keeps_default_api_and_tracing_without_base_url(self) -> None:
+        manifest = RunnerManifest(
+            session_id="abc",
+            prompt="hello",
+            workdir="/workspace",
+            model="gpt-5-mini",
+            api_key_env="OPENROUTER_API_KEY",
+        )
+        client_sentinel = object()
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        fake_openai = MagicMock(AsyncOpenAI=MagicMock(return_value=client_sentinel))
+        with (
+            patch.dict(sys.modules, {"agents": fake_sdk, "openai": fake_openai}),
+            patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-proxy"}, clear=True),
+        ):
+            rc = run(manifest)
+        assert rc == EXIT_OK
+        # No base_url: default Responses API and default tracing stay intact.
+        fake_sdk.set_default_openai_client.assert_called_once_with(client_sentinel)
+        fake_sdk.set_default_openai_api.assert_not_called()
+
+    def test_run_leaves_default_client_alone_without_overrides(self) -> None:
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        with patch.dict(sys.modules, {"agents": fake_sdk}):
+            run(self._manifest())
+        fake_sdk.set_default_openai_client.assert_not_called()
+
+    def test_run_fails_loudly_when_api_key_env_var_missing(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        manifest = RunnerManifest(
+            session_id="abc",
+            prompt="hello",
+            workdir="/workspace",
+            model="gpt-5-mini",
+            api_key_env="MISSING_PROXY_KEY",
+        )
+        with patch.dict("os.environ", {}, clear=True):
+            rc = run(manifest)
+        assert rc == EXIT_MANIFEST_ERROR
+        events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+        error = next(e for e in events if e["type"] == "error")
+        assert error["kind"] == "config_invalid"
+        assert "MISSING_PROXY_KEY" in error["message"]
+
+    def test_run_fails_loudly_for_non_credential_api_key_env(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        manifest = RunnerManifest(
+            session_id="abc",
+            prompt="hello",
+            workdir="/workspace",
+            model="gpt-5-mini",
+            base_url="http://localhost:8000/v1",
+            api_key_env="LD_PRELOAD",
+        )
+        with patch.dict("os.environ", {"LD_PRELOAD": "libx.so"}, clear=True):
+            rc = run(manifest)
+        assert rc == EXIT_MANIFEST_ERROR
+        events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+        error = next(e for e in events if e["type"] == "error")
+        assert error["kind"] == "config_invalid"
+        assert "LD_PRELOAD" in error["message"]
+        # The rejected variable's value is never echoed.
+        assert "libx.so" not in json.dumps(events)
+
+    def test_run_starts_and_stops_heartbeat(self) -> None:
+        stop_event = threading.Event()
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        with (
+            patch.object(
+                runner_module,
+                "_start_heartbeat",
+                return_value=stop_event,
+            ) as start_hb,
+            patch.dict(sys.modules, {"agents": fake_sdk}),
+        ):
+            run(self._manifest())
+        start_hb.assert_called_once()
+        assert stop_event.is_set()
+
+    def test_run_stops_heartbeat_on_sdk_missing(self) -> None:
+        stop_event = threading.Event()
+        with (
+            patch.object(
+                runner_module,
+                "_start_heartbeat",
+                return_value=stop_event,
+            ),
+            patch.dict(sys.modules, {"agents": None}),
+        ):
+            rc = run(self._manifest())
+        assert rc == EXIT_SDK_MISSING
+        assert stop_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Runner heartbeat
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerHeartbeat:
+    def test_heartbeat_writes_proxy_shaped_payload(self, tmp_path: Path) -> None:
+        hb_dir = tmp_path / ".sdd" / "runtime" / "heartbeats"
+        stop_event = _start_heartbeat("hb-sess", hb_dir, interval_s=0.05)
+        hb_file = hb_dir / "hb-sess.json"
+        try:
+            deadline = time.monotonic() + 5.0
+            while not hb_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            stop_event.set()
+        assert hb_file.exists()
+        payload = json.loads(hb_file.read_text(encoding="utf-8"))
+        # Schema mirrors _start_heartbeat_proxy in spawner_sandbox_session.
+        assert set(payload) == {
+            "timestamp",
+            "phase",
+            "progress_pct",
+            "current_file",
+            "message",
+            "status",
+            "files_changed",
+        }
+        assert payload["status"] == "working"
+        assert payload["phase"] == "implementing"
+        assert isinstance(payload["timestamp"], int)
+
+    def test_heartbeat_stops_after_event_set(self, tmp_path: Path) -> None:
+        hb_dir = tmp_path / ".sdd" / "runtime" / "heartbeats"
+        stop_event = _start_heartbeat("hb-stop", hb_dir, interval_s=0.05)
+        hb_file = hb_dir / "hb-stop.json"
+        deadline = time.monotonic() + 5.0
+        while not hb_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop_event.set()
+        time.sleep(0.15)
+        hb_file.unlink()
+        time.sleep(0.15)
+        assert not hb_file.exists()
+
+    def test_resolve_heartbeat_dir_prefers_manifest_field(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/project/.sdd/worktrees/s",
+            model="gpt-5",
+            heartbeat_dir="/project/.sdd/runtime/heartbeats",
+        )
+        assert _resolve_heartbeat_dir(manifest) == Path("/project/.sdd/runtime/heartbeats")
+
+    def test_resolve_heartbeat_dir_falls_back_to_workdir(self) -> None:
+        manifest = RunnerManifest(
+            session_id="s",
+            prompt="p",
+            workdir="/workspace",
+            model="gpt-5",
+        )
+        assert _resolve_heartbeat_dir(manifest) == Path("/workspace/.sdd/runtime/heartbeats")
+
+    def test_run_writes_heartbeat_where_monitor_reads(self, tmp_path: Path) -> None:
+        """Worktree isolation: heartbeats must land at the orchestrator root.
+
+        spawn_cwd is a per-session worktree, so the manifest carries the
+        orchestrator-root heartbeat directory. The file the runner writes
+        must be exactly the path the HeartbeatMonitor polls:
+        ``<orchestrator_workdir>/.sdd/runtime/heartbeats/<session_id>.json``.
+        """
+        orchestrator_root = tmp_path / "project"
+        worktree = orchestrator_root / ".sdd" / "worktrees" / "hb-mon"
+        worktree.mkdir(parents=True)
+        manifest = RunnerManifest(
+            session_id="hb-mon",
+            prompt="hello",
+            workdir=str(worktree),
+            model="gpt-5-mini",
+            heartbeat_dir=str(orchestrator_root / ".sdd" / "runtime" / "heartbeats"),
+        )
+        fake_runner = MagicMock()
+        fake_runner.run_sync.return_value = _FakeResult(summary="ok")
+        fake_sdk = MagicMock(Agent=MagicMock(), Runner=fake_runner)
+        with patch.object(runner_module, "_start_heartbeat") as start_hb:
+            start_hb.return_value = threading.Event()
+            with patch.dict(sys.modules, {"agents": fake_sdk}):
+                rc = run(manifest)
+        assert rc == EXIT_OK
+        # Same expression as HeartbeatMonitor: workdir / ".sdd" / "runtime" / "heartbeats"
+        monitor_dir = orchestrator_root / ".sdd" / "runtime" / "heartbeats"
+        start_hb.assert_called_once_with("hb-mon", monitor_dir)
 
 
 # ---------------------------------------------------------------------------

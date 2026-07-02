@@ -20,7 +20,9 @@ events strictly - they are persisted to the session log and exposed via
 the existing log tail + hooks plumbing - but the schema below is what
 tests and downstream cost-tracking code rely on::
 
-    {"type": "start", "session_id": "...", "model": "gpt-5-mini"}
+    {"type": "start", "session_id": "...", "model": "gpt-5-mini",
+     "temperature": null, "top_p": null, "top_k": null,
+     "base_url": null, "api_key_env": null}
     {"type": "tool_call", "name": "file_read", "args": {...}}
     {"type": "tool_result", "name": "file_read", "output": "..."}
     {"type": "progress", "message": "..."}
@@ -32,7 +34,8 @@ Exit codes
 ----------
 
 * ``0`` - completion event emitted successfully
-* ``2`` - manifest missing or malformed
+* ``2`` - manifest missing or malformed, or ``api_key_env`` names an
+  environment variable that is not set
 * ``3`` - optional ``openai-agents`` SDK not installed
 * ``4`` - provider rate-limit detected (maps to Bernstein's back-off)
 * ``1`` - any other runtime error
@@ -41,10 +44,15 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import logging
+import os
+import re
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -61,6 +69,81 @@ EXIT_GENERIC: int = 1
 EXIT_MANIFEST_ERROR: int = 2
 EXIT_SDK_MISSING: int = 3
 EXIT_RATE_LIMIT: int = 4
+
+# ``api_key_env`` must name a known LLM-provider credential.  The name both
+# widens the filtered environment handed to this subprocess and selects the
+# secret sent as the bearer key to ``base_url``, so an unconstrained value
+# would let a repo-carried config forward arbitrary host secrets
+# (``GITHUB_TOKEN``, ``AWS_SESSION_TOKEN``, ...) to an arbitrary endpoint.
+# Fail-closed: names outside the built-in provider set are rejected unless
+# the OPERATOR allows them via ``BERNSTEIN_ALLOWED_API_KEY_ENVS`` on the
+# host (a repo-carried config cannot set host environment variables, so the
+# override cannot be forged by the repo).  Keep in sync with the constraint
+# documented in ``docs/adapters/capability_contract.md``.
+_API_KEY_ENV_RE: re.Pattern[str] = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_API_KEY_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "TOGETHER_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "FIREWORKS_API_KEY",
+        "XAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "CEREBRAS_API_KEY",
+        "MOONSHOT_API_KEY",
+        "MINIMAX_API_KEY",
+        "NVIDIA_API_KEY",
+        "PERPLEXITY_API_KEY",
+        "HF_TOKEN",
+        "LLM_API_KEY",
+    }
+)
+_ALLOWED_API_KEY_ENVS_VAR = "BERNSTEIN_ALLOWED_API_KEY_ENVS"
+
+
+def _operator_allowed_api_key_envs() -> frozenset[str]:
+    """Extra credential names the operator allowed on this host.
+
+    Read from the comma-separated ``BERNSTEIN_ALLOWED_API_KEY_ENVS``
+    host environment variable. Names are stripped; empty entries are
+    ignored.
+    """
+    raw = os.environ.get(_ALLOWED_API_KEY_ENVS_VAR, "")
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+def validate_api_key_env_name(name: str) -> None:
+    """Reject ``api_key_env`` values outside the credential allowlist.
+
+    Accepted names match ``^[A-Z][A-Z0-9_]*$`` AND are either in the
+    built-in LLM-provider allowlist or explicitly allowed by the
+    operator via ``BERNSTEIN_ALLOWED_API_KEY_ENVS`` (comma-separated,
+    host-set). Everything else - including credential-shaped names of
+    unrelated secrets such as ``GITHUB_TOKEN`` - is rejected so a
+    repo-carried config cannot forward arbitrary host secrets to an
+    arbitrary ``base_url``.
+
+    Args:
+        name: Candidate environment variable name from the manifest.
+
+    Raises:
+        RuntimeError: The name does not satisfy the constraint above.
+    """
+    if _API_KEY_ENV_RE.match(name) and (name in _API_KEY_ENV_ALLOWLIST or name in _operator_allowed_api_key_envs()):
+        return
+    msg = (
+        f"api_key_env {name!r} is not an allowed credential variable name: "
+        f"it must match ^[A-Z][A-Z0-9_]*$ and be a known LLM provider key, "
+        f"or be explicitly allowed by the operator via "
+        f"{_ALLOWED_API_KEY_ENVS_VAR} (comma-separated env var names)."
+    )
+    raise RuntimeError(msg)
 
 
 @dataclass(frozen=True)
@@ -89,6 +172,33 @@ class RunnerManifest:
             the SDK so the Agent can call into them *without* letting the
             SDK spawn its own server processes (avoids duplicate
             connections and double cost accounting).
+        temperature: Optional sampling temperature forwarded to the SDK's
+            ``ModelSettings``.  ``None`` keeps the provider default.
+        top_p: Optional nucleus-sampling value forwarded to
+            ``ModelSettings``.  ``None`` keeps the provider default.
+        top_k: Optional top-k sampling value forwarded to ``ModelSettings``
+            via ``extra_args`` (the OpenAI API itself has no ``top_k``, but
+            OpenAI-compatible endpoints selected via ``base_url`` do).
+            ``None`` keeps the provider default.
+        base_url: Optional OpenAI-compatible endpoint URL.  When set the
+            runner constructs its own ``AsyncOpenAI`` client instead of the
+            SDK default, switches the SDK to the chat-completions API
+            (third-party endpoints do not serve ``/responses``), and
+            excludes the client from tracing so the endpoint's key is
+            never sent to api.openai.com.  ``None`` keeps today's
+            single-endpoint behavior.
+        api_key_env: Optional NAME of the environment variable holding the
+            API key for ``base_url``.  Never a literal key.  Must satisfy
+            :func:`validate_api_key_env_name`.  When set but the variable
+            is missing (or the name is rejected) the runner fails at
+            startup with :data:`EXIT_MANIFEST_ERROR`.
+        heartbeat_dir: Optional absolute path of the heartbeat directory
+            the orchestrator's ``HeartbeatMonitor`` watches (the project
+            root's ``.sdd/runtime/heartbeats``).  Set by the spawner
+            because ``workdir`` is a per-session worktree under default
+            isolation - a worktree-relative heartbeat would never be
+            observed.  When absent the runner falls back to
+            ``<workdir>/.sdd/runtime/heartbeats``.
     """
 
     session_id: str
@@ -104,6 +214,12 @@ class RunnerManifest:
     sandbox_provider: str = "unix_local"
     tools: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     mcp_servers: dict[str, Any] = field(default_factory=dict[str, Any])
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    heartbeat_dir: str | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> RunnerManifest:
@@ -224,6 +340,125 @@ def _build_run_config(manifest: RunnerManifest) -> dict[str, Any]:
     }
 
 
+def _build_model_settings_kwargs(manifest: RunnerManifest) -> dict[str, Any]:
+    """Translate optional sampling params into ``ModelSettings`` kwargs.
+
+    Only fields present in the manifest are emitted so an all-``None``
+    manifest yields an empty dict and the runner skips ``ModelSettings``
+    entirely (exactly today's behavior).  ``top_k`` is not a first-class
+    ``ModelSettings`` field in the SDK, so it travels via ``extra_args``
+    for OpenAI-compatible endpoints that accept it.
+
+    Returns:
+        Kwargs for ``agents.ModelSettings``, possibly empty.
+    """
+    kwargs: dict[str, Any] = {}
+    if manifest.temperature is not None:
+        kwargs["temperature"] = manifest.temperature
+    if manifest.top_p is not None:
+        kwargs["top_p"] = manifest.top_p
+    if manifest.top_k is not None:
+        kwargs["extra_args"] = {"top_k": manifest.top_k}
+    return kwargs
+
+
+def _resolve_client_kwargs(manifest: RunnerManifest) -> dict[str, Any]:
+    """Build ``AsyncOpenAI(...)`` kwargs for the optional endpoint override.
+
+    Returns an empty dict when neither ``base_url`` nor ``api_key_env`` is
+    set, in which case the runner leaves the SDK's default client alone.
+    The key is resolved from the environment by NAME - the manifest never
+    carries a literal secret.
+
+    Raises:
+        RuntimeError: ``api_key_env`` is set but the name fails
+            :func:`validate_api_key_env_name`, or the named environment
+            variable is missing or empty.
+    """
+    kwargs: dict[str, Any] = {}
+    if manifest.base_url:
+        kwargs["base_url"] = manifest.base_url
+    if manifest.api_key_env:
+        validate_api_key_env_name(manifest.api_key_env)
+        api_key = os.environ.get(manifest.api_key_env)
+        if not api_key:
+            msg = (
+                f"manifest api_key_env names environment variable "
+                f"{manifest.api_key_env!r} but it is not set. Export "
+                f"{manifest.api_key_env} before spawning the openai_agents "
+                f"runner."
+            )
+            raise RuntimeError(msg)
+        kwargs["api_key"] = api_key
+    return kwargs
+
+
+def _resolve_heartbeat_dir(manifest: RunnerManifest) -> Path:
+    """Return the directory heartbeat files must be written to.
+
+    Prefers ``manifest.heartbeat_dir`` (the orchestrator-root directory
+    the ``HeartbeatMonitor`` polls, injected by the spawner) and falls
+    back to a workdir-relative path for standalone runner invocations.
+    """
+    if manifest.heartbeat_dir:
+        return Path(manifest.heartbeat_dir)
+    return Path(manifest.workdir) / ".sdd" / "runtime" / "heartbeats"
+
+
+def _start_heartbeat(
+    session_id: str,
+    heartbeat_dir: Path,
+    interval_s: float = 15.0,
+) -> threading.Event:
+    """Write heartbeat files while the runner process is alive.
+
+    Mirrors the payload schema of ``_start_heartbeat_proxy`` in
+    :mod:`bernstein.core.agents.spawner_sandbox_session` so the
+    orchestrator's ``HeartbeatMonitor`` treats runner sessions exactly
+    like sandbox sessions.
+
+    Args:
+        session_id: Runner session identifier (heartbeat file basename).
+        heartbeat_dir: Directory the heartbeat file is written to.  Must
+            be the same ``.sdd/runtime/heartbeats`` directory the
+            orchestrator's ``HeartbeatMonitor`` reads - see
+            :func:`_resolve_heartbeat_dir`.
+        interval_s: Seconds between heartbeat writes (default 15).
+
+    Returns:
+        A :class:`threading.Event` the caller sets to stop the writer.
+    """
+    stop_event = threading.Event()
+
+    def _heartbeat_loop() -> None:
+        with contextlib.suppress(OSError):  # best effort
+            heartbeat_dir.mkdir(parents=True, exist_ok=True)
+        heartbeat_file = heartbeat_dir / f"{session_id}.json"
+        while not stop_event.is_set():
+            payload = json.dumps(
+                {
+                    "timestamp": int(time.time()),
+                    "phase": "implementing",
+                    "progress_pct": 0,
+                    "current_file": "",
+                    "message": "openai-agents runner working",
+                    "status": "working",
+                    "files_changed": 0,
+                }
+            )
+            with contextlib.suppress(OSError):  # best effort
+                heartbeat_file.write_text(payload, encoding="utf-8")
+            stop_event.wait(interval_s)
+
+    thread = threading.Thread(
+        target=_heartbeat_loop,
+        name=f"heartbeat-runner-{session_id}",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event
+
+
 def run(manifest: RunnerManifest) -> int:
     """Execute the SDK session described by ``manifest``.
 
@@ -236,15 +471,54 @@ def run(manifest: RunnerManifest) -> int:
     Returns:
         Process exit code.  See module docstring for the contract.
     """
+    # Every effective sampling/endpoint param is logged here.  The key
+    # itself is never logged - only the NAME of the env var that holds it.
     emit_event(
         {
             "type": "start",
             "session_id": manifest.session_id,
             "model": manifest.model,
             "sandbox_provider": manifest.sandbox_provider,
+            "temperature": manifest.temperature,
+            "top_p": manifest.top_p,
+            "top_k": manifest.top_k,
+            "base_url": manifest.base_url,
+            "api_key_env": manifest.api_key_env,
         },
     )
 
+    # Resolve the endpoint override before any SDK work so a missing key
+    # env var fails loudly at startup instead of mid-session.
+    try:
+        client_kwargs = _resolve_client_kwargs(manifest)
+    except RuntimeError as exc:
+        emit_event(
+            {
+                "type": "error",
+                "kind": "config_invalid",
+                "message": str(exc),
+            },
+        )
+        return EXIT_MANIFEST_ERROR
+
+    heartbeat_stop = _start_heartbeat(manifest.session_id, _resolve_heartbeat_dir(manifest))
+    try:
+        return _run_session(manifest, client_kwargs)
+    finally:
+        heartbeat_stop.set()
+
+
+def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int:
+    """Run the SDK session after startup validation has passed.
+
+    Args:
+        manifest: Parsed manifest describing the run.
+        client_kwargs: Non-empty when the manifest overrides the endpoint
+            or API key; forwarded to ``AsyncOpenAI``.
+
+    Returns:
+        Process exit code.  See module docstring for the contract.
+    """
     try:
         # Lazy import so the module itself stays importable without
         # the optional ``openai-agents`` package.  Tests stub this by
@@ -277,8 +551,41 @@ def run(manifest: RunnerManifest) -> int:
         )
         return EXIT_GENERIC
 
+    if client_kwargs:
+        # The manifest overrides the endpoint and/or API key.  Hand the SDK
+        # a dedicated client instead of letting it read the ambient
+        # OPENAI_* environment.
+        try:
+            from openai import AsyncOpenAI  # type: ignore[import-not-found]
+
+            client = AsyncOpenAI(**client_kwargs)
+            if manifest.base_url:
+                # Third-party OpenAI-compatible endpoints (the reason
+                # ``base_url`` exists) serve the chat-completions API,
+                # not ``/responses``, so switch the SDK's default API.
+                # ``use_for_tracing=False`` keeps the SDK's tracing
+                # exporter from uploading traces to api.openai.com
+                # authenticated with the third-party key.
+                sdk.set_default_openai_client(client, use_for_tracing=False)
+                sdk.set_default_openai_api("chat_completions")
+            else:
+                sdk.set_default_openai_client(client)
+        except Exception as exc:
+            emit_event(
+                {
+                    "type": "error",
+                    "kind": "runtime",
+                    "message": f"failed to configure OpenAI client: {type(exc).__name__}: {exc}",
+                },
+            )
+            return EXIT_GENERIC
+
     try:
-        agent: Any = agent_cls(**_build_agent_kwargs(manifest))
+        agent_kwargs = _build_agent_kwargs(manifest)
+        settings_kwargs = _build_model_settings_kwargs(manifest)
+        if settings_kwargs:
+            agent_kwargs["model_settings"] = sdk.ModelSettings(**settings_kwargs)
+        agent: Any = agent_cls(**agent_kwargs)
         run_config = _build_run_config(manifest)
         # ``Runner.run_sync`` is the SDK's synchronous API - we avoid
         # ``asyncio.run`` here so the runner stays compatible with

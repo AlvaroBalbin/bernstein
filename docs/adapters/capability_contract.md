@@ -144,3 +144,43 @@ The matrix is the source of truth; this table is regenerated from
 `strategy_conformance_table()`. Out of scope for this contract: runtime
 capability discovery, and removing every adapter-specific conditional (some
 output-formatting quirks remain as overrides).
+
+## Sampling and endpoint parameters
+
+Adapters that can honour per-spawn sampling and endpoint overrides declare
+`AdapterCapability.SUPPORTS_SAMPLING_PARAMS` in their `plugin_info()`
+capabilities. The overrides travel in the per-spawn `mcp_config` and, for
+`openai_agents`, land in the runner manifest as optional fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `temperature` | float | Sampling temperature. Absent = provider default. |
+| `top_p` | float | Nucleus sampling. Absent = provider default. |
+| `top_k` | int | Top-k sampling, forwarded for OpenAI-compatible endpoints that accept it. Absent = provider default. |
+| `base_url` | str | OpenAI-compatible endpoint URL. Absent = default endpoint. |
+| `api_key_env` | str | NAME of the environment variable holding the API key for `base_url`. Never a literal key. |
+
+All fields are optional; a manifest without them behaves exactly as before.
+When `base_url` is set, the runner switches the SDK to the chat-completions
+API (third-party OpenAI-compatible endpoints do not serve `/responses`) and
+excludes the custom client from tracing so the endpoint's key is never sent
+to api.openai.com.
+
+`api_key_env` must match `^[A-Z][A-Z0-9_]*$` AND be a known LLM provider
+key (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, and the
+rest of the built-in allowlist in `openai_agents_runner.py`). Any other
+name - including credential-shaped names of unrelated secrets such as
+`GITHUB_TOKEN` - is rejected at startup with a `config_invalid` error
+(exit code 2), the same failure path as a name whose variable is not set.
+To use a provider key outside the built-in set, the operator sets
+`BERNSTEIN_ALLOWED_API_KEY_ENVS` (comma-separated names) on the host; a
+repo-carried config cannot set host environment variables, so the
+override cannot be forged by the repo. The runner logs every effective
+value in its `start` event; only the env var name is ever logged, never
+the key itself.
+
+The spawn path enforces the capability: requesting any of these keys for an
+adapter that does not declare `SUPPORTS_SAMPLING_PARAMS` raises
+`SamplingParamsRefusal` instead of silently dropping the parameters. See
+`ensure_sampling_params_supported` in
+[`src/bernstein/adapters/plugin_sdk.py`](../../src/bernstein/adapters/plugin_sdk.py).
