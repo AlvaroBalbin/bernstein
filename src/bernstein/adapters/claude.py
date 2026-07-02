@@ -43,7 +43,11 @@ from bernstein.adapters.claude_mcp_loader import (
     load_mcp_config as load_mcp_config,
 )
 from bernstein.adapters.claude_wrapper_script import build_wrapper_script
-from bernstein.adapters.env_isolation import build_filtered_env
+from bernstein.adapters.env_isolation import (
+    _embedded_teams_opt_in,
+    build_filtered_env,
+    record_embedded_teams_opt_in,
+)
 from bernstein.core.defaults import COST
 from bernstein.core.models import ApiTier, ApiTierInfo, ModelConfig, ProviderType, RateLimit
 from bernstein.core.platform_compat import kill_process_group_graceful, process_alive
@@ -61,6 +65,95 @@ def _task_budgets_opt_in() -> bool:
     """Mirror of :func:`bernstein.core.cost.budget_countdown.is_task_budgets_opt_in`."""
     raw = os.environ.get(_TASK_BUDGETS_OPT_IN_ENV, "")
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ---------------------------------------------------------------------------
+# Context-compaction policy (recorded in the replay fingerprint)
+# ---------------------------------------------------------------------------
+#
+# Context compaction (auto-summarising older context between turns) rewrites
+# the history the model effectively works from. A run that records "context as
+# sent" and later replays it can diverge if compaction changed between the two:
+# the replay reconstructs the sent context, but a compaction event altered what
+# the recorded run actually consumed.
+#
+# The load-bearing, verifiable guarantee here is NOT that we can force
+# compaction off. It is that the compaction policy state is captured in the
+# step fingerprint (the HMAC/Merkle step journal). If compaction behaviour
+# changes between record and replay, the fingerprint diverges and the mismatch
+# is DETECTED and attributable to a named field rather than surfacing as a
+# mysterious, unexplained rewrite. That detection is the deterministic-replay
+# lever; it holds regardless of whether any suppression request is honoured.
+#
+# As a best-effort layer, in deterministic-record or hermetic-replay mode we
+# additionally REQUEST that the CLI suppress its client-side auto-compaction.
+# This is a best-effort request, not an authoritative guarantee: it targets the
+# CLI's own auto-compaction behaviour and cannot promise anything about any
+# server-side context handling. The fingerprint is what makes a divergence
+# safe; the suppression request only reduces how often one happens.
+#
+# The env flags below are the source of truth for the run mode. They mirror
+# the ones read by the orchestrator (BERNSTEIN_DETERMINISTIC_SEED for record,
+# BERNSTEIN_REPLAY_RUN_ID for replay); they are inlined here rather than
+# imported so the adapter stays free of scheduler internals (importlinter
+# contract ``adapters-no-scheduler``).
+_DETERMINISTIC_SEED_ENV: str = "BERNSTEIN_DETERMINISTIC_SEED"
+_REPLAY_RUN_ID_ENV: str = "BERNSTEIN_REPLAY_RUN_ID"
+
+#: Best-effort request to suppress the CLI's client-side auto-compaction; not a
+#: guarantee. Setting it to "1" asks the CLI not to auto-compact its own
+#: context this process; it makes no claim about any server-side handling. The
+#: authoritative replay protection is the recorded fingerprint (see
+#: :func:`ClaudeAdapter._record_compaction_state`), which detects and
+#: attributes any divergence a compaction change would cause.
+_DISABLE_COMPACTION_ENV: str = "DISABLE_AUTO_COMPACT"
+
+
+def _deterministic_run_mode() -> bool:
+    """Return whether this process runs in deterministic-record or hermetic-replay mode.
+
+    Reads :data:`_DETERMINISTIC_SEED_ENV` (record) and
+    :data:`_REPLAY_RUN_ID_ENV` (replay) from the environment. Either being set
+    to a non-empty value means the run must be byte-reconstructable, so the
+    compaction policy state is recorded in the fingerprint and a best-effort
+    suppression request is emitted.
+
+    Returns:
+        ``True`` when a deterministic seed or a replay run id is present.
+    """
+    seed = os.environ.get(_DETERMINISTIC_SEED_ENV, "").strip()
+    replay = os.environ.get(_REPLAY_RUN_ID_ENV, "").strip()
+    return bool(seed) or bool(replay)
+
+
+def apply_compaction_policy(env: dict[str, str]) -> bool:
+    """Apply the deterministic context-compaction policy to a spawn *env*.
+
+    In deterministic-record or hermetic-replay mode, sets
+    :data:`_DISABLE_COMPACTION_ENV` to "1" as a best-effort request that the
+    CLI suppress its client-side auto-compaction. This is a request, not a
+    guarantee: it cannot promise the model saw byte-identical context. Outside
+    those modes the env is left untouched (default behaviour).
+
+    Mutates *env* in place and returns whether the suppression policy was
+    applied, so the caller can record the policy state in the step fingerprint.
+    The fingerprint is the load-bearing guarantee: any divergence a compaction
+    change causes is detected and attributed to a known, recorded policy field
+    rather than surfacing as a mysterious rewrite.
+
+    Args:
+        env: The filtered spawn environment dict (mutated in place).
+
+    Returns:
+        ``True`` when the suppression policy was applied for this request
+        (deterministic modes), ``False`` when it was left at the default.
+    """
+    if _deterministic_run_mode():
+        # Best-effort request to suppress client-side auto-compaction; not a
+        # guarantee. The recorded fingerprint is what makes replay safe.
+        env[_DISABLE_COMPACTION_ENV] = "1"
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +508,43 @@ class ClaudeCodeAdapter(CLIAdapter):
             completion_path=completion_path,
         )
 
+    @staticmethod
+    def _record_compaction_state(workdir: Path, session_id: str, *, compaction_disabled: bool) -> None:
+        """Persist the compaction policy state applied to this spawn.
+
+        Writes a small sidecar JSON at
+        ``.sdd/runtime/compaction/<session_id>.json`` recording whether the
+        best-effort suppression policy was applied. The spawner folds this flag
+        into the step journal so that if compaction behaviour changes between
+        record and replay, the resulting divergence is DETECTED and attributable
+        to a known, recorded policy field rather than surfacing as a mysterious
+        context rewrite. This recording is the load-bearing replay guarantee;
+        the suppression request is only best-effort. Writing is itself
+        best-effort: a failure here must never break spawn.
+
+        Args:
+            workdir: Agent working directory (root of ``.sdd``).
+            session_id: Session id used as the sidecar filename.
+            compaction_disabled: ``True`` when the suppression policy was
+                applied for this request (deterministic / hermetic modes).
+        """
+        try:
+            state_dir = workdir / ".sdd" / "runtime" / "compaction"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_path = state_dir / f"{session_id}.json"
+            payload = {
+                "session_id": session_id,
+                # ``compaction_enabled`` is the policy value folded into the
+                # step fingerprint: True = default behaviour (no suppression
+                # requested), False = best-effort suppression requested for
+                # this deterministic/replay run. It records the policy we
+                # applied, not a proof the provider honoured it.
+                "compaction_enabled": not compaction_disabled,
+            }
+            state_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - best-effort, never blocks spawn
+            _logger.debug("Could not record compaction state for %s: %s", session_id, exc)
+
     def _launch_process(
         self,
         cmd: list[str],
@@ -548,6 +678,21 @@ class ClaudeCodeAdapter(CLIAdapter):
                     existing = cast(_CAST_DICT_STR_ANY, raw)
 
         existing["hooks"] = hooks_config
+
+        # We own the merged settings file handed to the worker, so pin the
+        # embedded agent-team gate off unless the operator explicitly opts in.
+        # Teammates a worker spawns inherit the lead's permission mode and run
+        # outside this worker's HMAC audit trail; a stray truthy value in a
+        # pre-existing settings file must not silently re-open that hole. The
+        # env-var path is denied in build_filtered_env(); this covers the
+        # settings.json path Claude Code also reads.
+        if not _embedded_teams_opt_in():
+            env_block = existing.get("env")
+            if not isinstance(env_block, dict):
+                env_block = {}
+            env_block["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "false"
+            existing["env"] = env_block
+
         try:
             settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         except OSError:
@@ -652,6 +797,17 @@ class ClaudeCodeAdapter(CLIAdapter):
         # rather than overwrite. Filter is empty-safe when the env var
         # is unset.
         env = build_filtered_env(["ANTHROPIC_API_KEY", "ANTHROPIC_BETA"])
+        # Embedded agent-team spawning is denied by default in
+        # build_filtered_env(); when an operator re-permits it via
+        # BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS we attest the decision to this
+        # worker's HMAC audit chain so the teammate hierarchy stays auditable
+        # rather than invisible.
+        if _embedded_teams_opt_in():
+            record_embedded_teams_opt_in(
+                adapter="claude",
+                session_id=session_id,
+                audit_dir=workdir / ".sdd" / "audit",
+            )
         # Anthropic Opus 4.7 ``task-budgets-2026-03-13`` beta header. Set
         # via ``ANTHROPIC_BETA`` so the Claude Code CLI forwards it to
         # every API call. Gated behind ``BERNSTEIN_ANTHROPIC_TASK_BUDGETS``
@@ -665,6 +821,14 @@ class ClaudeCodeAdapter(CLIAdapter):
                 env["ANTHROPIC_BETA"] = f"{existing_beta},{_TASK_BUDGETS_BETA_VALUE}"
             else:
                 env["ANTHROPIC_BETA"] = _TASK_BUDGETS_BETA_VALUE
+        # In deterministic-record / hermetic-replay mode, emit a best-effort
+        # request to suppress client-side auto-compaction (no-op otherwise).
+        # The returned policy flag is recorded in the fingerprint so any
+        # compaction-driven divergence between record and replay is detected
+        # and stays attributable rather than mysterious. The recording, not the
+        # suppression request, is the load-bearing guarantee.
+        compaction_disabled = apply_compaction_policy(env)
+        self._record_compaction_state(workdir, session_id, compaction_disabled=compaction_disabled)
         claude_proc, wrapper_proc = self._launch_process(wrapped_cmd, wrapper, workdir, log_path, env=env)
 
         # Track the worker process (wraps claude) for is_alive/kill
