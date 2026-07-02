@@ -140,7 +140,17 @@ class QualityGatesSchema(BaseModel):
 
 
 class RoleModelPolicyEntry(BaseModel):
-    """Per-role model/provider policy."""
+    """Per-role model/provider policy.
+
+    ``base_url`` and ``api_key_env`` let a role target an OpenAI-compatible
+    endpoint other than the default: some roles (for example a local
+    reasoning model behind an OpenAI-compatible gateway) must not share the
+    default endpoint's credentials. ``api_key_env`` is the NAME of the
+    environment variable holding that endpoint's key, never a literal key;
+    it is validated against the same fail-closed credential allowlist the
+    ``openai_agents`` runner enforces so a repo-carried config cannot
+    forward arbitrary host secrets to an arbitrary endpoint.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -148,6 +158,8 @@ class RoleModelPolicyEntry(BaseModel):
     provider: str | None = None
     model: str | None = None
     effort: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
 
 
 class RoleConfigEntry(BaseModel):
@@ -196,6 +208,22 @@ class SessionSchema(BaseModel):
 
     resume: bool = True
     stale_after_minutes: int = Field(default=30, ge=1)
+
+
+class GithubSchema(BaseModel):
+    """GitHub integration configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sync_backlog: bool = Field(
+        default=False,
+        description=(
+            "Pull open GitHub issues into .sdd/backlog/open/ at bootstrap. "
+            "Off by default: syncing every open issue can silently displace a "
+            "seeded goal on a non-empty backlog. Overridable at runtime with "
+            "BERNSTEIN_SYNC_GITHUB_BACKLOG."
+        ),
+    )
 
 
 class ClusterSchema(BaseModel):
@@ -494,6 +522,7 @@ class BernsteinConfig(BaseModel):
     notify: NotifyConfigSchema | None = None
     storage: StorageSchema | None = None
     session: SessionSchema | None = None
+    github: GithubSchema | None = None
     cluster: ClusterSchema | None = None
     remote: RemoteSchema | None = None
     agency: AgencySchema | None = None

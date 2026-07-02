@@ -23,6 +23,7 @@ from bernstein.core.compliance import ComplianceConfig, CompliancePreset
 from bernstein.core.config.seed_config import (
     CORSConfig,
     DashboardAuthConfig,
+    GithubConfig,
     MetricSchema,
     ModelFallbackSeedConfig,
     NetworkConfig,
@@ -647,13 +648,32 @@ def _parse_role_model_policy(raw: object) -> dict[str, dict[str, str]] | None:
     return parsed
 
 
+_ROLE_POLICY_KEYS: tuple[str, ...] = (
+    "provider",
+    "model",
+    "effort",
+    "cli",
+    "base_url",
+    "api_key_env",
+)
+
+
 def _parse_single_role_policy(role: str, settings: object) -> dict[str, str]:
-    """Parse and validate a single role's model policy settings."""
+    """Parse and validate a single role's model policy settings.
+
+    ``base_url`` and ``api_key_env`` are optional per-role endpoint
+    overrides that flow through the spawn path into the adapter manifest
+    the same way ``model``/``provider`` do. ``api_key_env`` is the NAME of
+    an environment variable, never a literal key, and is validated against
+    the same fail-closed credential allowlist the ``openai_agents`` runner
+    enforces so a repo-carried config cannot forward an unrelated host
+    secret to an arbitrary endpoint.
+    """
     if not isinstance(settings, dict):
         raise SeedError(f"role_model_policy[{role!r}] must be a mapping")
 
     normalized: dict[str, str] = {}
-    for key in ("provider", "model", "effort", "cli"):
+    for key in _ROLE_POLICY_KEYS:
         value = settings.get(key)
         if value is None:
             continue
@@ -661,10 +681,22 @@ def _parse_single_role_policy(role: str, settings: object) -> dict[str, str]:
             raise SeedError(f"role_model_policy[{role!r}][{key!r}] must be a non-empty string")
         normalized[key] = value
 
+    # Reuse the adapter's fail-closed credential-name allowlist. Imported
+    # lazily so parsing a seed file does not import the adapters package
+    # (and its optional SDK path) at module load. A rejected name surfaces
+    # as a SeedError so the misconfig fails at parse time, not at spawn.
+    if "api_key_env" in normalized:
+        from bernstein.adapters.openai_agents_runner import validate_api_key_env_name
+
+        try:
+            validate_api_key_env_name(normalized["api_key_env"])
+        except RuntimeError as exc:
+            raise SeedError(f"role_model_policy[{role!r}][api_key_env]: {exc}") from exc
+
     if "cli" in normalized and "provider" not in normalized:
         normalized["provider"] = normalized["cli"]
 
-    unknown_keys = sorted(set(settings) - {"provider", "model", "effort", "cli"})
+    unknown_keys = sorted(set(settings) - set(_ROLE_POLICY_KEYS))
     if unknown_keys:
         raise SeedError(f"role_model_policy[{role!r}] has unknown keys: {', '.join(unknown_keys)}")
     return normalized
@@ -889,6 +921,24 @@ def _parse_session(raw: object) -> SessionConfig:
     if not isinstance(stale_raw, int) or stale_raw < 1:
         raise SeedError(f"session.stale_after_minutes must be a positive integer, got: {stale_raw!r}")
     return SessionConfig(resume=resume_raw, stale_after_minutes=stale_raw)
+
+
+def _parse_github(raw: object) -> GithubConfig:
+    """Parse the optional ``github`` section.
+
+    Only ``sync_backlog`` is recognised today. Auto-sync of open issues into
+    the backlog is opt-in (default ``False``) because it can silently displace
+    a seeded goal on a non-empty backlog.
+    """
+    if raw is None:
+        return GithubConfig()
+    if not isinstance(raw, dict):
+        raise SeedError(f"github must be a mapping, got: {type(raw).__name__}")
+    github_dict: dict[str, object] = cast("_StrObjDict", raw)
+    sync_raw: object = github_dict.get("sync_backlog", False)
+    if not isinstance(sync_raw, bool):
+        raise SeedError(f"github.sync_backlog must be a bool, got: {type(sync_raw).__name__}")
+    return GithubConfig(sync_backlog=sync_raw)
 
 
 def _parse_workspace(
@@ -1556,6 +1606,7 @@ def parse_seed(path: Path) -> SeedConfig:
 
     cluster = _parse_cluster(data.get("cluster"))
     session_cfg = _parse_session(data.get("session"))
+    github_cfg = _parse_github(data.get("github"))
     workspace = _parse_workspace(data.get("workspace"), data.get("repos"), path.parent)
     worktree_setup = _parse_worktree_setup(data.get("worktree_setup"))
     batch = _parse_batch(data.get("batch"))
@@ -1613,6 +1664,7 @@ def parse_seed(path: Path) -> SeedConfig:
         cluster=cluster,
         workspace=workspace,
         session=session_cfg,
+        github=github_cfg,
         worktree_setup=worktree_setup,
         secrets=secrets,
         key_rotation=key_rotation,
