@@ -736,6 +736,51 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
     )
 
 
+def _deepseek_debug_tool_schema_summary(tools: Any) -> list[dict[str, Any]]:
+    """Best-effort summary of a tool list's name + strict-schema flag.
+
+    [DEEPSEEK-DEBUG] diagnostic helper (2026-07-03): the empty-completion /
+    malformed-tool-call bug on ``deepseek/deepseek-chat`` via OpenRouter is
+    hypothesized to be triggered by the OpenAI Agents SDK's default
+    ``strict_json_schema=True`` on ``FunctionTool`` (see ``agents/tool.py``
+    ``strict_json_schema: bool = True`` and ``function_tool(strict_mode=True)``
+    defaults, and ``Converter.tool_to_openai`` which puts
+    ``"strict": tool.strict_json_schema`` directly into the outbound
+    ``ChatCompletionToolParam``). This walks whatever tool objects/dicts are
+    about to be handed to the SDK and reports, per tool, its name and
+    whatever strict-schema signal is discoverable - without assuming a
+    specific SDK version's exact attribute layout (best-effort; never
+    raises).
+
+    Args:
+        tools: The tool list about to be attached to ``agent_kwargs["tools"]``
+            - either raw dicts (gateway tool_source) or SDK ``Tool``
+            instances (builtin tool_source, built via ``@function_tool``).
+
+    Returns:
+        List of ``{"name": ..., "strict_json_schema": ..., "kind": ...,
+        "params_json_schema": ...}`` summaries. Never raises.
+    """
+    summaries: list[dict[str, Any]] = []
+    try:
+        for tool in tools or []:
+            entry: dict[str, Any] = {"kind": type(tool).__name__}
+            if isinstance(tool, dict):
+                entry["name"] = tool.get("name", "<unnamed-dict-tool>")
+                entry["strict_json_schema"] = tool.get("strict")
+                params = tool.get("parameters") or tool.get("params_json_schema")
+                entry["params_json_schema"] = params
+            else:
+                entry["name"] = getattr(tool, "name", "<unnamed-tool-object>")
+                entry["strict_json_schema"] = getattr(tool, "strict_json_schema", "<attr-absent>")
+                params_schema = getattr(tool, "params_json_schema", None)
+                entry["params_json_schema"] = params_schema
+            summaries.append(entry)
+    except Exception as exc:  # diagnostics only - never mask the real failure
+        summaries.append({"error": f"tool schema summary failed: {type(exc).__name__}: {exc}"})
+    return summaries
+
+
 def _resolve_heartbeat_dir(manifest: RunnerManifest) -> Path:
     """Return the directory heartbeat files must be written to.
 
@@ -1001,6 +1046,33 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
                 sandbox_provider=manifest.sandbox_provider,
                 allow_run_command=manifest.allow_run_command,
             )
+
+            # Disable strict JSON schema for non-OpenAI models (e.g.
+            # deepseek-chat via OpenRouter).  The SDK defaults
+            # strict_json_schema=True on every FunctionTool, which sends
+            # {"strict": true} in the tool schema.  Models that don't
+            # support OpenAI's strict structured-output mode return empty
+            # responses or malformed tool calls when they see this flag.
+            _model_lower = (manifest.model or "").lower()
+            _is_openai_native = any(
+                _model_lower.startswith(p)
+                for p in ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
+            )
+            if not _is_openai_native:
+                _relaxed_count = 0
+                for tool in agent_kwargs.get("tools", []):
+                    if getattr(tool, "strict_json_schema", None) is True:
+                        tool.strict_json_schema = False
+                        _relaxed_count += 1
+                if _relaxed_count:
+                    logger.info(
+                        "[DEEPSEEK-DEBUG] Relaxed strict_json_schema=False on %d tools "
+                        "for non-OpenAI model %r (strict mode causes empty responses "
+                        "on deepseek-chat and other non-OpenAI models via OpenRouter)",
+                        _relaxed_count,
+                        manifest.model,
+                    )
+
         settings_kwargs = _build_model_settings_kwargs(manifest, model_settings_cls=sdk.ModelSettings)
         if settings_kwargs:
             agent_kwargs["model_settings"] = sdk.ModelSettings(**settings_kwargs)
@@ -1017,6 +1089,82 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         max_turns = _resolve_max_turns(manifest.max_turns)
         if max_turns is not None:
             run_sync_kwargs["max_turns"] = max_turns
+        # [DEEPSEEK-DEBUG] Unconditional (not gated behind a debug flag)
+        # pre-call diagnostic for the deepseek/deepseek-chat-via-OpenRouter
+        # empty-completion / malformed-tool-call investigation (2026-07-03).
+        # Logged at INFO so it is captured on every run without operator
+        # opt-in. Never logs the API key itself - only the env var NAME.
+        _model_settings_obj = agent_kwargs.get("model_settings")
+        _model_settings_repr = (
+            {
+                "temperature": getattr(_model_settings_obj, "temperature", None),
+                "top_p": getattr(_model_settings_obj, "top_p", None),
+                "tool_choice": getattr(_model_settings_obj, "tool_choice", None),
+                "parallel_tool_calls": getattr(_model_settings_obj, "parallel_tool_calls", None),
+                "max_tokens": getattr(_model_settings_obj, "max_tokens", None),
+                "extra_args": getattr(_model_settings_obj, "extra_args", None),
+                "extra_headers": getattr(_model_settings_obj, "extra_headers", None),
+                "extra_body": getattr(_model_settings_obj, "extra_body", None),
+            }
+            if _model_settings_obj is not None
+            else "<no ModelSettings constructed - settings_kwargs was empty>"
+        )
+        _tool_list_for_log = agent_kwargs.get("tools", [])
+        logger.info(
+            "[DEEPSEEK-DEBUG] pre-call session=%s model=%r base_url=%r api_key_env=%r "
+            "explicit_model_client=%s tool_source=%r tool_count=%d max_turns=%s",
+            manifest.session_id,
+            manifest.model,
+            manifest.base_url,
+            manifest.api_key_env,
+            explicit_model_client is not None,
+            manifest.tool_source,
+            len(_tool_list_for_log),
+            max_turns,
+        )
+        logger.info(
+            "[DEEPSEEK-DEBUG] pre-call session=%s model_settings=%s "
+            "(tool_choice/parallel_tool_calls of None means the SDK/provider "
+            "default applies - bernstein never sets these explicitly)",
+            manifest.session_id,
+            _model_settings_repr,
+        )
+        logger.info(
+            "[DEEPSEEK-DEBUG] pre-call session=%s no extra_headers configured by bernstein "
+            "(no HTTP-Referer/X-Title sent to OpenRouter unless the SDK's own default "
+            "HEADERS constant includes them) - client_kwargs base_url=%r",
+            manifest.session_id,
+            client_kwargs.get("base_url"),
+        )
+        try:
+            _tool_schema_summary = _deepseek_debug_tool_schema_summary(_tool_list_for_log)
+            logger.info(
+                "[DEEPSEEK-DEBUG] pre-call session=%s tool_schemas=%s",
+                manifest.session_id,
+                json.dumps(_tool_schema_summary, default=str)[:8000],
+            )
+            _any_strict_true = any(
+                entry.get("strict_json_schema") is True for entry in _tool_schema_summary
+            )
+            if _any_strict_true:
+                logger.warning(
+                    "[DEEPSEEK-DEBUG] pre-call session=%s: at least one tool schema has "
+                    "strict_json_schema=True - the OpenAI Agents SDK sends this as "
+                    "'strict': true in the ChatCompletionToolParam.function block "
+                    "(agents/models/chatcmpl_converter.py Converter.tool_to_openai). "
+                    "This is the leading hypothesis for deepseek-chat-via-OpenRouter "
+                    "empty/malformed tool_calls - deepseek's function calling is not "
+                    "confirmed to fully support OpenAI's strict structured-output mode.",
+                    manifest.session_id,
+                )
+        except Exception as exc:  # diagnostics only - never mask the real failure
+            logger.warning(
+                "[DEEPSEEK-DEBUG] pre-call session=%s: tool schema logging itself failed: %s: %s",
+                manifest.session_id,
+                type(exc).__name__,
+                exc,
+            )
+
         # ``Runner.run_sync`` is the SDK's synchronous API - we avoid
         # ``asyncio.run`` here so the runner stays compatible with
         # environments where the event loop is already running
@@ -1024,6 +1172,67 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         # is only forwarded when configured (env/tuning) - omitting the
         # kwarg preserves the SDK's own default exactly, as before.
         result: Any = runner_cls.run_sync(agent, manifest.prompt, **run_sync_kwargs)
+
+        # [DEEPSEEK-DEBUG] Unconditional post-call diagnostic: dump as much
+        # of the raw SDK response shape as is discoverable so an empty
+        # completion (zero usage, empty summary) or a malformed-tool-call
+        # response is a direct log read instead of a re-run-and-guess.
+        try:
+            _raw_responses = getattr(result, "raw_responses", None) or []
+            _raw_summaries: list[dict[str, Any]] = []
+            for _rr in _raw_responses:
+                _rr_usage = getattr(_rr, "usage", None)
+                _output = getattr(_rr, "output", None)
+                _choices = getattr(_rr, "choices", None)
+                _summary: dict[str, Any] = {
+                    "usage": {
+                        "input_tokens": getattr(_rr_usage, "input_tokens", None),
+                        "output_tokens": getattr(_rr_usage, "output_tokens", None),
+                        "raw": str(_rr_usage) if _rr_usage is not None else None,
+                    },
+                }
+                if _choices is not None:
+                    _choice_summaries = []
+                    for _choice in _choices:
+                        _message = getattr(_choice, "message", None)
+                        _choice_summaries.append(
+                            {
+                                "finish_reason": getattr(_choice, "finish_reason", None),
+                                "content": getattr(_message, "content", None) if _message else None,
+                                "refusal": getattr(_message, "refusal", None) if _message else None,
+                                "tool_calls": str(getattr(_message, "tool_calls", None)) if _message else None,
+                            },
+                        )
+                    _summary["choices"] = _choice_summaries
+                if _output is not None:
+                    _summary["output"] = str(_output)[:4000]
+                _raw_summaries.append(_summary)
+            logger.info(
+                "[DEEPSEEK-DEBUG] post-call session=%s model=%s raw_responses_count=%d "
+                "final_output=%r raw_responses=%s",
+                manifest.session_id,
+                manifest.model,
+                len(_raw_responses),
+                str(getattr(result, "final_output", ""))[:2000],
+                json.dumps(_raw_summaries, default=str)[:8000],
+            )
+            _result_usage = getattr(result, "usage", None)
+            logger.info(
+                "[DEEPSEEK-DEBUG] post-call session=%s result.usage=%r "
+                "(RunResult/RunResultBase does not define 'usage' on installed SDK "
+                "0.17.7 per _extract_usage_tokens's docstring - expect None here; "
+                "the raw_responses per-call usage above is the real signal)",
+                manifest.session_id,
+                _result_usage,
+            )
+        except Exception as exc:  # diagnostics only - never mask the real failure
+            logger.warning(
+                "[DEEPSEEK-DEBUG] post-call session=%s: raw response logging itself "
+                "failed (SDK shape may differ from expected): %s: %s",
+                manifest.session_id,
+                type(exc).__name__,
+                exc,
+            )
     except Exception as exc:  # SDK errors are varied - catch broadly
         # D2 MiniMax attempt-3 (2026-07-03): agents that die on an
         # exception - especially ``MaxTurnsExceeded``, which by definition
@@ -1037,6 +1246,21 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         # the exception carries no run data, ``_emit_session_usage`` still
         # emits the ``usage_missing`` marker so downstream sees "unknown",
         # never a silent zero.
+        #
+        # [DEEPSEEK-DEBUG] Before this fix, everything downstream of this
+        # except block only ever saw ``f"{type(exc).__name__}: {exc}"`` -
+        # the full traceback was silently swallowed. Log it unconditionally
+        # at ERROR so an exception raised mid-call (e.g. a malformed
+        # response the SDK's client-side parsing chokes on) is a direct log
+        # read, not a guess from a one-line message.
+        logger.exception(
+            "[DEEPSEEK-DEBUG] exception in Runner.run_sync session=%s model=%s "
+            "base_url=%r exc_type=%s",
+            manifest.session_id,
+            manifest.model,
+            manifest.base_url,
+            type(exc).__name__,
+        )
         _emit_session_usage(
             manifest,
             getattr(exc, "run_data", None),

@@ -466,6 +466,29 @@ class OpenAIAgentsAdapter(PluginAdapter):
             len(manifest["tools"]),
         )
 
+        # [DEEPSEEK-DEBUG] Unconditional diagnostic for the
+        # deepseek/deepseek-chat-via-OpenRouter empty-completion / malformed
+        # tool-call investigation (2026-07-03). Confirms at the SPAWN side
+        # (before the runner subprocess even starts) that: (1) the model
+        # string is forwarded to the runner byte-for-byte with no name
+        # mapping/rewriting anywhere in this adapter, and (2) bernstein never
+        # sets any OpenRouter-recommended extra headers (HTTP-Referer,
+        # X-Title) anywhere in ``_build_manifest``/``spawn`` - grep this repo's
+        # ``src/bernstein/adapters/openai_agents*.py`` for "extra_headers" /
+        # "HTTP-Referer" / "X-Title" to confirm; there are none. If OpenRouter
+        # routing/model behavior depends on those headers being present, this
+        # is the log line proving they are absent for this spawn.
+        logger.info(
+            "[DEEPSEEK-DEBUG] spawn session=%s: model string forwarded verbatim (no "
+            "name mapping) model=%r, base_url=%r, api_key_env=%r (value never logged), "
+            "extra_headers_configured=False (bernstein sets no HTTP-Referer/X-Title/"
+            "any custom header anywhere in this adapter or the runner)",
+            session_id,
+            manifest.get("model"),
+            manifest.get("base_url") or "<default>",
+            api_key_env,
+        )
+
         cmd = [*self._runner_command(), "--manifest", str(manifest_path)]
 
         # Wrap with bernstein-worker for process visibility.
