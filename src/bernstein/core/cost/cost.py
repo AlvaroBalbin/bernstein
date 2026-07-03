@@ -57,7 +57,7 @@ class ModelUsdPer1MTokens(TypedDict, total=False):
     cache_write: float | None
 
 
-# Per-model input/output pricing per 1M tokens (USD). Keys match substring checks in ``_model_cost``.
+# Per-model input/output pricing per 1M tokens (USD). Keys are matched exactly (case-insensitive) in ``price_model_usage``.
 # Updated 2026-05-05 from official API pricing pages - GPT-5.5 added (announced
 # 2026-04-23, generally available in API on 2026-04-24).
 MODEL_COSTS_PER_1M_TOKENS: dict[str, ModelUsdPer1MTokens] = {
@@ -67,11 +67,9 @@ MODEL_COSTS_PER_1M_TOKENS: dict[str, ModelUsdPer1MTokens] = {
     # table rather than Anthropic's own billing. Introductory launch price
     # (anthropic.com/news/claude-sonnet-5) is $2/$10 per 1M in/out through
     # 2026-08-31, reverting to standard $3/$15 (== the generic "sonnet" row
-    # below) on 2026-09-01 - revisit this entry then. MUST precede the bare
-    # "sonnet" row below: substring matching in ``price_model_usage`` takes
-    # the first dict-order match, and "sonnet" is a substring of
-    # "claude-sonnet-5" - without this ordering every claude-sonnet-5 call
-    # would silently price at the wrong (generic sonnet) rate.
+    # below) on 2026-09-01 - revisit this entry then. "sonnet" is a substring
+    # of "claude-sonnet-5"; price_model_usage() uses exact matching so
+    # this entry and "sonnet" below are independent — no ordering concern.
     "claude-sonnet-5": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5},
     "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
     "opus": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
@@ -124,7 +122,7 @@ MODEL_COSTS_PER_1M_TOKENS: dict[str, ModelUsdPer1MTokens] = {
     # price_model_usage() below for the fix that makes unpriced models
     # visible instead of silently vanishing). Prices approximate MiniMax's
     # published API rates; keep "minimax-m3" ahead of any future bare
-    # "minimax" stem so substring matching cannot land on the wrong SKU.
+    # "minimax" stem (exact matching in price_model_usage makes ordering irrelevant).
     "minimax-m3": {"input": 0.3, "output": 1.2},
     "minimax-m2.7": {"input": 0.2, "output": 0.8},
 }
@@ -173,8 +171,10 @@ def price_model_usage(model: str, input_tokens: int, output_tokens: int) -> Usag
 
     Args:
         model: Model name/id as reported by the provider (e.g.
-            ``"gpt-5-mini"``, ``"MiniMax-M3"``). Matched case-insensitively
-            as a substring against :data:`MODEL_COSTS_PER_1M_TOKENS` keys.
+            ``"gpt-5-mini"``, ``"MiniMax-M3"``). Matched
+            via exact case-insensitive lookup against
+            :data:`MODEL_COSTS_PER_1M_TOKENS` keys (vendor prefixes like
+            ``deepseek/`` are stripped automatically).
         input_tokens: Prompt tokens consumed by this call.
         output_tokens: Completion tokens consumed by this call.
 
@@ -183,18 +183,23 @@ def price_model_usage(model: str, input_tokens: int, output_tokens: int) -> Usag
         model had a pricing-table entry.
     """
     model_lower = model.lower()
-    for key, pricing in MODEL_COSTS_PER_1M_TOKENS.items():
-        if key in model_lower:
-            cost = (input_tokens / 1_000_000.0) * pricing.get("input", 0.0) + (
-                output_tokens / 1_000_000.0
-            ) * pricing.get("output", 0.0)
-            return UsagePriceResult(
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_usd=cost,
-                priced=True,
-            )
+    pricing = MODEL_COSTS_PER_1M_TOKENS.get(model_lower)
+    if pricing is None:
+        # Try stripping vendor prefix (e.g. "deepseek/deepseek-chat" → "deepseek-chat")
+        bare = model_lower.rsplit("/", 1)[-1]
+        if bare != model_lower:
+            pricing = MODEL_COSTS_PER_1M_TOKENS.get(bare)
+    if pricing is not None:
+        cost = (input_tokens / 1_000_000.0) * pricing.get("input", 0.0) + (
+            output_tokens / 1_000_000.0
+        ) * pricing.get("output", 0.0)
+        return UsagePriceResult(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost,
+            priced=True,
+        )
     logger.warning(
         "price_model_usage: no pricing-table entry for model %r - metering at "
         "$0/token so this call's tokens stay visible instead of vanishing from "
