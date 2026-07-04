@@ -781,8 +781,8 @@ async def create_task(body: TaskCreate, request: Request) -> TaskResponse:
             if raw_role != "auto" and raw_role not in role_model_policy:
                 logger.warning(
                     "Rejecting task create: title=%r attempted role=%r is not a valid role. Valid roles=%s",
-                    effective_body.title,
-                    raw_role,
+                    sanitize_log(str(effective_body.title)),
+                    sanitize_log(str(raw_role)),
                     valid_roles,
                 )
                 raise HTTPException(
@@ -794,14 +794,14 @@ async def create_task(body: TaskCreate, request: Request) -> TaskResponse:
                 )
             logger.info(
                 "Task created with role=%r matched against role_model_policy keys=%s",
-                raw_role,
+                sanitize_log(str(raw_role)),
                 policy_keys,
             )
         else:
             logger.info(
                 "Task created with role=%r; no role_model_policy configured on this run "
                 "(seed_config=%s) -- skipping role validation",
-                raw_role,
+                sanitize_log(str(raw_role)),
                 "present but empty" if seed_config is not None else "absent",
             )
 
