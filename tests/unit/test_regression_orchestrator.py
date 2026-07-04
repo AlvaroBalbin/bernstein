@@ -289,13 +289,10 @@ class TestTaskStateTransitions:
         assert event.entity_type == "task"
 
     def test_illegal_task_transition_raises(self) -> None:
-        """DONE -> IN_PROGRESS is not in the transition table.
-
-        (DONE -> OPEN is intentionally legal now: bounded janitor reopen.)
-        """
+        """DONE -> OPEN is not in the transition table."""
         task = _make_task(id="T-bad", status="done")
         with pytest.raises(IllegalTransitionError):
-            transition_task(task, TaskStatus.IN_PROGRESS)
+            transition_task(task, TaskStatus.OPEN)
 
     def test_illegal_agent_transition_raises(self) -> None:
         """dead -> working is not allowed."""
