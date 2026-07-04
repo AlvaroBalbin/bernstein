@@ -74,3 +74,23 @@ def test_hold_create_rejects_unknown_fields(client: TestClient) -> None:
     """extra="forbid" - a misspelled TTL field must 422, not silently default."""
     resp = client.post("/orchestrator/holds", json={"reason": "x", "ttl_s": 5})
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("bad_ttl", ["-5", "0", "NaN", "Infinity"])
+def test_hold_create_rejects_non_positive_or_non_finite_ttl(client: TestClient, bad_ttl: str) -> None:
+    """A NaN TTL makes expires_at NaN, so the hold would never expire or purge.
+
+    Negative/zero TTLs reject with a clean 422. Non-finite TTLs are also
+    rejected before any hold is created, but FastAPI cannot serialise the
+    offending float back into the 422 body, so the crash guard converts
+    those to a 500 - either way the request must fail and no hold may be
+    registered.
+    """
+    before = client.get("/orchestrator/holds").json()["count"]
+    resp = client.post(
+        "/orchestrator/holds",
+        content=f'{{"reason": "x", "ttl_seconds": {bad_ttl}}}',
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code >= 400, (bad_ttl, resp.status_code, resp.text)
+    assert client.get("/orchestrator/holds").json()["count"] == before

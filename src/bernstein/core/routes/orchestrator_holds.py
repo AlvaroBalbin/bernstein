@@ -38,7 +38,16 @@ class HoldCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(..., description="Why the caller wants the orchestrator to stay up")
-    ttl_seconds: float | None = Field(default=None, description="Grace-window auto-expiry; server default if omitted")
+    # gt=0 / allow_inf_nan=False: a NaN TTL would make expires_at NaN, and
+    # since NaN comparisons are always False the hold would never expire and
+    # never be purged - silently defeating the auto-expiry guarantee. Zero
+    # and negative TTLs are instantly-expired no-ops; reject them loudly too.
+    ttl_seconds: float | None = Field(
+        default=None,
+        gt=0.0,
+        allow_inf_nan=False,
+        description="Grace-window auto-expiry; server default if omitted",
+    )
 
 
 class HoldResponse(BaseModel):
