@@ -1896,8 +1896,7 @@ class AgentSpawner:
             heartbeat_dir = str(self._workdir / ".sdd" / "runtime" / "heartbeats")
             instrumentation_root = str(self._workdir)
         logger.info(
-            "heartbeat_dir/instrumentation_root injection check: adapter=%s "
-            "consumes_heartbeat_dir=%s injected=%s",
+            "heartbeat_dir/instrumentation_root injection check: adapter=%s consumes_heartbeat_dir=%s injected=%s",
             adapter.name() if hasattr(adapter, "name") else type(adapter).__name__,
             consumes,
             injected,

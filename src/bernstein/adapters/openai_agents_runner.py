@@ -285,8 +285,7 @@ def _model_name_for_hooks(agent: Any, manifest: RunnerManifest) -> str:
                 return inner
     except Exception as exc:
         logger.warning(
-            "_model_name_for_hooks: failed to resolve model name for session=%s, "
-            "falling back to manifest.model=%r: %s",
+            "_model_name_for_hooks: failed to resolve model name for session=%s, falling back to manifest.model=%r: %s",
             manifest.session_id,
             manifest.model,
             exc,
