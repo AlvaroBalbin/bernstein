@@ -64,8 +64,6 @@ from urllib.parse import urlparse
 
 import yaml
 
-import yaml
-
 from bernstein.core.instrumentation import get_instrumenter, init_instrumenter, resolve_agent_dir
 from bernstein.core.security.sanitize import sanitize_log
 
