@@ -400,8 +400,8 @@ def _build_instrumentation_hooks(sdk: Any, manifest: RunnerManifest) -> Any:
                 )
                 _mark_hook_llm_call_logged()
                 logger.debug(
-                    "wrote llm_call entry call_id=%s session=%s model=%s prompt_tokens=%s "
-                    "completion_tokens=%s total_tokens=%s",
+                    "wrote llm_call entry call_id=%s session=%s model=%s usage_prompt=%s "
+                    "usage_completion=%s usage_total=%s",
                     call_id,
                     manifest.session_id,
                     model_name,
@@ -1264,7 +1264,7 @@ def _load_council_config(manifest: RunnerManifest) -> dict[str, Any] | None:
         )
         return manifest.council
 
-    if not (manifest.model.endswith(".yaml") or manifest.model.endswith(".yml")):
+    if not manifest.model.endswith((".yaml", ".yml")):
         return None
 
     config_path = _resolve_council_config_path(manifest, manifest.model)
