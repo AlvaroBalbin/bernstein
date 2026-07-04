@@ -356,7 +356,9 @@ class TestSpawnerWithRouter:
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
         router = _make_router()
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="sonnet")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="sonnet"
+        )
 
         task = make_task(scope=Scope.LARGE, complexity=Complexity.HIGH)
         session = spawner.spawn_for_tasks([task])
@@ -377,7 +379,9 @@ class TestSpawnerWithRouter:
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
         router = _make_router()
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="sonnet")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="sonnet"
+        )
 
         task = make_task(scope=Scope.LARGE, complexity=Complexity.HIGH)
         spawner.spawn_for_tasks([task])
@@ -397,7 +401,9 @@ class TestSpawnerWithRouter:
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
         router = _make_router()
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task(scope=Scope.LARGE, complexity=Complexity.HIGH)
         session = spawner.spawn_for_tasks([task])
@@ -410,7 +416,9 @@ class TestSpawnerWithRouter:
         adapter = mock_adapter_factory(pid=400)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, router=None, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, router=None, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task()
         session = spawner.spawn_for_tasks([task])
@@ -424,7 +432,9 @@ class TestSpawnerWithRouter:
         templates_dir.mkdir(parents=True)
         # Router with no providers will raise RouterError
         router = TierAwareRouter()
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, router=router, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task()
         session = spawner.spawn_for_tasks([task])
@@ -1491,7 +1501,9 @@ class TestSpawnForTasksWithCatalog:
         adapter = mock_adapter_factory(pid=700)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task(role="backend", description="Implement JWT authentication")
         spawner.spawn_for_tasks([task])
@@ -1514,7 +1526,9 @@ class TestSpawnForTasksWithCatalog:
         adapter = mock_adapter_factory(pid=701)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task(role="backend", description="Review code quality")
         spawner.spawn_for_tasks([task])
@@ -1530,7 +1544,9 @@ class TestSpawnForTasksWithCatalog:
         adapter = mock_adapter_factory(pid=702)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, catalog=None, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, catalog=None, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task(role="backend", description="Write some code")
         spawner.spawn_for_tasks([task])
@@ -1551,7 +1567,9 @@ class TestSpawnForTasksWithCatalog:
         adapter = mock_adapter_factory(pid=703)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task(role="backend", description="Implement JWT auth")
         session = spawner.spawn_for_tasks([task])
@@ -1570,7 +1588,9 @@ class TestSpawnForTasksWithCatalog:
         adapter = mock_adapter_factory(pid=704)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model")
+        spawner = AgentSpawner(
+            adapter, templates_dir, tmp_path, catalog=catalog, use_worktrees=False, default_model="mock-model"
+        )
 
         task = make_task(role="backend", description="Write some backend code")
         session = spawner.spawn_for_tasks([task])
