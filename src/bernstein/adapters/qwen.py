@@ -126,7 +126,11 @@ class QwenAdapter(CLIAdapter):
                 ``top_p`` overrides - the only two sampling fields this
                 adapter's :meth:`plugin_info` declares support for.
         """
-        cmd: list[str] = ["qwen", "-y"]
+        # ``--approval-mode yolo`` is the current documented auto-approve flag
+        # in qwen-code (the unified form; the older ``-y`` / ``--yolo`` spellings
+        # are no longer shown in ``qwen --help``). ``--approval-mode`` is the
+        # stable flag the adapter contract verifies against the CLI help.
+        cmd: list[str] = ["qwen", "--approval-mode", "yolo"]
 
         # Map abstract/alias names to real Qwen API model IDs.
         # Always pass --model explicitly to avoid relying on settings.json.
