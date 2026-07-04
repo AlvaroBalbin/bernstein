@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 
 from bernstein.core.agent_log_aggregator import AgentLogAggregator
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.completion_budget import CompletionBudget
 from bernstein.core.context import append_decision
 from bernstein.core.context_recommendations import RecommendationEngine
@@ -2120,16 +2121,28 @@ def claim_and_spawn_batches(
         if len(batch) == 1:
             l1_check = classify_task(batch[0])
             if l1_check.level == TaskLevel.L1 and not batch[0].model:
-                l1_cfg = get_l1_model_config()
-                batch[0].model = l1_cfg.model
-                batch[0].effort = l1_cfg.effort
-                logger.info(
-                    "L1 downgrade for task %s -> %s/%s (%s)",
-                    batch[0].id,
-                    l1_cfg.model,
-                    l1_cfg.effort,
-                    l1_check.reason,
-                )
+                try:
+                    l1_cfg = get_l1_model_config()
+                except ModelNotConfiguredError:
+                    # fast_path.l1_model is not configured: skip the L1
+                    # downgrade and let standard routing apply the
+                    # operator-configured default_model (or refuse with a
+                    # clear error if none is configured anywhere).
+                    logger.info(
+                        "Task %s classified L1 but fast_path.l1_model is not configured - skipping L1 downgrade",
+                        batch[0].id,
+                    )
+                    l1_cfg = None
+                if l1_cfg is not None:
+                    batch[0].model = l1_cfg.model
+                    batch[0].effort = l1_cfg.effort
+                    logger.info(
+                        "L1 downgrade for task %s -> %s/%s (%s)",
+                        batch[0].id,
+                        l1_cfg.model,
+                        l1_cfg.effort,
+                        l1_check.reason,
+                    )
 
         # Provider batch: submit eligible low-risk single-task work to
         # OpenAI/Anthropic batch APIs instead of spawning a local CLI agent.

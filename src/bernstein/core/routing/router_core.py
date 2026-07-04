@@ -1042,13 +1042,27 @@ def _check_opus_override(
 
 
 def _try_l1_fast_path(task: Task) -> ModelConfig | None:
-    """Try L1 fast-path routing for simple tasks."""
+    """Try L1 fast-path routing for simple tasks.
+
+    Returns None (fall through to the remaining routing sources) when
+    ``fast_path.l1_model`` is not configured, so an operator-configured
+    ``default_model`` still applies to L1-classified tasks. If no source
+    at all configures a model, the heuristic fallback in
+    ``_select_model_config`` raises ``ModelNotConfiguredError``.
+    """
     from bernstein.core.fast_path import TaskLevel, classify_task, get_l1_model_config
 
     classification = classify_task(task)
     if classification.level != TaskLevel.L1:
         return None
-    l1_cfg = get_l1_model_config()
+    try:
+        l1_cfg = get_l1_model_config()
+    except ModelNotConfiguredError:
+        logger.info(
+            "Task %s classified L1 but fast_path.l1_model is not configured - falling through to standard routing",
+            task.id,
+        )
+        return None
     logger.info(
         "Task %s: Selected %s/%s (L1 fast-path: role=%s, scope=%s, %s)",
         task.id,
