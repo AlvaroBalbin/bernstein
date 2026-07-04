@@ -41,11 +41,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from bernstein.core.security.sanitize import sanitize_log
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,35 @@ RUN_ID_ENV_VAR = "BERNSTEIN_RUN_ID"
 # wanted here, never full payloads (see module docstring + task spec).
 _ARG_VALUE_TRUNCATE_CHARS = 500
 _TRUNCATE_MARKER = "...[truncated]"
+
+# Filesystem-safe shape for a single directory-name component. run_id arrives
+# via an environment variable and task_id/agent_id via the runner manifest,
+# so :func:`resolve_agent_dir` treats all three as untrusted before joining
+# them into a path (see :func:`_sanitize_path_component`).
+_SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_COMPONENT_CHARS = 128
+_FALLBACK_COMPONENT = "unknown"
+
+
+def _sanitize_path_component(value: str) -> str:
+    """Reduce an untrusted id to a single safe directory-name component.
+
+    Keeps only the final path component (dropping separators, absolute
+    prefixes, and ``..`` segments before it), replaces every character
+    outside ``[A-Za-z0-9._-]`` with ``_``, caps the length, and collapses
+    anything that could still escape the directory (empty string, ``.``,
+    ``..``, all-dot names) to ``"unknown"``. Never raises - a hostile or
+    malformed id degrades to a wrong-but-contained directory name, matching
+    this module's observe-only contract.
+    """
+    cleaned = str(value).replace("\x00", "").strip()
+    # Normalize backslashes so a Windows-style separator cannot survive as a
+    # literal character on POSIX, then keep only the last path component.
+    cleaned = PurePosixPath(cleaned.replace("\\", "/")).name
+    cleaned = _SAFE_COMPONENT_RE.sub("_", cleaned)[:_MAX_COMPONENT_CHARS]
+    if not cleaned or cleaned.strip(".") == "":
+        return _FALLBACK_COMPONENT
+    return cleaned
 
 
 def _now_iso() -> str:
@@ -126,9 +158,9 @@ class RunInstrumenter:
             logger.info(
                 "RunInstrumenter initialized run_id=%s task_id=%s agent_id=%s -> "
                 "llm_calls=%s tool_calls=%s conversation=%s",
-                self.run_id,
-                self.task_id,
-                self.agent_id,
+                sanitize_log(self.run_id),
+                sanitize_log(self.task_id),
+                sanitize_log(self.agent_id),
                 self._llm_calls_path(),
                 self._tool_calls_path(),
                 self._conversation_path(),
@@ -139,9 +171,9 @@ class RunInstrumenter:
                 "task_id=%s agent_id=%s): %s - instrumentation for this agent is "
                 "DISABLED, the agent run itself is unaffected",
                 self.base_dir,
-                self.run_id,
-                self.task_id,
-                self.agent_id,
+                sanitize_log(self.run_id),
+                sanitize_log(self.task_id),
+                sanitize_log(self.agent_id),
                 exc,
             )
 
@@ -172,14 +204,18 @@ class RunInstrumenter:
         try:
             line = json.dumps(record, ensure_ascii=False, default=str)
         except (TypeError, ValueError) as exc:
-            logger.warning("RunInstrumenter: failed to serialize %s record %s=%s: %s", kind, kind, key, exc)
+            logger.warning(
+                "RunInstrumenter: failed to serialize %s record %s=%s: %s", kind, kind, sanitize_log(key), exc
+            )
             return
         try:
             with self._lock, path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-            logger.debug("RunInstrumenter: wrote %s record %s=%s to %s", kind, kind, key, path)
+            logger.debug("RunInstrumenter: wrote %s record %s=%s to %s", kind, kind, sanitize_log(key), path)
         except OSError as exc:
-            logger.warning("RunInstrumenter: failed to write %s record %s=%s to %s: %s", kind, kind, key, path, exc)
+            logger.warning(
+                "RunInstrumenter: failed to write %s record %s=%s to %s: %s", kind, kind, sanitize_log(key), path, exc
+            )
 
     # -- public API -------------------------------------------------------
 
@@ -232,7 +268,7 @@ class RunInstrumenter:
                 record["tokens_per_sec"] = tokens_per_sec
             self._append_line(self._llm_calls_path(), record, kind="llm_call", key=call_id)
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
-            logger.warning("RunInstrumenter.log_llm_call failed for call_id=%s: %s", call_id, exc)
+            logger.warning("RunInstrumenter.log_llm_call failed for call_id=%s: %s", sanitize_log(call_id), exc)
 
     def log_tool_call(
         self,
@@ -267,7 +303,7 @@ class RunInstrumenter:
             }
             self._append_line(self._tool_calls_path(), record, kind="tool_call", key=call_id)
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
-            logger.warning("RunInstrumenter.log_tool_call failed for call_id=%s: %s", call_id, exc)
+            logger.warning("RunInstrumenter.log_tool_call failed for call_id=%s: %s", sanitize_log(call_id), exc)
 
     def log_message(
         self,
@@ -339,8 +375,24 @@ def resolve_agent_dir(workdir: Path, run_id: str, task_id: str, agent_id: str) -
 
     Mirrors the wave-2 run layout (``.sdd/runs/<run_id>/...``) documented in
     :mod:`bernstein.core.orchestration.run_report`.
+
+    Each id is sanitized to a single directory-name component first (see
+    :func:`_sanitize_path_component`): ``run_id`` comes from the
+    ``BERNSTEIN_RUN_ID`` environment variable and ``task_id``/``agent_id``
+    from the runner manifest, so a value carrying path separators or ``..``
+    segments must not be able to point the instrumentation tree outside
+    ``<workdir>/.sdd/runs/``.
     """
-    return workdir / ".sdd" / "runs" / run_id / "tasks" / task_id / "agents" / agent_id
+    return (
+        workdir
+        / ".sdd"
+        / "runs"
+        / _sanitize_path_component(run_id)
+        / "tasks"
+        / _sanitize_path_component(task_id)
+        / "agents"
+        / _sanitize_path_component(agent_id)
+    )
 
 
 def init_instrumenter(*, run_id: str, task_id: str, agent_id: str, base_dir: Path) -> RunInstrumenter:
