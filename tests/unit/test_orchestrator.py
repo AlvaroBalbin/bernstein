@@ -235,9 +235,15 @@ def _build_orchestrator(
     transport: httpx.MockTransport,
     adapter: CLIAdapter | None = None,
     config: OrchestratorConfig | None = None,
-    default_model: str | None = None,
+    default_model: str | None = "mock-model",
 ) -> Orchestrator:
-    """Convenience: wire up orchestrator with mocked transport."""
+    """Convenience: wire up orchestrator with mocked transport.
+
+    ``default_model`` defaults to a mock value because routing now refuses
+    to spawn when no model is configured anywhere; tests here exercise
+    orchestrator scheduling, not model configuration. Pass ``None``
+    explicitly to exercise the unconfigured-model refusal path.
+    """
     cfg = config or OrchestratorConfig(
         max_agents=6,
         poll_interval_s=1,
