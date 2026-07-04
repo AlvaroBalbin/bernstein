@@ -5580,9 +5580,9 @@ if __name__ == "__main__":
         logger.exception("Orchestrator crashed")
         try:
             _crash_log_dir = workdir / ".sdd" / "runtime"
-            os.makedirs(_crash_log_dir, exist_ok=True)
+            _crash_log_dir.mkdir(parents=True, exist_ok=True)
             _crash_log_path = _crash_log_dir / "spawner_crash.log"
-            with open(_crash_log_path, "a", encoding="utf-8") as _crash_fh:
+            with _crash_log_path.open("a", encoding="utf-8") as _crash_fh:
                 _crash_fh.write(f"\n=== spawner crash at {datetime.now(UTC).isoformat()} ===\n")
                 _crash_fh.write(_crash_tb)
                 _crash_fh.write("\n")
