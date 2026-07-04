@@ -1230,6 +1230,7 @@ def create_app(
     from bernstein.core.routes.hooks import router as hooks_router
     from bernstein.core.routes.identities import router as identities_router
     from bernstein.core.routes.mcp_bot_tools import router as mcp_bot_tools_router
+    from bernstein.core.routes.orchestrator_holds import router as orchestrator_holds_router
     from bernstein.core.routes.paginated_tasks import router as paginated_tasks_router
     from bernstein.core.routes.plans import router as plans_router
     from bernstein.core.routes.predictive import router as predictive_router
@@ -1301,6 +1302,7 @@ def create_app(
         well_known_router,
         mcp_bot_tools_router,
         session_peek_router,
+        orchestrator_holds_router,
     ]
 
     for r in all_routers:
