@@ -1925,7 +1925,7 @@ class Orchestrator:
                         # this instant still prevents the stop for this tick.
                         try:
                             _active_holds = fetch_active_holds(self._client, base)
-                        except Exception as exc:  # noqa: BLE001 - defensive, must never crash the tick loop
+                        except Exception as exc:  # intentional-broad-except: must never crash the tick loop
                             logger.warning(
                                 "fetch_active_holds raised during quiescence self-stop check (tick #%d): %s "
                                 "- treating as no active holds",
@@ -1936,8 +1936,7 @@ class Orchestrator:
                         if _active_holds:
                             _hold_reasons = [str(h.get("reason", "<no reason>")) for h in _active_holds]
                             logger.info(
-                                "Quiescence detected but %d active hold(s) present (tick #%d) - skipping "
-                                "self-stop: %s",
+                                "Quiescence detected but %d active hold(s) present (tick #%d) - skipping self-stop: %s",
                                 len(_active_holds),
                                 self._tick_count,
                                 _hold_reasons,

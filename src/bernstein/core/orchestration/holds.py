@@ -44,7 +44,7 @@ DEFAULT_TTL_SECONDS: float = 45.0
 
 
 @dataclass(frozen=True, slots=True)
-class Hold(object):
+class Hold:
     """A single active hold preventing orchestrator self-stop.
 
     Attributes:
