@@ -2418,12 +2418,17 @@ class AgentSpawner:
         #      based on task complexity, scope, and role templates.
         # ---------------------------------------------------------------
         metrics_dir = self._workdir / ".sdd" / "metrics"
+        # role_model_policy may pin this role's model below; feed that pin to
+        # the heuristic selector as the default so a role-policy-only config
+        # (no run-level default_model) does not fail heuristic routing before
+        # the pin is applied.
+        _policy_preview = self._role_model_policy.get(tasks[0].role) or self._role_model_policy.get("default") or {}
         base_config = _select_batch_config(
             tasks,
             templates_dir=self._templates_dir,
             metrics_dir=metrics_dir if metrics_dir.exists() else None,
             workdir=self._workdir,
-            default_model=self._default_model,
+            default_model=self._default_model or _policy_preview.get("model"),
         )
         if model_override:
             base_config = ModelConfig(
@@ -3286,12 +3291,15 @@ class AgentSpawner:
         )
 
         metrics_dir = self._workdir / ".sdd" / "metrics"
+        # Same role-policy fallback as the main spawn path: a role-policy-only
+        # config (no run-level default_model) must not fail heuristic routing.
+        _policy_preview = self._role_model_policy.get(tasks[0].role) or self._role_model_policy.get("default") or {}
         model_config = _select_batch_config(
             tasks,
             templates_dir=self._templates_dir,
             metrics_dir=metrics_dir if metrics_dir.exists() else None,
             workdir=self._workdir,
-            default_model=self._default_model,
+            default_model=self._default_model or _policy_preview.get("model"),
         )
         role = tasks[0].role
         session_id = f"{role}-resume-{uuid.uuid4().hex[:8]}"
