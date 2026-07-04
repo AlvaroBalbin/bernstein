@@ -45,14 +45,19 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from bernstein.core.security.sanitize import sanitize_log
+
 if TYPE_CHECKING:
     from bernstein.adapters.openai_agents_runner import RunnerManifest
 
 logger = logging.getLogger(__name__)
 
 # Default per-candidate (and per-judge) wall-clock budget when the council
-# config does not set its own ``timeout``. Matches
-# ``config_schema.CouncilConfig.timeout``'s Pydantic default.
+# config does not set its own ``timeout``. Deliberately more generous than
+# ``config_schema.CouncilConfig.timeout``'s Pydantic default (60.0): this
+# fallback only fires for a council YAML file that omits ``timeout``
+# entirely, and each member drives a WHOLE multi-turn task run here, not a
+# single call.
 DEFAULT_TIMEOUT_SECONDS = 120.0
 
 
@@ -230,17 +235,22 @@ async def _run_candidate(
             label,
             time.monotonic() - started,
             type(exc).__name__,
-            exc,
+            # Provider exception messages can embed response fragments -
+            # sanitize so a crafted payload cannot forge log lines.
+            sanitize_log(str(exc)),
         )
         return None
 
     elapsed = time.monotonic() - started
     output_text = str(getattr(result, "final_output", ""))
     logger.info(
-        "run_council._run_candidate: %s responded in %.2fs - FULL output follows:\n%s",
+        "run_council._run_candidate: %s responded in %.2fs - FULL output follows "
+        "(newlines escaped, never truncated):\n%s",
         label,
         elapsed,
-        output_text,
+        # Model output is external input: escape newlines so a crafted
+        # completion cannot forge log entries, while keeping every byte.
+        sanitize_log(output_text),
     )
     return label, str(model_id), result
 
@@ -326,7 +336,9 @@ async def _run_judge(
         timeout,
         max_turns if max_turns is not None else "SDK-default",
         len(candidate_outputs),
-        judge_prompt,
+        # The judge prompt embeds the task prompt and candidate outputs -
+        # both external input - so escape newlines before logging.
+        sanitize_log(judge_prompt),
     )
     started = time.monotonic()
     judge_result = await asyncio.wait_for(
@@ -336,9 +348,11 @@ async def _run_judge(
     elapsed = time.monotonic() - started
     output_text = str(getattr(judge_result, "final_output", ""))
     logger.info(
-        "run_council._run_judge: judge responded in %.2fs - FULL synthesis output follows:\n%s",
+        "run_council._run_judge: judge responded in %.2fs - FULL synthesis output "
+        "follows (newlines escaped, never truncated):\n%s",
         elapsed,
-        output_text,
+        # Model output is external input - escape newlines before logging.
+        sanitize_log(output_text),
     )
     return judge_result
 
@@ -362,7 +376,12 @@ async def _run_council_async(
         logger.error(msg)
         raise RuntimeError(msg)
     timeout_value = council_cfg.get("timeout")
-    timeout = float(timeout_value) if isinstance(timeout_value, (int, float)) else DEFAULT_TIMEOUT_SECONDS
+    # Reject bools explicitly (bool is an int subclass, so ``timeout: true``
+    # in a council YAML file would otherwise silently become 1.0s).
+    if isinstance(timeout_value, (int, float)) and not isinstance(timeout_value, bool):
+        timeout = float(timeout_value)
+    else:
+        timeout = DEFAULT_TIMEOUT_SECONDS
 
     # Reuse the runner's own max_turns resolution (manifest field > env var >
     # yaml tuning default > SDK default) so a council role gets the exact
