@@ -14,6 +14,7 @@ alwaysApply: false
 | `credential_scoping.py`     | Agent credential scope minimization for least-privilege API keys |
 | `dataclass_helpers.py`      | Helpers for preserving dataclass instance types through updates |
 | `defaults.py`               | Centralized default values for the Bernstein orchestrator |
+| `instrumentation.py`        | Wave-3 per-agent instrumentation: LLM calls, tool calls, and conversation history |
 | `streaming_merge.py`        | Streaming task results for long-running agents (incremental merge) |
 | `agents/`                   | agents sub-package |
 | `approval/`                 | Interactive tool-call approval (op-002) |
