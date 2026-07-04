@@ -501,7 +501,7 @@ class Orchestrator:
         try:
             os.environ["BERNSTEIN_RUN_ID"] = run_id
             logger.info("Exported BERNSTEIN_RUN_ID=%s for spawned-agent instrumentation", run_id)
-        except Exception as exc:  # noqa: BLE001 - defensive, must never block startup
+        except Exception as exc:  # intentional-broad-except: defensive, must never block startup
             logger.warning("Failed to export BERNSTEIN_RUN_ID=%s to process env: %s", run_id, exc)
         hard_budget_usd = 0.0
         _raw_hard = os.environ.get("BERNSTEIN_HARD_BUDGET_USD", "").strip()
