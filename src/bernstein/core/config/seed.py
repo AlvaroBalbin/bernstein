@@ -19,8 +19,6 @@ from typing import Any, Literal, cast
 
 import yaml
 
-logger = logging.getLogger(__name__)
-
 # Re-export all dataclasses / config types from seed_config
 from bernstein.core.config.seed_config import (  # noqa: F401
     CORSConfig,
@@ -40,8 +38,15 @@ from bernstein.core.config.seed_config import (  # noqa: F401
     github_backlog_sync_enabled,
 )
 
-# Re-export all parsing functions from seed_parser
+# Re-export all parsing functions and regex/frozenset constants from
+# seed_parser that callers may reference
 from bernstein.core.config.seed_parser import (  # noqa: F401
+    _ALLOWED_WEBHOOK_EVENTS,
+    _BUDGET_RE,
+    _DEFAULT_RATE_LIMIT_PATHS,
+    _ENV_REF_RE,
+    _VALID_CLIS,
+    _WEBHOOK_EVENT_ALIASES,
     _expand_env_value,
     _normalize_webhook_event,
     _parse_bridge_settings,
@@ -69,15 +74,7 @@ from bernstein.core.models import (
     TaskStatus,
 )
 
-# Re-export regex/frozenset constants that callers may reference
-from bernstein.core.config.seed_parser import (  # noqa: F401
-    _ALLOWED_WEBHOOK_EVENTS,
-    _BUDGET_RE,
-    _DEFAULT_RATE_LIMIT_PATHS,
-    _ENV_REF_RE,
-    _VALID_CLIS,
-    _WEBHOOK_EVENT_ALIASES,
-)
+logger = logging.getLogger(__name__)
 
 # Type alias kept for backward compatibility
 type _StrObjDict = dict[str, object]
