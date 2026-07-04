@@ -923,7 +923,7 @@ class TaskStore:
         logger.info(
             "TaskStore.create: max_turns=%r for title=%r (None => auto-computed at spawn time)",
             max_turns_raw,
-            req.title,
+            sanitize_log(req.title),
         )
 
         task = Task(
