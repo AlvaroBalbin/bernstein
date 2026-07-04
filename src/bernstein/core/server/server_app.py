@@ -321,6 +321,7 @@ def task_to_response(task: Task) -> TaskResponse:
         terminal_reason=task.terminal_reason,
         max_output_tokens=task.max_output_tokens,
         meta_messages=list(task.meta_messages),
+        max_turns=task.max_turns,
     )
 
 

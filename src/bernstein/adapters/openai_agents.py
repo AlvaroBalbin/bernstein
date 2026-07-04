@@ -284,6 +284,26 @@ class OpenAIAgentsAdapter(PluginAdapter):
             heartbeat_dir = mcp_config.get("heartbeat_dir")
             if isinstance(heartbeat_dir, str) and heartbeat_dir:
                 overrides["heartbeat_dir"] = heartbeat_dir
+            # Wave 3 (per-agent instrumentation): task id injected by
+            # spawner_core so the runner's RunInstrumenter can write under
+            # .sdd/runs/<run_id>/tasks/<task_id>/agents/<session_id>/.
+            # Absent on hand-written manifests (e.g. direct-invocation
+            # tests) - the runner falls back to "unknown" in that case.
+            task_id = mcp_config.get("task_id")
+            if isinstance(task_id, str) and task_id:
+                overrides["task_id"] = task_id
+            # Wave 3 (per-agent instrumentation): orchestrator-root
+            # directory injected by spawner_core (mirrors heartbeat_dir
+            # above). ``workdir`` is a per-session worktree under default
+            # isolation and gets deleted on cleanup/merge - instrumentation
+            # JSONL must be anchored to the project root, not the worktree,
+            # or the files land somewhere nobody looks and are then
+            # deleted with the worktree. Absent on hand-written manifests
+            # (e.g. direct-invocation tests) - the runner falls back to
+            # ``workdir`` in that case.
+            instrumentation_root = mcp_config.get("instrumentation_root")
+            if isinstance(instrumentation_root, str) and instrumentation_root:
+                overrides["instrumentation_root"] = instrumentation_root
 
         # ``max_tokens`` from ``mcp_config`` (mode-profile override) wins; the
         # model_config value is only the fallback when the override is absent.

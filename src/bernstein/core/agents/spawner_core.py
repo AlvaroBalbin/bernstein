@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import json
 import logging
 import re
@@ -1867,6 +1868,22 @@ class AgentSpawner:
         the ``HeartbeatMonitor`` polls - without this injection the
         heartbeat would land in the worktree and never be observed.
 
+        The SAME attribute gates injection of ``instrumentation_root``:
+        the orchestrator's wave-2 phase/task timing (``write_summary_json``)
+        lives under ``self._workdir / ".sdd" / "runs" / <run_id>`` (the
+        project root), but the runner subprocess only knows its own
+        per-session worktree path (``manifest.workdir``) under default
+        worktree isolation (``use_worktrees=True``). Without this
+        injection ``RunInstrumenter`` writes its llm-calls/tool-calls/
+        conversation JSONL under ``<worktree>/.sdd/runs/...`` instead -
+        a directory that (a) nobody looks in, since the run report lives
+        at the project root, and (b) is deleted outright when the
+        worktree is merged/cleaned up after the task finishes, so the
+        JSONL files vanish even on a fully successful run. This exactly
+        mirrors the pre-existing ``heartbeat_dir`` bug this docstring
+        describes above, just for wave-3 instrumentation instead of
+        wave-2 heartbeats.
+
         Adapters without the attribute get ``mcp_config`` back unchanged
         so their MCP config files stay byte-identical.
 
@@ -1881,15 +1898,20 @@ class AgentSpawner:
         injected = bool(consumes)
         if injected:
             heartbeat_dir = str(self._workdir / ".sdd" / "runtime" / "heartbeats")
+            instrumentation_root = str(self._workdir)
         logger.info(
-            "heartbeat_dir injection check: adapter=%s consumes_heartbeat_dir=%s injected=%s",
+            "heartbeat_dir/instrumentation_root injection check: adapter=%s consumes_heartbeat_dir=%s injected=%s",
             adapter.name() if hasattr(adapter, "name") else type(adapter).__name__,
             consumes,
             injected,
         )
         if not injected:
             return mcp_config
-        return {**(mcp_config or {}), "heartbeat_dir": heartbeat_dir}
+        return {
+            **(mcp_config or {}),
+            "heartbeat_dir": heartbeat_dir,
+            "instrumentation_root": instrumentation_root,
+        }
 
     def _primary_adapter_supports_sampling(
         self, model_config: ModelConfig, *, provider_name: str | None = None
@@ -2993,6 +3015,20 @@ class AgentSpawner:
                     # adapter never inherits another adapter's extras.
                     attempt_mcp = self._mcp_config_for_adapter(target_adapter, effective_mcp)
 
+                    # Wave 3 (per-agent instrumentation): tell the
+                    # openai_agents runner subprocess which task it is
+                    # working so its RunInstrumenter writes to
+                    # .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/
+                    # instead of an "unknown" task bucket. Scoped to the
+                    # openai_agents adapter only: other adapters pass
+                    # mcp_config through to their own CLI flags verbatim,
+                    # and a stray top-level "task_id" key there is an
+                    # unnecessary risk for no benefit (those adapters are
+                    # not instrumented in this wave).
+                    if "openai_agents" in adapter_name and tasks:
+                        attempt_mcp = dict(attempt_mcp or {})
+                        attempt_mcp.setdefault("task_id", tasks[0].id)
+
                     try:
                         # Apply OS-level resource limits to non-sandboxed spawns.
                         target_adapter.set_resource_limits(self._resource_limits)
@@ -3053,6 +3089,26 @@ class AgentSpawner:
                             # Extract budget_multiplier from task metadata
                             # (set by retry logic when previous attempt hit budget cap).
                             _budget_mult = max(float(t.metadata.get("budget_multiplier", 1.0)) for t in tasks)
+                            # Explicit per-task max_turns override (Task.max_turns):
+                            # thread it to the adapter as explicit_max_turns, but
+                            # only when its spawn() signature accepts the
+                            # parameter. Adapters without support keep their own
+                            # auto-computed turn budget; warn so the operator
+                            # knows the cap was not applied. When several grouped
+                            # tasks carry a value the largest wins, mirroring
+                            # budget_multiplier above.
+                            _extra_spawn_kwargs: dict[str, Any] = {}
+                            _explicit_turns = max((t.max_turns for t in tasks if t.max_turns is not None), default=None)
+                            if _explicit_turns is not None:
+                                if "explicit_max_turns" in inspect.signature(target_adapter.spawn).parameters:
+                                    _extra_spawn_kwargs["explicit_max_turns"] = _explicit_turns
+                                else:
+                                    logger.warning(
+                                        "Adapter %s spawn() does not accept explicit_max_turns; "
+                                        "task max_turns=%d ignored, falling back to adapter-computed turns",
+                                        adapter_name,
+                                        _explicit_turns,
+                                    )
                             # Cacheable prefix extraction is deferred to adapters
                             # that support provider-specific caching.
                             result = target_adapter.spawn(
@@ -3064,6 +3120,7 @@ class AgentSpawner:
                                 task_scope=max_scope,
                                 budget_multiplier=_budget_mult,
                                 system_addendum="",
+                                **_extra_spawn_kwargs,
                             )
                         spawn_duration = time.perf_counter() - spawn_start
                         agent_spawn_duration.labels(adapter=provider_name or adapter_name).observe(spawn_duration)
