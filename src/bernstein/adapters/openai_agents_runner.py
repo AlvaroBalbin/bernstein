@@ -64,6 +64,7 @@ from typing import Any, cast
 import yaml
 
 from bernstein.core.instrumentation import get_instrumenter, init_instrumenter, resolve_agent_dir
+from bernstein.core.security.sanitize import sanitize_log
 
 logger = logging.getLogger(__name__)
 
@@ -462,11 +463,14 @@ def _build_instrumentation_hooks(sdk: Any, manifest: RunnerManifest) -> Any:
                     "tool": tool_name,
                     "args": args_dict,
                 }
+                # tool_name/tool_call_id originate in the model's response
+                # stream - sanitize before logging (established repo pattern
+                # for externally-derived values).
                 logger.debug(
                     "hook fired: on_tool_start call_id=%s tool=%s tool_call_id=%s session=%s",
                     call_id,
-                    tool_name,
-                    tool_call_id,
+                    sanitize_log(tool_name),
+                    sanitize_log(tool_call_id),
                     manifest.session_id,
                 )
             except Exception as exc:
@@ -496,7 +500,7 @@ def _build_instrumentation_hooks(sdk: Any, manifest: RunnerManifest) -> Any:
                 logger.debug(
                     "wrote tool_call entry call_id=%s tool=%s session=%s success=%s",
                     call_id,
-                    tool_name,
+                    sanitize_log(tool_name),
                     manifest.session_id,
                     not is_error,
                 )
