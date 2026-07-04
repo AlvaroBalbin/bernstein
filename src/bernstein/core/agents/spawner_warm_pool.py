@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 from bernstein.core.models import ModelConfig, Task
@@ -176,6 +177,15 @@ def _select_batch_config(
 
     def _route_for_batch(task: Task) -> ModelConfig:
         """Batch-specific routing: consult bandit when available, else heuristics."""
+        print(
+            f"[SPAWNER-DEBUG] _route_for_batch: task.id={task.id!r}, task.role={task.role!r}, "
+            f"task.model={task.model!r}, task.effort={task.effort!r}. "
+            "NOTE: role_model_policy is not passed into _select_batch_config/_route_for_batch's "
+            "scope - the caller (spawner_core.py) resolves role_model_policy separately via "
+            "self._role_model_policy.get(task.role, {}) after this function returns.",
+            file=sys.stderr,
+            flush=True,
+        )
         if task.model or task.effort:
             return ModelConfig(model=task.model or "sonnet", effort=task.effort or "normal")
         if task.role in _HIGH_STAKES_ROLES or task.scope == Scope.LARGE or task.priority == 1:

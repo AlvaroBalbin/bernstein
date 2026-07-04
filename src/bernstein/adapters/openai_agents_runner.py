@@ -60,6 +60,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
+
+import yaml
 
 import yaml
 
@@ -1008,9 +1011,9 @@ def _build_agent_kwargs(manifest: RunnerManifest) -> dict[str, Any]:
     return kwargs
 
 
-# Alibaba Cloud (DashScope/MaaS) OpenAI-compatible endpoints. Substring match
-# against ``base_url`` - covers both the public DashScope host
-# (``dashscope.aliyuncs.com``) and the MaaS variant
+# Alibaba Cloud (DashScope/MaaS) OpenAI-compatible endpoints. Host-suffix
+# match against ``base_url``'s hostname - covers both the public DashScope
+# host (``dashscope.aliyuncs.com``) and the MaaS variant
 # (``maas.aliyuncs.com``) mentioned in Alibaba's own function-calling docs.
 _ALIBABA_BASE_URL_MARKERS: tuple[str, ...] = ("aliyuncs.com",)
 
@@ -1022,11 +1025,19 @@ def _is_alibaba_cloud_endpoint(base_url: str | None) -> bool:
     "thinking" mode, which makes the model reason its way out of calling
     tools and write ad-hoc scripts instead - Alibaba's own function-calling
     docs show ``extra_body={"enable_thinking": False}`` on every
-    tool-calling request as the fix. Detection is a simple substring match
-    so both the public DashScope host and any ``*.aliyuncs.com`` MaaS
-    variant are covered without hardcoding a specific hostname.
+    tool-calling request as the fix. Detection matches the URL's hostname
+    (exact or dot-suffix) so both the public DashScope host and any
+    ``*.aliyuncs.com`` MaaS variant are covered without hardcoding a
+    specific hostname - and so a URL that merely CONTAINS the marker in
+    its path or in an unrelated hostname (e.g. ``notaliyuncs.com``) never
+    triggers the injection on another provider.
     """
-    return bool(base_url) and any(marker in cast("str", base_url) for marker in _ALIBABA_BASE_URL_MARKERS)
+    if not base_url or not isinstance(base_url, str):
+        return False
+    # ``urlparse`` only populates ``hostname`` when a netloc is present;
+    # prefix ``//`` for scheme-less values so a bare host still parses.
+    host = urlparse(base_url if "//" in base_url else f"//{base_url}").hostname or ""
+    return any(host == marker or host.endswith(f".{marker}") for marker in _ALIBABA_BASE_URL_MARKERS)
 
 
 def _inject_alibaba_enable_thinking(

@@ -99,6 +99,7 @@ from bernstein.core.orchestration.tick_pipeline import (
     block_task,
     complete_task,
     fail_task,
+    fetch_active_holds,
     fetch_all_tasks,
     group_by_role,
     parse_backlog_file,
@@ -125,6 +126,7 @@ from bernstein.core.runtime_state import (
     rotate_log_file,
     write_session_replay_metadata,
 )
+from bernstein.core.security.sanitize import sanitize_log
 from bernstein.core.semantic_cache import ResponseCacheManager
 from bernstein.core.signals import read_unresolved_pivots
 from bernstein.core.slo import SLOTracker, apply_error_budget_adjustments
@@ -1913,16 +1915,44 @@ class Orchestrator:
                     settled_open = len(settled["open"])
                     settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
                     if settled_open == settled_agents == 0:
-                        logger.info(
-                            "Quiescence confirmed after %.1fs settle window (tick #%d, "
-                            "open=%d agents=%d) - self-stopping",
-                            _settle_s,
-                            self._tick_count,
-                            settled_open,
-                            settled_agents,
-                        )
-                        self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
-                        self._running = False
+                        # Hold/release API (supplements the settle-timer
+                        # self-stop above): external callers can call
+                        # POST /orchestrator/holds to keep this orchestrator
+                        # alive even when it looks fully quiescent - e.g. a
+                        # dashboard mid-review, or an external scheduler about
+                        # to enqueue follow-up tasks that hasn't posted them
+                        # yet. Checked here, right before the actual
+                        # self-stop, so a hold acquired at any point up to
+                        # this instant still prevents the stop for this tick.
+                        try:
+                            _active_holds = fetch_active_holds(self._client, base)
+                        except Exception as exc:  # intentional-broad-except: must never crash the tick loop
+                            logger.warning(
+                                "fetch_active_holds raised during quiescence self-stop check (tick #%d): %s "
+                                "- treating as no active holds",
+                                self._tick_count,
+                                exc,
+                            )
+                            _active_holds = []
+                        if _active_holds:
+                            _hold_reasons = [sanitize_log(str(h.get("reason", "<no reason>"))) for h in _active_holds]
+                            logger.info(
+                                "Quiescence detected but %d active hold(s) present (tick #%d) - skipping self-stop: %s",
+                                len(_active_holds),
+                                self._tick_count,
+                                _hold_reasons,
+                            )
+                        else:
+                            logger.info(
+                                "Quiescence confirmed after %.1fs settle window (tick #%d, "
+                                "open=%d agents=%d, no active holds) - self-stopping",
+                                _settle_s,
+                                self._tick_count,
+                                settled_open,
+                                settled_agents,
+                            )
+                            self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
+                            self._running = False
                     else:
                         logger.info(
                             "Quiescence NOT confirmed after %.1fs settle window (tick #%d): "
@@ -4858,6 +4888,7 @@ def _collect_smtp_targets(seed: Any, targets: list[NotificationTarget]) -> None:
 if __name__ == "__main__":
     import argparse
     import sys
+    import traceback
     from pathlib import Path
 
     from bernstein.adapters.registry import get_adapter
@@ -4884,6 +4915,21 @@ if __name__ == "__main__":
     _model_env_default = os.environ.get("BERNSTEIN_MODEL", "").strip() or None
     parser.add_argument("--model", type=str, default=_model_env_default)
     args = parser.parse_args()
+
+    print(f"[SPAWNER-DEBUG] orchestrator __main__: parsed CLI args={vars(args)!r}", file=sys.stderr, flush=True)
+    print(
+        f"[SPAWNER-DEBUG] orchestrator __main__: BERNSTEIN_SEED_PATH env var="
+        f"{os.environ.get('BERNSTEIN_SEED_PATH', '<unset>')!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"[SPAWNER-DEBUG] orchestrator __main__: BERNSTEIN_ADAPTER env var="
+        f"{os.environ.get('BERNSTEIN_ADAPTER', '<unset>')!r}, BERNSTEIN_MODEL env var="
+        f"{os.environ.get('BERNSTEIN_MODEL', '<unset>')!r}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     workdir = Path.cwd()
 
@@ -4957,17 +5003,70 @@ if __name__ == "__main__":
         # the real store is set after the orchestrator assigns its run_id below.
         pass  # store will be set after orchestrator is instantiated
 
+    print("[SPAWNER-DEBUG] orchestrator __main__: entering top-level try block", file=sys.stderr, flush=True)
     try:
         # Try to load adapter from seed if available
         adapter_name = args.adapter
         seed_path = workdir / _BERNSTEIN_YAML
+        logger.info(
+            "orchestrator __main__: resolved seed_path=%s (exists=%s)",
+            seed_path,
+            seed_path.exists(),
+        )
         seed: SeedConfig | None = None
         if seed_path.exists():
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file exists at {seed_path}, attempting parse_seed()",
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 seed = parse_seed(seed_path)
                 adapter_name = getattr(seed, "cli", adapter_name)
+                _seed_role_model_policy = getattr(seed, "role_model_policy", None)
+                if not _seed_role_model_policy:
+                    print(
+                        "[SPAWNER-DEBUG] orchestrator __main__: role_model_policy is None/empty "
+                        f"after seed parse (seed_path={seed_path})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[SPAWNER-DEBUG] orchestrator __main__: parsed role_model_policy="
+                        f"{json.dumps(_seed_role_model_policy, default=str)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                print(
+                    "[SPAWNER-DEBUG] orchestrator __main__: seed parse SUCCESS - cli="
+                    f"{getattr(seed, 'cli', None)!r}, top-level model="
+                    f"{getattr(seed, 'model', None)!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                logger.info(
+                    "orchestrator __main__: parsed seed from %s (cli=%s, model=%s, role_model_policy=%s)",
+                    seed_path,
+                    getattr(seed, "cli", None),
+                    getattr(seed, "model", None),
+                    getattr(seed, "role_model_policy", None),
+                )
             except Exception as exc:
+                print(
+                    f"[SPAWNER-DEBUG] orchestrator __main__: seed parse FAILED for {seed_path}: "
+                    f"{exc!r}\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 logger.warning("Failed to parse seed for adapter config: %s", exc)
+        else:
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file does NOT exist at {seed_path} "
+                "- role_model_policy and model will be unset from seed",
+                file=sys.stderr,
+                flush=True,
+            )
 
         # Run-level model: ``--model`` flag (threaded from ``bernstein run
         # --model``) wins, falling back to the seed's resolved model (also
@@ -4976,6 +5075,13 @@ if __name__ == "__main__":
         # so child-task spawns can coerce Claude tier names for non-Claude
         # adapters instead of passing them through literally.
         run_model: str | None = args.model or (getattr(seed, "model", None) if seed else None)
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: resolved run_model={run_model!r} "
+            f"(args.model={args.model!r}, seed.model="
+            f"{getattr(seed, 'model', None) if seed else '<no seed>'!r})",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if adapter_name == "auto":
             # Auto mode: default to Claude Code (primary), others used via routing
@@ -5284,6 +5390,17 @@ if __name__ == "__main__":
             ),
         )
 
+        _spawner_role_model_policy = seed.role_model_policy if seed else None
+        _spawner_policy_repr = (
+            json.dumps(_spawner_role_model_policy, default=str) if _spawner_role_model_policy else "<None/empty>"
+        )
+        print(
+            "[SPAWNER-DEBUG] orchestrator __main__: constructing AgentSpawner with "
+            f"role_model_policy={_spawner_policy_repr}, "
+            f"default_model={run_model!r}, adapter={adapter_inst!r}",
+            file=sys.stderr,
+            flush=True,
+        )
         spawner = AgentSpawner(
             adapter=adapter_inst,
             templates_dir=get_templates_dir(workdir) / "roles",
@@ -5484,7 +5601,32 @@ if __name__ == "__main__":
                 if mcp_manager is not None:
                     mcp_manager.stop_all()
     except Exception:
+        _crash_tb = traceback.format_exc()
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: FATAL uncaught exception:\n{_crash_tb}",
+            file=sys.stderr,
+            flush=True,
+        )
         logger.exception("Orchestrator crashed")
+        try:
+            _crash_log_dir = workdir / ".sdd" / "runtime"
+            _crash_log_dir.mkdir(parents=True, exist_ok=True)
+            _crash_log_path = _crash_log_dir / "spawner_crash.log"
+            with _crash_log_path.open("a", encoding="utf-8") as _crash_fh:
+                _crash_fh.write(f"\n=== spawner crash at {datetime.now(UTC).isoformat()} ===\n")
+                _crash_fh.write(_crash_tb)
+                _crash_fh.write("\n")
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: crash traceback appended to {_crash_log_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as _log_exc:  # pragma: no cover - crash logging must never itself crash the reporting path
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: FAILED to write spawner_crash.log: {_log_exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         sys.exit(1)
 # ---------------------------------------------------------------------------
 # Meta-messages for orchestrator nudges (T567)

@@ -106,6 +106,7 @@ Bernstein is named after Leonard Bernstein, the American conductor and composer.
 | `conformance.py`            | Adapter tool contract conformance suite harness |
 | `continue_dev.py`           | Continue.dev CLI adapter |
 | `copilot.py`                | GitHub Copilot CLI adapter |
+| `council_runner.py`         | Task-level "council of agents" runner |
 | `cursor.py`                 | Cursor Agent CLI adapter |
 | `devin_terminal.py`         | Devin for Terminal (Cognition) CLI adapter |
 | `droid.py`                  | Droid (Factory AI) CLI adapter |
