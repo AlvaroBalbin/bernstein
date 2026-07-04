@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import json
 import logging
 import re
@@ -2946,6 +2947,20 @@ class AgentSpawner:
                     # adapter never inherits another adapter's extras.
                     attempt_mcp = self._mcp_config_for_adapter(target_adapter, effective_mcp)
 
+                    # Wave 3 (per-agent instrumentation): tell the
+                    # openai_agents runner subprocess which task it is
+                    # working so its RunInstrumenter writes to
+                    # .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/
+                    # instead of an "unknown" task bucket. Scoped to the
+                    # openai_agents adapter only: other adapters pass
+                    # mcp_config through to their own CLI flags verbatim,
+                    # and a stray top-level "task_id" key there is an
+                    # unnecessary risk for no benefit (those adapters are
+                    # not instrumented in this wave).
+                    if "openai_agents" in adapter_name and tasks:
+                        attempt_mcp = dict(attempt_mcp or {})
+                        attempt_mcp.setdefault("task_id", tasks[0].id)
+
                     try:
                         # Apply OS-level resource limits to non-sandboxed spawns.
                         target_adapter.set_resource_limits(self._resource_limits)
@@ -3006,6 +3021,26 @@ class AgentSpawner:
                             # Extract budget_multiplier from task metadata
                             # (set by retry logic when previous attempt hit budget cap).
                             _budget_mult = max(float(t.metadata.get("budget_multiplier", 1.0)) for t in tasks)
+                            # Explicit per-task max_turns override (Task.max_turns):
+                            # thread it to the adapter as explicit_max_turns, but
+                            # only when its spawn() signature accepts the
+                            # parameter. Adapters without support keep their own
+                            # auto-computed turn budget; warn so the operator
+                            # knows the cap was not applied. When several grouped
+                            # tasks carry a value the largest wins, mirroring
+                            # budget_multiplier above.
+                            _extra_spawn_kwargs: dict[str, Any] = {}
+                            _explicit_turns = max((t.max_turns for t in tasks if t.max_turns is not None), default=None)
+                            if _explicit_turns is not None:
+                                if "explicit_max_turns" in inspect.signature(target_adapter.spawn).parameters:
+                                    _extra_spawn_kwargs["explicit_max_turns"] = _explicit_turns
+                                else:
+                                    logger.warning(
+                                        "Adapter %s spawn() does not accept explicit_max_turns; "
+                                        "task max_turns=%d ignored, falling back to adapter-computed turns",
+                                        adapter_name,
+                                        _explicit_turns,
+                                    )
                             # Cacheable prefix extraction is deferred to adapters
                             # that support provider-specific caching.
                             result = target_adapter.spawn(
@@ -3017,6 +3052,7 @@ class AgentSpawner:
                                 task_scope=max_scope,
                                 budget_multiplier=_budget_mult,
                                 system_addendum="",
+                                **_extra_spawn_kwargs,
                             )
                         spawn_duration = time.perf_counter() - spawn_start
                         agent_spawn_duration.labels(adapter=provider_name or adapter_name).observe(spawn_duration)
