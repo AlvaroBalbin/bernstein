@@ -6,8 +6,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from bernstein.core import fast_path as fast_path_module
-from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.fast_path import (
     FastPathAction,
     FastPathResult,
@@ -19,6 +17,9 @@ from bernstein.core.fast_path import (
     try_fast_path_batch,
 )
 from bernstein.core.models import Complexity, ModelConfig, Scope, Task
+
+from bernstein.core import fast_path as fast_path_module
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 
 # --- Helpers ---
 

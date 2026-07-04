@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from bernstein.core import fast_path as fast_path_module
 from bernstein.core.models import Complexity, ModelConfig, Scope, Task
 from bernstein.core.router import (
     ModelPolicy,
@@ -19,6 +18,8 @@ from bernstein.core.router import (
     load_model_policy_from_yaml,
     route_task,
 )
+
+from bernstein.core import fast_path as fast_path_module
 
 # --- Helpers ---
 
@@ -503,9 +504,7 @@ class TestRouteTask:
         assert config.model == "l1-model"
         assert config.effort == "normal"
 
-    def test_simple_tasks_fall_back_to_default_model_when_l1_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_simple_tasks_fall_back_to_default_model_when_l1_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Without fast_path.l1_model, L1 classification falls through to the
         # standard routing sources instead of failing the task.
         monkeypatch.setattr(fast_path_module, "_l1_model_config", None)
