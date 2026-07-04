@@ -2968,6 +2968,20 @@ class AgentSpawner:
                     # adapter never inherits another adapter's extras.
                     attempt_mcp = self._mcp_config_for_adapter(target_adapter, effective_mcp)
 
+                    # Wave 3 (per-agent instrumentation): tell the
+                    # openai_agents runner subprocess which task it is
+                    # working so its RunInstrumenter writes to
+                    # .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/
+                    # instead of an "unknown" task bucket. Scoped to the
+                    # openai_agents adapter only: other adapters pass
+                    # mcp_config through to their own CLI flags verbatim,
+                    # and a stray top-level "task_id" key there is an
+                    # unnecessary risk for no benefit (those adapters are
+                    # not instrumented in this wave).
+                    if "openai_agents" in adapter_name and tasks:
+                        attempt_mcp = dict(attempt_mcp or {})
+                        attempt_mcp.setdefault("task_id", tasks[0].id)
+
                     try:
                         # Apply OS-level resource limits to non-sandboxed spawns.
                         target_adapter.set_resource_limits(self._resource_limits)
@@ -3028,54 +3042,39 @@ class AgentSpawner:
                             # Extract budget_multiplier from task metadata
                             # (set by retry logic when previous attempt hit budget cap).
                             _budget_mult = max(float(t.metadata.get("budget_multiplier", 1.0)) for t in tasks)
+                            # Explicit per-task max_turns override (Task.max_turns):
+                            # thread it to the adapter as explicit_max_turns, but
+                            # only when its spawn() signature accepts the
+                            # parameter. Adapters without support keep their own
+                            # auto-computed turn budget; warn so the operator
+                            # knows the cap was not applied. When several grouped
+                            # tasks carry a value the largest wins, mirroring
+                            # budget_multiplier above.
+                            _extra_spawn_kwargs: dict[str, Any] = {}
+                            _explicit_turns = max((t.max_turns for t in tasks if t.max_turns is not None), default=None)
+                            if _explicit_turns is not None:
+                                if "explicit_max_turns" in inspect.signature(target_adapter.spawn).parameters:
+                                    _extra_spawn_kwargs["explicit_max_turns"] = _explicit_turns
+                                else:
+                                    logger.warning(
+                                        "Adapter %s spawn() does not accept explicit_max_turns; "
+                                        "task max_turns=%d ignored, falling back to adapter-computed turns",
+                                        adapter_name,
+                                        _explicit_turns,
+                                    )
                             # Cacheable prefix extraction is deferred to adapters
                             # that support provider-specific caching.
-                            spawn_kwargs: dict[str, Any] = {
-                                "prompt": prompt,
-                                "workdir": spawn_cwd,
-                                "model_config": model_config,
-                                "session_id": session_id,
-                                "mcp_config": attempt_mcp,
-                                "task_scope": max_scope,
-                                "budget_multiplier": _budget_mult,
-                                "system_addendum": "",
-                            }
-                            # max_turns override (see server_models.TaskCreate.max_turns
-                            # and claude_max_turns.compute_max_turns): read the explicit
-                            # override off the task being spawned and thread it through
-                            # ONLY if the target adapter's spawn() signature actually
-                            # accepts it - not every adapter implements this yet (only
-                            # the Claude adapter as of this wave), and passing an
-                            # unexpected kwarg would crash the spawn call outright.
-                            _explicit_max_turns = getattr(tasks[0], "max_turns", None) if tasks else None
-                            if _explicit_max_turns is not None:
-                                try:
-                                    _spawn_params = inspect.signature(target_adapter.spawn).parameters
-                                except (TypeError, ValueError) as exc:
-                                    logger.warning(
-                                        "explicit_max_turns=%s: could not inspect %s.spawn signature (%s) - skipping",
-                                        _explicit_max_turns,
-                                        adapter_name,
-                                        exc,
-                                    )
-                                    _spawn_params = {}
-                                if "explicit_max_turns" in _spawn_params:
-                                    spawn_kwargs["explicit_max_turns"] = _explicit_max_turns
-                                    logger.info(
-                                        "explicit_max_turns=%s threaded through to adapter=%s for task=%s",
-                                        _explicit_max_turns,
-                                        adapter_name,
-                                        tasks[0].id,
-                                    )
-                                else:
-                                    logger.info(
-                                        "explicit_max_turns=%s requested for task=%s but adapter=%s does not "
-                                        "support explicit_max_turns - skipping (falls back to auto-computed turns)",
-                                        _explicit_max_turns,
-                                        tasks[0].id,
-                                        adapter_name,
-                                    )
-                            result = target_adapter.spawn(**spawn_kwargs)
+                            result = target_adapter.spawn(
+                                prompt=prompt,
+                                workdir=spawn_cwd,
+                                model_config=model_config,
+                                session_id=session_id,
+                                mcp_config=attempt_mcp,
+                                task_scope=max_scope,
+                                budget_multiplier=_budget_mult,
+                                system_addendum="",
+                                **_extra_spawn_kwargs,
+                            )
                         spawn_duration = time.perf_counter() - spawn_start
                         agent_spawn_duration.labels(adapter=provider_name or adapter_name).observe(spawn_duration)
                         self._adapter_health.record_success(adapter_name, latency_ms=spawn_duration * 1000)
