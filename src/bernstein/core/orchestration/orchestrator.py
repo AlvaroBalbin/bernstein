@@ -4986,8 +4986,7 @@ if __name__ == "__main__":
         seed: SeedConfig | None = None
         if seed_path.exists():
             print(
-                f"[SPAWNER-DEBUG] orchestrator __main__: seed file exists at {seed_path}, "
-                "attempting parse_seed()",
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file exists at {seed_path}, attempting parse_seed()",
                 file=sys.stderr,
                 flush=True,
             )
@@ -5362,9 +5361,12 @@ if __name__ == "__main__":
         )
 
         _spawner_role_model_policy = seed.role_model_policy if seed else None
+        _spawner_policy_repr = (
+            json.dumps(_spawner_role_model_policy, default=str) if _spawner_role_model_policy else "<None/empty>"
+        )
         print(
             "[SPAWNER-DEBUG] orchestrator __main__: constructing AgentSpawner with "
-            f"role_model_policy={json.dumps(_spawner_role_model_policy, default=str) if _spawner_role_model_policy else '<None/empty>'}, "
+            f"role_model_policy={_spawner_policy_repr}, "
             f"default_model={run_model!r}, adapter={adapter_inst!r}",
             file=sys.stderr,
             flush=True,
@@ -5570,7 +5572,11 @@ if __name__ == "__main__":
                     mcp_manager.stop_all()
     except Exception:
         _crash_tb = traceback.format_exc()
-        print(f"[SPAWNER-DEBUG] orchestrator __main__: FATAL uncaught exception:\n{_crash_tb}", file=sys.stderr, flush=True)
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: FATAL uncaught exception:\n{_crash_tb}",
+            file=sys.stderr,
+            flush=True,
+        )
         logger.exception("Orchestrator crashed")
         try:
             _crash_log_dir = workdir / ".sdd" / "runtime"
@@ -5580,7 +5586,11 @@ if __name__ == "__main__":
                 _crash_fh.write(f"\n=== spawner crash at {datetime.now(UTC).isoformat()} ===\n")
                 _crash_fh.write(_crash_tb)
                 _crash_fh.write("\n")
-            print(f"[SPAWNER-DEBUG] orchestrator __main__: crash traceback appended to {_crash_log_path}", file=sys.stderr, flush=True)
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: crash traceback appended to {_crash_log_path}",
+                file=sys.stderr,
+                flush=True,
+            )
         except Exception as _log_exc:  # pragma: no cover - crash logging must never itself crash the reporting path
             print(
                 f"[SPAWNER-DEBUG] orchestrator __main__: FAILED to write spawner_crash.log: {_log_exc!r}",

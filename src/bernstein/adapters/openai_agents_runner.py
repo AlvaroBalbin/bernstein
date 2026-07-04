@@ -58,12 +58,9 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import yaml
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -744,8 +741,7 @@ def _load_council_config(manifest: RunnerManifest) -> dict[str, Any] | None:
         raise RuntimeError(msg)
 
     logger.info(
-        "openai_agents_runner session=%s: council file %s parsed OK: %d candidates, "
-        "judge model=%r, timeout=%r",
+        "openai_agents_runner session=%s: council file %s parsed OK: %d candidates, judge model=%r, timeout=%r",
         manifest.session_id,
         config_path,
         len(raw_candidates),
