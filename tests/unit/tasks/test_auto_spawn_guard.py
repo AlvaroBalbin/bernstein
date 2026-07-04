@@ -187,9 +187,7 @@ def test_dedupe_check_logs_key_verdict_and_reason_for_every_candidate(tmp_path: 
     assert decision.reason == "dedupe"
     check_lines = [r.getMessage() for r in caplog.records if "auto_spawn_dedupe_check" in r.getMessage()]
     assert any("existing='Upgrade: Proposal One'" in line and "match=False" in line for line in check_lines)
-    assert any(
-        "existing='Upgrade: Improve task success rate'" in line and "match=True" in line for line in check_lines
-    )
+    assert any("existing='Upgrade: Improve task success rate'" in line and "match=True" in line for line in check_lines)
 
 
 def test_evaluate_logs_info_decision_line_for_allowed_spawn(tmp_path: Path, caplog) -> None:

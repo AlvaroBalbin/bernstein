@@ -3,7 +3,7 @@
 Guards against the "recursive junk task" production incident: with no limits,
 the evolution loop's "Upgrade: ..." proposal tasks and the watchdog's
 "Watchdog triage: ..." tasks can spawn unboundedly, including meta-tasks
-*about* other meta-tasks (e.g. "Watchdog triage of watchdog triage" — a triage
+*about* other meta-tasks (e.g. "Watchdog triage of watchdog triage" - a triage
 task created because a previous triage task itself stalled). A single real
 run degenerated into ~19 "Upgrade: Improve task success rate" duplicates plus
 recursive watchdog-triage-of-watchdog-triage chains with zero forward
@@ -22,7 +22,7 @@ Guard order (first hit wins, cheapest checks first):
    already-open auto-spawned task. Normalization: lowercase, collapse
    whitespace, strip a trailing id-like suffix (e.g. "(abc123)"); a match is
    either an exact normalized match or one title containing the other (both
-   at least 8 characters) — good enough to catch cosmetic drift like an
+   at least 8 characters) - good enough to catch cosmetic drift like an
    appended session id without conflating unrelated short titles.
 3. Cap: refuse once the number of ALLOWED auto-spawns for this run has
    reached ``max_auto_spawns_per_run``. State is a small JSON counter
@@ -186,7 +186,7 @@ class AutoSpawnGuard:
             existing_open_titles: Titles of currently-open (open or claimed)
                 auto-spawned tasks, for dedupe comparison.
 
-        Every call — allowed or refused — is logged at INFO with the full
+        Every call - allowed or refused - is logged at INFO with the full
         decision inputs (reason, dedupe key, ancestry depth); this is the
         primary debugging surface for auto-spawn behaviour, so the log line
         is never truncated or downgraded to DEBUG.
@@ -217,7 +217,13 @@ class AutoSpawnGuard:
                 source_title,
                 dedupe_key,
             )
-            self._log_decision(kind=kind, title=title, source_title=source_title, dedupe_key=dedupe_key, decision=decision)
+            self._log_decision(
+                kind=kind,
+                title=title,
+                source_title=source_title,
+                dedupe_key=dedupe_key,
+                decision=decision,
+            )
             return decision
 
         for existing in existing_open_titles:
@@ -242,8 +248,7 @@ class AutoSpawnGuard:
                     cap=self._max_auto_spawns_per_run,
                 )
                 logger.warning(
-                    "Auto-spawn refused (dedupe): kind=%s title=%r duplicates existing open task %r "
-                    "dedupe_key=%r",
+                    "Auto-spawn refused (dedupe): kind=%s title=%r duplicates existing open task %r dedupe_key=%r",
                     kind,
                     title,
                     existing,
@@ -270,7 +275,13 @@ class AutoSpawnGuard:
                 self._max_auto_spawns_per_run,
                 dedupe_key,
             )
-            self._log_decision(kind=kind, title=title, source_title=source_title, dedupe_key=dedupe_key, decision=decision)
+            self._log_decision(
+                kind=kind,
+                title=title,
+                source_title=source_title,
+                dedupe_key=dedupe_key,
+                decision=decision,
+            )
             return decision
 
         new_count = count + 1
@@ -298,7 +309,7 @@ class AutoSpawnGuard:
 
         This is intentionally separate from (and in addition to) the
         per-branch WARNING logs above: those are for operator alerting on
-        refusals, this is the single always-on debugging trail — never
+        refusals, this is the single always-on debugging trail - never
         truncated, always includes the exact dedupe key and ancestry depth
         used, per the "logging IS the debugging interface" rule.
         """

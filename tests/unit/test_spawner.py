@@ -373,9 +373,7 @@ class TestSpawnerWithRouter:
         spawner.spawn_for_tasks([task])
 
         messages = [r.message for r in caplog.records]
-        assert any(
-            "Router selected provider" in m and "provider=test_provider" in m for m in messages
-        ), messages
+        assert any("Router selected provider" in m and "provider=test_provider" in m for m in messages), messages
 
     def test_router_skipped_for_non_claude_adapter(self, tmp_path: Path, make_task, mock_adapter_factory) -> None:
         """Router is skipped when adapter is not Claude-compatible (e.g. qwen, gemini).
@@ -1817,9 +1815,7 @@ class TestSamplingParamsSpawnPath:
         assert adapter.seen_mcp_config["max_tokens"] == 4096
         assert adapter.seen_mcp_config["extra_params"] == {"reasoning_effort": "low"}
 
-    def test_role_policy_sampling_params_take_precedence_over_mode_profile(
-        self, tmp_path: Path, make_task
-    ) -> None:
+    def test_role_policy_sampling_params_take_precedence_over_mode_profile(self, tmp_path: Path, make_task) -> None:
         """PR3: when both a role_model_policy sampling field and a
         ModeProfile sampling field are set for the same role/key, the
         role-policy value must win - matching the docstring's stated
@@ -2004,8 +2000,8 @@ class TestExtractErrorAwareReason:
                 '  File "openai/_client.py", line 812, in create',
                 "    raise self._make_status_error_from_response(response)",
                 "openai.BadRequestError: Error code: 400 - {'error': {'message': "
-                "\"invalid params, model[MiniMax-M2.7-highspeed] does not support "
-                'max tokens > 196608 (2013)", \'type\': \'bad_request_error\'}}',
+                '"invalid params, model[MiniMax-M2.7-highspeed] does not support '
+                "max tokens > 196608 (2013)\", 'type': 'bad_request_error'}}",
                 "",
                 "OPENAI_API_KEY is not set, skipping trace export",
             ]
@@ -2097,8 +2093,7 @@ class TestDiagnoseSpawnFailure:
                     "Traceback (most recent call last):",
                     '  File "openai_agents_runner.py", line 274, in run',
                     "    response = client.responses.create(**kwargs)",
-                    "openai.BadRequestError: Error code: 400 - does not support max "
-                    "tokens > 196608",
+                    "openai.BadRequestError: Error code: 400 - does not support max tokens > 196608",
                     "",
                     "OPENAI_API_KEY is not set, skipping trace export",
                 ]
@@ -2107,10 +2102,7 @@ class TestDiagnoseSpawnFailure:
 
         # The exception the fast-exit probe would have raised - its message
         # embeds ONLY the log's last line (the bug being fixed).
-        exc = SpawnError(
-            "openai_agents exited early with code 1: OPENAI_API_KEY is not set, "
-            "skipping trace export"
-        )
+        exc = SpawnError("openai_agents exited early with code 1: OPENAI_API_KEY is not set, skipping trace export")
 
         reason = _diagnose_spawn_failure(session_id, tmp_path, "openai_agents", exc)
 

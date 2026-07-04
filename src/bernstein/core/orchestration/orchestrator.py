@@ -1742,10 +1742,7 @@ class Orchestrator:
         # summary generation below; quiescence detection, the settle-window
         # check, the self-stop, and shutdown-final regeneration re-run on
         # every quiescent tick until confirmed.
-        if (
-            not self._config.evolve_mode
-            and result.open_tasks == result.active_agents == 0
-        ):
+        if not self._config.evolve_mode and result.open_tasks == result.active_agents == 0:
             refreshed_tasks_by_status = tasks_by_status
             try:
                 refreshed_tasks_by_status = fetch_all_tasks(self._client, base)
@@ -1844,9 +1841,7 @@ class Orchestrator:
                     self._summary_written,
                     _action,
                 )
-                self._generate_run_summary(
-                    refreshed_tasks_by_status["done"], refreshed_tasks_by_status["failed"]
-                )
+                self._generate_run_summary(refreshed_tasks_by_status["done"], refreshed_tasks_by_status["failed"])
             else:
                 _action = "summary_already_written"
                 logger.info(
@@ -1869,9 +1864,7 @@ class Orchestrator:
             # harness driving tick() directly against an empty transport).
             # Self-stopping in that case would end the orchestrator before
             # it ever does anything.
-            _had_any_terminal_task = bool(
-                refreshed_tasks_by_status["done"] or refreshed_tasks_by_status["failed"]
-            )
+            _had_any_terminal_task = bool(refreshed_tasks_by_status["done"] or refreshed_tasks_by_status["failed"])
             if not _had_any_terminal_task:
                 logger.debug(
                     "8b quiescence (tick #%d) with zero terminal tasks - not eligible "
@@ -3084,7 +3077,7 @@ class Orchestrator:
         Bug item-7 (2026-07-02, D2 claude FAIL-NOTE): ``session.tokens_used``
         is never populated on the openai_agents provider path, so this tick
         skipped every live agent and the run ledger's ``spent_usd`` stayed
-        0.0 for the entire run — budget guards were unenforceable while real
+        0.0 for the entire run - budget guards were unenforceable while real
         cost accumulated only in the ``.tokens`` sidecars. Fix: read each
         live session's cumulative sidecar totals (the same source of truth
         the orphan-recovery path prices dead agents from) and feed them to

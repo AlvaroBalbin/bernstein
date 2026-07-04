@@ -93,8 +93,7 @@ def test_janitor_fail_budget_exhausted_permanent_fails(caplog: pytest.LogCapture
     assert url.endswith("/tasks/task123/fail")
     assert "reopen_budget_exhausted" in body["reason"]
     assert (
-        "janitor_verdict_action: task=task123 verdict=FAIL action=permanent_fail "
-        "reason=reopen_budget_exhausted"
+        "janitor_verdict_action: task=task123 verdict=FAIL action=permanent_fail reason=reopen_budget_exhausted"
     ) in caplog.text
 
 

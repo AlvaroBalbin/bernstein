@@ -410,7 +410,7 @@ def _render_auth_section(token_path: Path) -> str:
         "```bash\n"
         f'-H "Authorization: Bearer $(cat {absolute})"\n'
         "```\n"
-        "**Command-form contract — read this before your first request.** Your "
+        "**Command-form contract - read this before your first request.** Your "
         "`run_command` tool accepts two call forms:\n"
         "- a single command **STRING** (e.g. "
         f'`run_command("curl ... -H \\"Authorization: Bearer $(cat {absolute})\\" ...")`)'
@@ -420,20 +420,20 @@ def _render_auth_section(token_path: Path) -> str:
         "\n  → this execs the process directly with NO shell involved, so `$(...)` and "
         "`$VAR` are never expanded. The literal text (including the dollar sign, "
         "parens, and path) is sent as-is, curl still exits 0, and the task server "
-        "returns 401. There is no visible error other than the HTTP status — it "
+        "returns 401. There is no visible error other than the HTTP status - it "
         "looks like success unless you check it.\n\n"
         "**Every curl below MUST be invoked with `run_command` in the single-STRING "
         "form whenever it uses `$(...)`, `$VAR`, a pipe, or `&&`.** If you are not "
         "sure which form your tool call used, re-issue the request as one string "
         "and re-check the status code.\n\n"
         "**Do not use the `read_file` tool to obtain your token.** `read_file` is "
-        "confined to your own worktree, and the token file lives outside it — the "
+        "confined to your own worktree, and the token file lives outside it - the "
         "call will fail with a workdir-escape error every time, regardless of the "
         "token's validity. The only supported way to read the token is through "
         "`run_command` in string form running `cat <token-path>` (or interpolating "
         "it into the curl command directly, as shown below).\n\n"
         "**Always check the HTTP status, not just the command's exit code.** curl "
-        "exits 0 even on a 401 or 500 — the failure is only visible in the response "
+        "exits 0 even on a 401 or 500 - the failure is only visible in the response "
         "body/status line. Add `-w '\\n%{http_code}'` to every call and treat any "
         "status outside 200-299 as a failure: stop, re-verify you used the string "
         "form and the correct token path, and retry. Do not report a task as done, "
@@ -2056,8 +2056,7 @@ class AgentSpawner:
         """
         role = tasks[0].role if tasks else None
         logger.debug(
-            "_apply_sampling_overrides: entry role=%r model=%r provider_name=%r mcp_config_keys=%s "
-            "role_policy_keys=%s",
+            "_apply_sampling_overrides: entry role=%r model=%r provider_name=%r mcp_config_keys=%s role_policy_keys=%s",
             role,
             model_config.model,
             provider_name,
@@ -2299,8 +2298,7 @@ class AgentSpawner:
                 preferred_provider=preferred_provider,
             )
             logger.info(
-                "Router selected provider for role=%s: provider=%s model=%s/%s "
-                "(preferred_provider=%s)",
+                "Router selected provider for role=%s: provider=%s model=%s/%s (preferred_provider=%s)",
                 tasks[0].role,
                 decision.provider,
                 decision.model_config.model,

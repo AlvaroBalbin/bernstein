@@ -318,9 +318,7 @@ class TestRunCommandShellString:
             elapsed = time.monotonic() - start
             stdout = out.split("stdout:\n", 1)[1].split("\nstderr:", 1)[0].strip()
             assert stdout == "started"
-            assert elapsed < 10, (
-                f"run_command took {elapsed:.1f}s - heartbeat loop blocked the call"
-            )
+            assert elapsed < 10, f"run_command took {elapsed:.1f}s - heartbeat loop blocked the call"
         finally:
             # Belt-and-braces cleanup: kill by recorded pid, then sweep by
             # marker in case the pidfile write lost the race with process
@@ -588,9 +586,7 @@ class TestRunCommandDuplicateSuppression:
         assert "a" in text
         assert "b" in text
 
-    def test_window_zero_disables_suppression(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_window_zero_disables_suppression(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("BERNSTEIN_RUN_COMMAND_DEDUPE_WINDOW_S", "0")
         _events, emit = _sink()
         run_command_in_workdir(tmp_path, "echo run >> marker.txt", emit=emit)

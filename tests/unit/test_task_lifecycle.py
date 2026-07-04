@@ -1135,9 +1135,7 @@ def test_record_evolution_completion_passes_reconciled_tokens(tmp_path: Path, ma
 # ---------------------------------------------------------------------------
 
 
-def test_claim_and_spawn_batches_spawns_claimed_subset_on_partial_claim_failure(
-    tmp_path: Path, make_task: Any
-) -> None:
+def test_claim_and_spawn_batches_spawns_claimed_subset_on_partial_claim_failure(tmp_path: Path, make_task: Any) -> None:
     """A batch where task A claims successfully but task B's claim is
     rejected (409, and B turns out to be claimed by a foreign session on
     re-fetch) must still spawn an agent for A -- not leave A claimed with no
@@ -1145,7 +1143,9 @@ def test_claim_and_spawn_batches_spawns_claimed_subset_on_partial_claim_failure(
     orch = _claim_orch(tmp_path)
     task_a = make_task(id="T-a", role="backend")
     task_b = make_task(id="T-b", role="backend")
-    session = AgentSession(id="A-partial", role="backend", task_ids=[task_a.id], model_config=ModelConfig("sonnet", "high"))
+    session = AgentSession(
+        id="A-partial", role="backend", task_ids=[task_a.id], model_config=ModelConfig("sonnet", "high")
+    )
     orch._spawner.spawn_for_tasks.return_value = session
 
     def _post_side_effect(url: str, **kwargs: Any) -> SimpleNamespace:

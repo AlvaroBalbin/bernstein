@@ -94,9 +94,7 @@ def test_merge_with_conflict_detection_refuses_sdd_runtime_in_staged_set(
 
     # The merge is refused -- not silent, not committed.
     assert result.success is False
-    assert result.refused_forbidden_files, (
-        "guard must populate refused_forbidden_files with the offending paths"
-    )
+    assert result.refused_forbidden_files, "guard must populate refused_forbidden_files with the offending paths"
     assert ".sdd/runtime/agent_tokens/backend-74bcd752.token" in result.refused_forbidden_files
     assert ".sdd/attestations/ed25519-signing-key.pem" in result.refused_forbidden_files
     assert ".sdd/auth/agent_identity_jwt_secret" in result.refused_forbidden_files
@@ -107,9 +105,7 @@ def test_merge_with_conflict_detection_refuses_sdd_runtime_in_staged_set(
     # The actual ``commit`` invocation must NOT appear -- a refused merge
     # never produces a commit, that is the whole point of the guard.
     commit_calls = [a for a in fake.seen if a[:1] == ["commit"]]
-    assert commit_calls == [], (
-        f"refused merge must not run ``git commit``; saw: {commit_calls}"
-    )
+    assert commit_calls == [], f"refused merge must not run ``git commit``; saw: {commit_calls}"
 
 
 def test_merge_with_conflict_detection_refuses_bernstein_yaml_in_staged_set(
@@ -189,9 +185,7 @@ def test_is_forbidden_for_merge_matches_deny_list() -> None:
         ".claude/mcp.json",
         ".env",
     ]:
-        assert git_pr._is_forbidden_for_merge(path) is True, (
-            f"path {path!r} should be forbidden"
-        )
+        assert git_pr._is_forbidden_for_merge(path) is True, f"path {path!r} should be forbidden"
     # Allowed
     for path in [
         "src/bernstein/cli/cli.py",
@@ -200,9 +194,7 @@ def test_is_forbidden_for_merge_matches_deny_list() -> None:
         "docs/operations/merge.md",
         "scripts/run_tests.py",
     ]:
-        assert git_pr._is_forbidden_for_merge(path) is False, (
-            f"path {path!r} should NOT be forbidden"
-        )
+        assert git_pr._is_forbidden_for_merge(path) is False, f"path {path!r} should NOT be forbidden"
 
 
 def test_create_task_branch_delegates_to_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

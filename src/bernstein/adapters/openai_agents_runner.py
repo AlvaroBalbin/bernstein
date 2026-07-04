@@ -55,12 +55,10 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -693,7 +691,7 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
     # orchestrator's live cost-metering loop actually sees this session
     # (see _resolve_tokens_sidecar_path docstring for why the previous
     # stdout-only "usage" event never reached it).
-    from bernstein.core.cost.cost import price_model_usage
+    from bernstein.core.cost.model_prices import price_model_usage
 
     price_result = price_model_usage(manifest.model, input_tokens, output_tokens)
     # ``Runner.run_sync`` aggregates every internal turn into one cumulative
@@ -734,6 +732,24 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
         input_tokens,
         output_tokens,
     )
+
+
+def _redacted_keys(mapping: Any) -> Any:
+    """Redact a header/body mapping for logging: return only its sorted key
+    names, never the values.
+
+    ``extra_headers``/``extra_body`` are where provider auth
+    (``Authorization: Bearer <key>``, ``X-Api-Key``, OpenRouter keys) is
+    conventionally placed, so their values must never reach the logs. Returns
+    the sorted list of key names for a mapping, ``None`` for ``None`` (nothing
+    configured), and a redacted marker for any non-mapping value so a secret
+    can never be logged verbatim.
+    """
+    if mapping is None:
+        return None
+    if isinstance(mapping, Mapping):
+        return sorted(str(k) for k in mapping)
+    return "<redacted: non-mapping value>"
 
 
 def _deepseek_debug_tool_schema_summary(tools: Any) -> list[dict[str, Any]]:
@@ -1054,10 +1070,7 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
             # support OpenAI's strict structured-output mode return empty
             # responses or malformed tool calls when they see this flag.
             _model_lower = (manifest.model or "").lower()
-            _is_openai_native = any(
-                _model_lower.startswith(p)
-                for p in ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
-            )
+            _is_openai_native = any(_model_lower.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-", "chatgpt-"))
             if not _is_openai_native:
                 _relaxed_count = 0
                 for tool in agent_kwargs.get("tools", []):
@@ -1103,8 +1116,12 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
                 "parallel_tool_calls": getattr(_model_settings_obj, "parallel_tool_calls", None),
                 "max_tokens": getattr(_model_settings_obj, "max_tokens", None),
                 "extra_args": getattr(_model_settings_obj, "extra_args", None),
-                "extra_headers": getattr(_model_settings_obj, "extra_headers", None),
-                "extra_body": getattr(_model_settings_obj, "extra_body", None),
+                # extra_headers/extra_body are the SDK-conventional home for
+                # provider auth (Authorization/api-key). Log only the KEY NAMES,
+                # never the values, so this diagnostic can never leak a secret
+                # if an auth header is ever configured here.
+                "extra_headers_keys": _redacted_keys(getattr(_model_settings_obj, "extra_headers", None)),
+                "extra_body_keys": _redacted_keys(getattr(_model_settings_obj, "extra_body", None)),
             }
             if _model_settings_obj is not None
             else "<no ModelSettings constructed - settings_kwargs was empty>"
@@ -1143,9 +1160,7 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
                 manifest.session_id,
                 json.dumps(_tool_schema_summary, default=str)[:8000],
             )
-            _any_strict_true = any(
-                entry.get("strict_json_schema") is True for entry in _tool_schema_summary
-            )
+            _any_strict_true = any(entry.get("strict_json_schema") is True for entry in _tool_schema_summary)
             if _any_strict_true:
                 logger.warning(
                     "[DEEPSEEK-DEBUG] pre-call session=%s: at least one tool schema has "
@@ -1254,8 +1269,7 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         # response the SDK's client-side parsing chokes on) is a direct log
         # read, not a guess from a one-line message.
         logger.exception(
-            "[DEEPSEEK-DEBUG] exception in Runner.run_sync session=%s model=%s "
-            "base_url=%r exc_type=%s",
+            "[DEEPSEEK-DEBUG] exception in Runner.run_sync session=%s model=%s base_url=%r exc_type=%s",
             manifest.session_id,
             manifest.model,
             manifest.base_url,

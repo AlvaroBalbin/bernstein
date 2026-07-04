@@ -73,6 +73,32 @@ _NOOP_TASK_TYPES = frozenset({TaskType.RESEARCH})
 
 _ATTRIBUTION_MAX_COMMITS = 50
 
+# Completion-signal types that constitute real evidence a task did work
+# (as opposed to a bare path_exists / glob_exists that a rubber-stamp could
+# trivially satisfy). A passing signal of one of these types lets the janitor
+# accept a task whose diff is not attributable (empty-diff warn path) instead
+# of hard-rejecting it.
+_NONTRIVIAL_SIGNAL_TYPES = frozenset({"test_passes", "file_contains", "llm_review", "llm_judge"})
+
+
+def _has_nontrivial_passing_signal(task: Task, signal_results: list[tuple[str, bool, str]]) -> bool:
+    """True if the task has at least one passing non-trivial completion signal.
+
+    ``signal_results`` entries are ``(desc, passed, detail)`` where ``desc`` is
+    ``f"{signal.type}: {signal.value}"`` (see :func:`_collect_signal_results`),
+    so the type is the text before the first ``": "``. A passing signal of a
+    :data:`_NONTRIVIAL_SIGNAL_TYPES` type is treated as evidence real work
+    happened, which lets an unattributable-diff task be accepted with a warning
+    rather than hard-rejected.
+    """
+    for desc, passed, _detail in signal_results:
+        if not passed:
+            continue
+        signal_type = desc.split(":", 1)[0].strip()
+        if signal_type in _NONTRIVIAL_SIGNAL_TYPES:
+            return True
+    return False
+
 
 def _is_git_repo(workdir: Path) -> bool:
     """True when *workdir* is inside a git work tree (attribution possible)."""
@@ -502,19 +528,46 @@ async def run_janitor(
                 attribution_reason,
             )
             if not attributed_files and task.task_type not in _NOOP_TASK_TYPES:
-                all_passed = False
-                empty_diff_detail = f"empty diff: {attribution_reason}"
-                signal_results.append(("attribution:empty_diff", False, empty_diff_detail))
-                failed_descs.append(f"attribution:empty_diff: {empty_diff_detail}")
-                logger.warning(
-                    "janitor REJECT (empty diff): task=%s task_type=%s -- no changed files "
-                    "attributable to this task (attribution: %s); a task with zero changed "
-                    "files must not be accepted unless it is an explicit no-op task type %s",
-                    task.id,
-                    task.task_type.value,
-                    attribution_reason,
-                    sorted(t.value for t in _NOOP_TASK_TYPES),
-                )
+                # An empty attributable diff normally means a 0-file
+                # rubber-stamp or a crash-recovery orphan auto-completion and
+                # must be rejected. BUT a task can legitimately land real work
+                # in a commit whose message omits the task id and which carries
+                # no owned_files (attribution then returns empty even though
+                # work happened). To avoid false-rejecting such a real
+                # completion, only hard-reject when the task has NOT already
+                # proven work via a non-trivial passing signal (a passing
+                # test_passes / file_contains / llm_review / llm_judge). When
+                # such proof exists and all signals passed, downgrade to a
+                # warn-and-flag for review instead of failing the task.
+                has_nontrivial_pass = all_passed and _has_nontrivial_passing_signal(task, signal_results)
+                if has_nontrivial_pass:
+                    warn_detail = f"empty diff but non-trivial completion signals passed: {attribution_reason}"
+                    signal_results.append(("attribution:empty_diff_warn", True, warn_detail))
+                    logger.warning(
+                        "janitor WARN (empty diff, flagged for review): task=%s task_type=%s -- no "
+                        "changed files attributable to this task (attribution: %s), but non-trivial "
+                        "completion signals passed, so accepting rather than rejecting; stamp the "
+                        "task id into the landing commit or set owned_files to make attribution "
+                        "explicit",
+                        task.id,
+                        task.task_type.value,
+                        attribution_reason,
+                    )
+                else:
+                    all_passed = False
+                    empty_diff_detail = f"empty diff: {attribution_reason}"
+                    signal_results.append(("attribution:empty_diff", False, empty_diff_detail))
+                    failed_descs.append(f"attribution:empty_diff: {empty_diff_detail}")
+                    logger.warning(
+                        "janitor REJECT (empty diff): task=%s task_type=%s -- no changed files "
+                        "attributable to this task (attribution: %s); a task with zero changed "
+                        "files must not be accepted unless it is an explicit no-op task type %s "
+                        "or it has a non-trivial passing completion signal",
+                        task.id,
+                        task.task_type.value,
+                        attribution_reason,
+                        sorted(t.value for t in _NOOP_TASK_TYPES),
+                    )
 
         diff = _get_git_diff(task, workdir, attributed_commits=attributed_commits)
         guardrail_results: list[GuardrailResult] = run_guardrails(
@@ -976,10 +1029,13 @@ def _check_path_exists(path_str: str, workdir: Path) -> tuple[bool, str]:
       1. Literal path, resolved against ``workdir`` -- the default and
          only out-of-the-box behavior, unchanged: the check means exactly
          the path the plan author wrote.
-      2. If the criterion itself contains explicit glob syntax
-         (``*``/``?``/``[``), it is evaluated as a glob pattern. This is
-         opt-in per-check by construction -- a plain literal path is never
-         reinterpreted.
+      2. If the literal path does NOT exist AND the criterion contains
+         explicit glob syntax (``*``/``?``/``[``), it is evaluated as a glob
+         pattern. Literal semantics take precedence: a literal path that
+         happens to contain a metacharacter (e.g. a Next.js dynamic-route
+         file ``app/users/[id]/page.tsx`` or a fixture ``foo[1].json``) is
+         matched literally first and is never silently reinterpreted as a
+         glob when it exists on disk.
       3. OPT-IN fuzzy fallback (``BERNSTEIN_JANITOR_FUZZY_PATHS=1``,
          default off): on a literal miss, try a pattern derived from the
          basename (``**/<stem>*<suffix>``) to tolerate a manager guessing
@@ -995,12 +1051,17 @@ def _check_path_exists(path_str: str, workdir: Path) -> tuple[bool, str]:
     """
     has_glob_syntax = any(c in _GLOB_CHARS for c in path_str)
 
-    if not has_glob_syntax:
-        literal = _resolve(path_str, workdir)
-        if literal.exists():
-            return True, "exists"
-    else:
-        # Explicit glob syntax in the criterion: honor it unconditionally.
+    # Literal-first: a literal path always wins, even when it contains a glob
+    # metacharacter. This preserves literal-path semantics for real files like
+    # ``app/users/[id]/page.tsx`` or ``foo[1].json`` so they are never silently
+    # reinterpreted as a glob when they exist on disk.
+    literal = _resolve(path_str, workdir)
+    if literal.exists():
+        return True, "exists"
+
+    if has_glob_syntax:
+        # Literal miss AND the criterion contains explicit glob syntax: honor
+        # it as a glob pattern (opt-in per-check by construction).
         glob_pattern = str(workdir / path_str)
         glob_matches = sorted(globmod.glob(glob_pattern, recursive=True))
         if glob_matches:

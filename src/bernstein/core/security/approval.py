@@ -315,12 +315,12 @@ class ApprovalGate:
         task: Task,
         *,
         worktree_path: Path,
-        _session_id: str = "",
+        session_id: str = "",
         base_branch: str = "main",
         labels: list[str] | None = None,
         _role: str = "",
-        _model: str = "",
-        _cost_usd: float = 0.0,
+        model: str = "",
+        cost_usd: float = 0.0,
         test_summary: str = "",
     ) -> str:
         """Push the agent branch and open a GitHub PR.
@@ -330,30 +330,27 @@ class ApprovalGate:
         then creates a PR with a structured body including task metadata, cost,
         test results, and the agent role/model.
 
-        NOTE ON PARAMETER NAMES: ``_session_id``/``_role``/``_model``/``_cost_usd``
-        are underscore-prefixed by convention because they are "part of the
-        interface" (accepted for logging/metadata parity with other gate call
-        sites) but not required for PR construction itself. Do NOT rename these
-        without updating every caller -- a prior signature drift between this
-        method (which used to accept ``session_id``/``model``/``cost_usd``
-        without underscores) and ``task_lifecycle._create_approval_pr`` (which
-        always called with the underscore-prefixed keywords) raised
-        ``TypeError: create_pr() got an unexpected keyword argument '_session_id'``
-        on every PR-mode approval, which was swallowed by the caller's
-        broad ``except Exception`` and silently defaulted to auto-merge --
-        i.e. the gate was bypassed. See house lesson on ApprovalGate fail-open
-        drift. This method now also fail-closes internally (below) so that
-        even a *future* drift cannot escape as a bypass.
+        NOTE ON PARAMETER NAMES: ``session_id``/``model``/``cost_usd`` are the
+        public keyword names accepted for logging/metadata parity with other
+        gate call sites; ``_role`` is underscore-prefixed by convention because
+        it is "part of the interface" but not required for PR construction
+        itself. Do NOT rename the public names without updating every caller --
+        a prior signature drift where this method briefly accepted
+        ``_session_id``/``_model``/``_cost_usd`` broke pre-existing callers and
+        tests that pass ``session_id``/``model``/``cost_usd`` with
+        ``TypeError: create_pr() got an unexpected keyword argument
+        'session_id'``. This method fail-closes internally (below) so that even
+        a *future* drift cannot escape as a bypass.
 
         Args:
             task: The task whose work should become a PR.
             worktree_path: Path to the agent's git worktree.
-            _session_id: Agent session ID (part of interface).
+            session_id: Agent session ID (part of interface).
             base_branch: Target branch for the PR.
             labels: GitHub labels to attach (defaults to ["bernstein", "auto-generated"]).
             _role: Agent role (part of interface).
-            _model: Model name (part of interface).
-            _cost_usd: Cost in USD (part of interface).
+            model: Model name (part of interface).
+            cost_usd: Cost in USD (part of interface).
             test_summary: One-line test result summary (e.g. ``"12 passed, 0 failed"``).
 
         Returns:
@@ -365,12 +362,12 @@ class ApprovalGate:
             return self._create_pr_inner(
                 task,
                 worktree_path=worktree_path,
-                session_id=_session_id,
+                session_id=session_id,
                 base_branch=base_branch,
                 labels=labels,
                 role=_role,
-                model=_model,
-                cost_usd=_cost_usd,
+                model=model,
+                cost_usd=cost_usd,
                 test_summary=test_summary,
             )
         except Exception:
@@ -379,10 +376,10 @@ class ApprovalGate:
                 "treat this as approved/auto-merge). task=%s session=%s role=%s model=%s cost_usd=%s "
                 "base_branch=%s worktree_path=%s\n%s",
                 task.id,
-                _session_id,
+                session_id,
                 _role,
-                _model,
-                _cost_usd,
+                model,
+                cost_usd,
                 base_branch,
                 worktree_path,
                 traceback.format_exc(),

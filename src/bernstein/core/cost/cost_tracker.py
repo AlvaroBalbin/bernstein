@@ -721,10 +721,10 @@ class CostTracker:
             envelope_fired = self._maybe_fire_envelope_threshold_locked(envelope)
 
         # Bug item-7 (2026-07-02): the run ledger's spent_usd sat at 0.0 for
-        # whole runs because nothing fed record() — every ledger mutation now
+        # whole runs because nothing fed record() - every ledger mutation now
         # logs itself so a silent-zero ledger is diagnosable from logs alone.
         # item 31 (2026-07-02): also tag each mutation with the ORIGIN of its
-        # token counts (via the existing cost_tags channel — no signature
+        # token counts (via the existing cost_tags channel - no signature
         # change) so an alive-exit /complete sidecar ingestion is
         # distinguishable in the logs from an orphan/dead-exit recovery.
         logger.info(

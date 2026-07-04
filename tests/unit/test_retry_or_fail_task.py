@@ -344,9 +344,9 @@ def test_retry_cap_decision_is_logged_with_original_task_id(caplog):
         )
 
     messages = [r.getMessage() for r in caplog.records]
-    assert any(
-        "retry_or_fail_task decision inputs" in m and "orig-root-task" in m for m in messages
-    ), f"expected a decision-inputs log line with the original_task_id, got: {messages}"
-    assert any(
-        "verdict=permanent_fail" in m and "orig-root-task" in m for m in messages
-    ), f"expected a permanent_fail verdict log line, got: {messages}"
+    assert any("retry_or_fail_task decision inputs" in m and "orig-root-task" in m for m in messages), (
+        f"expected a decision-inputs log line with the original_task_id, got: {messages}"
+    )
+    assert any("verdict=permanent_fail" in m and "orig-root-task" in m for m in messages), (
+        f"expected a permanent_fail verdict log line, got: {messages}"
+    )

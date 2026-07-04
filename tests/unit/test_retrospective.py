@@ -420,7 +420,7 @@ class TestComputeRunHealth:
                 id="T-1",
                 status="failed",
                 result_summary=(
-                    'BadRequestError: Error code: 400 - "This endpoint\'s maximum context '
+                    "BadRequestError: Error code: 400 - \"This endpoint's maximum context "
                     'length is 163840 tokens. However, you requested about 201099 tokens."'
                 ),
             )
@@ -558,6 +558,7 @@ class TestGenerateRetrospectiveRunHealth:
         assert "**Verdict:** UNHEALTHY" in content
         assert "Auto-completed after agent death | 1" in content
         assert "No issues detected; run looks healthy." not in content
+
 
 class TestRetrospectiveRegeneration:
     """Regression for the A5 stale-retrospective bug: a canary run's

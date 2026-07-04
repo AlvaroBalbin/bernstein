@@ -24,9 +24,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from bernstein.core.spawner import AgentSpawner
 
 from bernstein.adapters import registry
-from bernstein.core.spawner import AgentSpawner
 
 
 def _make_spawner(tmp_path: Path) -> AgentSpawner:

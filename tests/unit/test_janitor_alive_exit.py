@@ -24,6 +24,7 @@ After the fix:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from typing import Any
 
 import pytest
 from bernstein.core.models import CompletionSignal, Task, TaskType
+
 from bernstein.core.tasks import task_lifecycle
 from bernstein.core.tasks.task_lifecycle import (
     _enqueue_alive_exit_janitor_pass,
@@ -100,6 +102,7 @@ def test_enqueue_alive_exit_janitor_logs_and_submits(
     fn, args, _ = executor.submitted[0]
     # Either verify_task (sync) or _verify_via_janitor (async) is acceptable.
     from bernstein.core.janitor import verify_task
+
     assert fn in (verify_task, task_lifecycle._verify_via_janitor)
     if fn is verify_task:
         # verify_task(task, workdir)
@@ -215,12 +218,10 @@ def test_process_completed_tasks_invokes_helper_for_alive_exits(
     )
 
     with caplog.at_level(logging.INFO, logger="bernstein.core.tasks.task_lifecycle"):
-        try:
+        # The post-enqueue path may fail on the minimal mock; the test
+        # asserts the helper was invoked, not that it ran cleanly.
+        with contextlib.suppress(Exception):
             process_completed_tasks(orch, [task], result)
-        except Exception:
-            # The post-enqueue path may fail on the minimal mock; the test
-            # asserts the helper was invoked, not that it ran cleanly.
-            pass
 
     # _enqueue_alive_exit_janitor_pass ran via the helper path; the
     # helper itself submits to the executor exactly once.
@@ -277,12 +278,10 @@ def test_process_single_completed_task_logs_alive_exit_start(
     )
 
     with caplog.at_level(logging.INFO, logger="bernstein.core.tasks.task_lifecycle"):
-        try:
+        # After the top-of-function log any unrelated failures (no orch
+        # subclasses hooked up) should not affect the pass test.
+        with contextlib.suppress(Exception):
             _process_single_completed_task(orch, task, verify_futures, result)
-        except Exception:
-            # After the top-of-function log any unrelated failures (no orch
-            # subclasses hooked up) should not affect the pass test.
-            pass
 
     assert any(
         "janitor: alive-exit pass starting" in rec.message

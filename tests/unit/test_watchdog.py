@@ -190,12 +190,8 @@ def test_watchdog_manager_logs_detection_and_escalation(tmp_path: Path, caplog) 
         manager.sync([finding])
 
     messages = [r.message for r in caplog.records]
-    assert any(
-        "watchdog TIER1 detected" in m and "heartbeat:sess-1:task-1" in m for m in messages
-    ), messages
-    assert any(
-        "watchdog TIER3 escalating to human" in m and "heartbeat:sess-1:task-1" in m for m in messages
-    ), messages
+    assert any("watchdog TIER1 detected" in m and "heartbeat:sess-1:task-1" in m for m in messages), messages
+    assert any("watchdog TIER3 escalating to human" in m and "heartbeat:sess-1:task-1" in m for m in messages), messages
 
 
 def test_watchdog_manager_refuses_triage_of_triage(tmp_path: Path) -> None:

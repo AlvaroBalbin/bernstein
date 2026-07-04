@@ -113,9 +113,7 @@ def _is_forbidden_for_merge(path: str) -> bool:
     for prefix in _MERGE_DENY_PREFIXES:
         if norm == prefix.rstrip("/") or norm.startswith(prefix):
             return True
-    if norm in _MERGE_DENY_EXACT:
-        return True
-    return False
+    return norm in _MERGE_DENY_EXACT
 
 
 def _verify_merge_staging_is_safe(
@@ -163,8 +161,7 @@ def _verify_merge_staging_is_safe(
     # log INFO with author/reason/added; even a refused merge must be
     # auditable.  Single line, fixed schema.
     logger.info(
-        "merge_preflight: cwd=%s branch=%s staged_count=%d forbidden_count=%d "
-        "added=%s reason=%s",
+        "merge_preflight: cwd=%s branch=%s staged_count=%d forbidden_count=%d added=%s reason=%s",
         cwd,
         branch,
         len(staged_paths),

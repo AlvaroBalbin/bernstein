@@ -17,8 +17,6 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-logger = logging.getLogger(__name__)
-
 from bernstein.evolution.aggregator import (
     AgentMetrics,
     AnomalyDetection,
@@ -100,6 +98,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from bernstein.core.models import Task
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "AgentMetrics",
@@ -460,7 +460,7 @@ class EvolutionCoordinator:
         argument '_model'`` on every call, which was silently swallowed by a
         broad ``except Exception`` (task_lifecycle.py, logged at WARNING) or a
         bare ``contextlib.suppress(Exception)`` (agent_lifecycle.py's
-        wall-clock and heartbeat reap paths — no log at all). Net effect: the
+        wall-clock and heartbeat reap paths - no log at all). Net effect: the
         evolution system's agents.jsonl metrics stream never received a
         single agent-lifetime record, starving role/model retirement analysis
         of its primary input with zero visible signal in the reap paths.
@@ -480,8 +480,7 @@ class EvolutionCoordinator:
         """
         resolved_model = _model if _model is not None else model
         logger.info(
-            "record_agent_lifetime: agent_id=%s role=%s model=%s "
-            "lifetime_seconds=%.2f tasks_completed=%d",
+            "record_agent_lifetime: agent_id=%s role=%s model=%s lifetime_seconds=%.2f tasks_completed=%d",
             agent_id,
             role,
             resolved_model,

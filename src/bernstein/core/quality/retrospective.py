@@ -236,8 +236,7 @@ def classify_task_terminator(task: Task) -> str:
         # ends have drifted out of sync.
         matched = next((m for m in _AUTO_COMPLETED_MARKERS if m in text), None)
         logger.debug(
-            "classify_task_terminator: task_id=%s -> auto_completed_after_death "
-            "(matched_marker=%r, result_summary=%r)",
+            "classify_task_terminator: task_id=%s -> auto_completed_after_death (matched_marker=%r, result_summary=%r)",
             task.id,
             matched,
             task.result_summary,
@@ -691,9 +690,7 @@ def generate_retrospective(
     total = len(all_tasks) + n_unresolved
     completion_rate = (n_done / total * 100) if total else 0.0
 
-    _status_histogram = (
-        full_status_counts if full_status_counts is not None else {"done": n_done, "failed": n_failed}
-    )
+    _status_histogram = full_status_counts if full_status_counts is not None else {"done": n_done, "failed": n_failed}
     logger.info(
         "Generating retrospective (trigger=%s): status_histogram=%s",
         trigger_reason,
@@ -811,7 +808,7 @@ def generate_retrospective(
     _section("")
     if trigger_reason != "shutdown-final":
         _section(
-            f"**INTERIM — run in progress** (trigger: {trigger_reason}). This snapshot was "
+            f"**INTERIM - run in progress** (trigger: {trigger_reason}). This snapshot was "
             "generated before all tasks reached a terminal state and will be overwritten by "
             "the final retrospective at orchestrator shutdown."
         )

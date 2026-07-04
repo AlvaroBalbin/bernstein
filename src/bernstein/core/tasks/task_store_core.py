@@ -1500,7 +1500,7 @@ class TaskStore:
         """Reopen a done task that failed janitor verification.
 
         Transitions DONE -> OPEN so the SAME task (same id) is re-claimed and
-        re-attempted — no new task is created. Increments
+        re-attempted - no new task is created. Increments
         ``metadata['janitor_reopen_count']`` so the orchestrator can bound the
         number of reopen cycles before permanent failure.
 

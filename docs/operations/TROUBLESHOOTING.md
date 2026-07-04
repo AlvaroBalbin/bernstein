@@ -527,7 +527,7 @@ find . -name "*<basename-without-extension>*"
 
 **Resolution:**
 - **Default behavior is unchanged**: `path_exists` with a plain literal
-  path still means exactly that path — operators can rely on the check
+  path still means exactly that path - operators can rely on the check
   meaning the path they wrote.
 - **Explicit glob syntax always works**: a criterion that itself contains
   glob characters (e.g. `path_exists: packages/db/**/seed-workers*.test.ts`)
@@ -541,11 +541,11 @@ find . -name "*<basename-without-extension>*"
   depth/convention. Default OFF. When a fuzzy match satisfies a check, the
   janitor logs a WARNING (`janitor path_exists: FUZZY MATCH ...`) naming
   the literal path that missed, the pattern tried, and the path that
-  matched — check `.sdd/runtime/*.log`. See
+  matched - check `.sdd/runtime/*.log`. See
   [CONFIG.md](CONFIG.md#3-environment-variables).
 - **Known limitation:** `test_passes` signals (e.g. `pnpm exec vitest run
   test/seed-workers.test.ts`) still reference the manager's guessed literal
-  path and are not rewritten by this fix — a command-level mismatch there
+  path and are not rewritten by this fix - a command-level mismatch there
   will still fail. If you hit this, prefer directory-wide test commands
   (`pnpm --filter db test`) in the plan/decomposition rather than a single
   guessed file path.

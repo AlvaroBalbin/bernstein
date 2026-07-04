@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -146,6 +147,51 @@ class HeartbeatMonitor:
         stop_path.touch()
         logger.info("Heartbeat STOP marker written for session %s (%s)", session_id, stop_path)
 
+    def _pid_cmdline(self, pid: int) -> str | None:
+        """Best-effort process command line for *pid*, or None if unavailable.
+
+        Reads ``/proc/<pid>/cmdline`` on Linux; falls back to ``ps`` on
+        platforms without procfs (e.g. macOS). Returns None when the process
+        is gone or the command line cannot be read, so the caller can decide
+        conservatively.
+        """
+        proc_cmdline = Path("/proc") / str(pid) / "cmdline"
+        try:
+            raw = proc_cmdline.read_bytes()
+        except FileNotFoundError:
+            # No procfs (macOS/BSD) or process gone: fall back to ps.
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip() or None
+        except OSError:
+            return None
+        # /proc cmdline args are NUL-separated.
+        return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip() or None
+
+    def _pid_is_heartbeat_loop(self, pid: int, session_id: str) -> bool | None:
+        """Whether *pid* still looks like this session's heartbeat loop.
+
+        Returns True when the process command line references this session's
+        heartbeat/stop path, False when it clearly does not (a recycled,
+        unrelated PID), and None when identity cannot be determined (command
+        line unreadable) so the caller can choose a conservative default.
+        """
+        cmdline = self._pid_cmdline(pid)
+        if cmdline is None:
+            return None
+        heartbeat_marker = str(self._heartbeat_pid_path(session_id).parent / f"{session_id}")
+        stop_marker = str(self._heartbeat_stop_path(session_id))
+        return heartbeat_marker in cmdline or stop_marker in cmdline
+
     def reap_heartbeat_loop(self, session_id: str, *, reason: str) -> None:
         """Belt-and-braces reap: request stop, then kill the recorded pid if still alive.
 
@@ -169,6 +215,33 @@ class HeartbeatMonitor:
         except ValueError:
             logger.info("Heartbeat reap for session %s: malformed pidfile contents %r", session_id, raw_pid)
             return
+
+        # Verify the PID still belongs to this session's heartbeat loop before
+        # signalling it. A run that crashed before writing the STOP marker can
+        # leave a stale pidfile; if the OS recycled that PID to an unrelated
+        # process, an unconditional SIGTERM would kill a foreign process. Skip
+        # the kill on a definitive identity mismatch; proceed (with a warning)
+        # only when identity cannot be determined at all.
+        identity = self._pid_is_heartbeat_loop(pid, session_id)
+        if identity is False:
+            logger.warning(
+                "Heartbeat reap for session %s: pid %d does not match this session's heartbeat "
+                "loop (likely a recycled/unrelated PID) -- NOT signalling it (reason: %s)",
+                session_id,
+                pid,
+                reason,
+            )
+            with contextlib.suppress(OSError):
+                pid_path.unlink()
+            return
+        if identity is None:
+            logger.warning(
+                "Heartbeat reap for session %s: could not verify pid %d identity (command line "
+                "unreadable); proceeding with SIGTERM (reason: %s)",
+                session_id,
+                pid,
+                reason,
+            )
 
         try:
             os.kill(pid, signal.SIGTERM)

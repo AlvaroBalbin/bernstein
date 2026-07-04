@@ -52,7 +52,7 @@ class RequestPriority(enum.Enum):
 # Text patterns that indicate a rate-limit / 429 event in agent logs.
 # Checked case-insensitively against the last 500 lines of the log.
 #
-# NOTE: "429" is a *risky bare token* (see _RISKY_BARE_TOKENS below) — a bare
+# NOTE: "429" is a *risky bare token* (see _RISKY_BARE_TOKENS below) - a bare
 # number matches freely inside structured JSON log data (byte counts, task
 # IDs, timestamps) that has nothing to do with a rate-limit event. It is only
 # treated as a hit when it appears on a line that ALSO contains explicit
@@ -84,7 +84,7 @@ _TIMEOUT_PATTERNS: tuple[str, ...] = (
     "TimeoutError",
     "ConnectTimeoutError",
     "ReadTimeoutError",
-    "504",  # risky bare token — see _RISKY_BARE_TOKENS
+    "504",  # risky bare token - see _RISKY_BARE_TOKENS
     "gateway timeout",
 )
 
@@ -105,7 +105,7 @@ _API_ERROR_PATTERNS: tuple[str, ...] = (
 )
 
 # Text patterns that indicate an authentication error (401, 403) in agent logs.
-# "401"/"403" are risky bare tokens — see _RISKY_BARE_TOKENS.
+# "401"/"403" are risky bare tokens - see _RISKY_BARE_TOKENS.
 _AUTH_ERROR_PATTERNS: tuple[str, ...] = (
     "401",
     "403",
@@ -121,11 +121,11 @@ _AUTH_ERROR_PATTERNS: tuple[str, ...] = (
 # Text patterns that indicate a context-overflow / prompt-too-long (413) error.
 #
 # "413" and "context window" are risky bare/generic tokens (see
-# _RISKY_BARE_TOKENS) — they match freely inside structured JSON tool-result
+# _RISKY_BARE_TOKENS) - they match freely inside structured JSON tool-result
 # and manifest dumps that have nothing to do with a real provider error.
 # "max_tokens" was REMOVED outright (not just demoted to risky): it is a
 # completely ordinary field name in request/response manifests and provides
-# no error signal even with context words nearby — see 2026-07-02 incident
+# no error signal even with context words nearby - see 2026-07-02 incident
 # (runs 4/5/6 killed by healthy MiniMax-M3 workers whose JSON logs contained
 # `"max_tokens": 16384` and numbers containing 413/429).
 _CONTEXT_OVERFLOW_PATTERNS: tuple[str, ...] = (
@@ -148,20 +148,20 @@ _CONTEXT_OVERFLOW_PATTERNS: tuple[str, ...] = (
 # (tool-call results, manifest dumps, byte counts, task IDs) and therefore
 # cannot be trusted as failure signals on their own. A risky token only
 # counts as a match when it appears with a word boundary on a line that ALSO
-# contains explicit error context (see _ERROR_CONTEXT_RE) — e.g.
+# contains explicit error context (see _ERROR_CONTEXT_RE) - e.g.
 # "Error code: 413 - request too large" matches, but a JSON blob containing
 # `"max_tokens": 16384` (which incidentally contains the digits 4-1-3 nowhere,
 # but DOES contain other risky substrings like "429" in unrelated counters)
 # does not. See 2026-07-02 false-positive incident (runs 4/5/6 killed).
 _RISKY_BARE_TOKENS: frozenset[str] = frozenset(
     {
-        # bare HTTP codes — match inside byte counts / ids / timestamps
+        # bare HTTP codes - match inside byte counts / ids / timestamps
         "413",
         "429",
         "401",
         "403",
         "504",
-        # generic words/phrases — appear freely in tool output, target-repo code
+        # generic words/phrases - appear freely in tool output, target-repo code
         # being read, and test stdout (2026-07-02 run 7: `"timeout": 5` in a
         # tool-call JSON killed a healthy manager)
         "context window",
@@ -206,7 +206,7 @@ _RISKY_BARE_TOKENS: frozenset[str] = frozenset(
 _DATA_LINE_TYPES: frozenset[str] = frozenset({"tool_call", "tool_result", "heartbeat", "completion", "progress"})
 
 # Words that indicate a line is plausibly describing a real provider/HTTP
-# error, rather than incidental structured data. Deliberately narrow —
+# error, rather than incidental structured data. Deliberately narrow -
 # broadening this list re-opens the false-positive hole this patch closes.
 _ERROR_CONTEXT_RE = re.compile(r"\b(error|status|http|code|exception|failed|failure|traceback)\b", re.IGNORECASE)
 
@@ -533,7 +533,7 @@ class RateLimitTracker:
 
         Patterns in ``_RISKY_BARE_TOKENS`` (bare numbers like "413"/"429" and
         generic phrases like "context window") are NOT matched by plain
-        substring containment — structured JSON log lines (tool results,
+        substring containment - structured JSON log lines (tool results,
         manifest dumps) are full of numbers and common words that would
         otherwise false-positive-kill a healthy worker (2026-07-02 incident:
         runs 4/5/6 killed by this exact failure mode). A risky token only

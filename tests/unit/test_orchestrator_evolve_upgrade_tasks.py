@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from bernstein.core.models import Task, TaskStatus, TaskType
+
 from bernstein.core.orchestration.evolution import UpgradeStatus
 from bernstein.core.orchestration.orchestrator_evolve import _create_upgrade_tasks
 

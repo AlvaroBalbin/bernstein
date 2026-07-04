@@ -4,7 +4,7 @@ The hook (``_run_auto_commit_pre_complete`` in
 ``bernstein.core.routes.task_crud``) auto-commits a worker's uncommitted
 work BEFORE ``store.complete`` transitions the task to done, so a worker
 that forgets to commit still has its work delivered.  Failures are
-swallowed (fail-open) — see defect 33 spec.
+swallowed (fail-open) - see defect 33 spec.
 
 These tests run foreground-only per the lessons.md rule 5 (background
 pytest is a stall trap for delegated agents).
@@ -12,11 +12,10 @@ pytest is a stall trap for delegated agents).
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
@@ -28,10 +27,6 @@ from bernstein.core.routes.task_crud import (
 )
 from bernstein.core.server import create_app
 from bernstein.core.tasks.models import Task, TaskStatus
-
-if TYPE_CHECKING:
-    from starlette.requests import Request
-
 
 # ---------------------------------------------------------------------------
 # Pure-function tests (deny list / salvage detection)
@@ -112,7 +107,7 @@ class _FakeAppState:
 class _FakeApp:
     """Minimal stand-in for ``starlette.requests.Request.app``.
 
-    The hook reads ``request.app.state.workdir`` — so ``app`` exposes
+    The hook reads ``request.app.state.workdir`` - so ``app`` exposes
     ``state`` whose attribute is the workdir Path.
     """
 
@@ -196,9 +191,7 @@ def _setup_workdir_with_worktree(workdir: Path, session_id: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_auto_commit_creates_commit_for_uncommitted_changes(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_auto_commit_creates_commit_for_uncommitted_changes(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="bernstein.core.routes.task_crud")
     session_id = "A-1"
     task = _make_task("T-100", session_id)
@@ -246,15 +239,13 @@ def test_auto_commit_creates_commit_for_uncommitted_changes(
 # ---------------------------------------------------------------------------
 
 
-def test_auto_commit_skips_when_already_committed(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_auto_commit_skips_when_already_committed(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="bernstein.core.routes.task_crud")
     session_id = "A-2"
     task = _make_task("T-200", session_id)
     wt = _setup_workdir_with_worktree(tmp_path, session_id)
 
-    # Worker already committed with the task id in the message — this is
+    # Worker already committed with the task id in the message - this is
     # the success path from 88611aab's prompt contract.
     (wt / "delivered.txt").write_text("worker deliverable\n", encoding="utf-8")
     subprocess.run(["git", "add", "delivered.txt"], cwd=wt, check=True)
@@ -291,9 +282,7 @@ def test_auto_commit_skips_when_already_committed(
 # ---------------------------------------------------------------------------
 
 
-def test_auto_commit_skips_salvage_branch(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_auto_commit_skips_salvage_branch(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="bernstein.core.routes.task_crud")
     session_id = "A-3"
     task = _make_task("T-300", session_id)
@@ -413,7 +402,7 @@ def test_auto_commit_swallows_git_errors(
     (wt / "deliverable.py").write_text("print('hi')\n", encoding="utf-8")
 
     # Force git commit to fail by patching subprocess.run inside the hook.
-    # The hook reads ``subprocess.run`` from the module-level import — we
+    # The hook reads ``subprocess.run`` from the module-level import - we
     # patch ``subprocess.run`` itself so the hook sees the failure too.
     real_run = subprocess.run
 
@@ -440,9 +429,7 @@ def test_auto_commit_swallows_git_errors(
     _run_auto_commit_pre_complete(request, task)  # type: ignore[arg-type]
 
     warn_records = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING and "auto_commit_pre_complete_failed" in r.message
+        r for r in caplog.records if r.levelno == logging.WARNING and "auto_commit_pre_complete_failed" in r.message
     ]
     assert warn_records, f"expected warn log on simulated git error; got: {[r.message for r in caplog.records]}"
 
@@ -452,9 +439,7 @@ def test_auto_commit_swallows_git_errors(
 # ---------------------------------------------------------------------------
 
 
-def test_auto_commit_skips_when_no_session(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_auto_commit_skips_when_no_session(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="bernstein.core.routes.task_crud")
     task = _make_task("T-700", None)
 
@@ -466,14 +451,12 @@ def test_auto_commit_skips_when_no_session(
 
 
 # ---------------------------------------------------------------------------
-# (h) /complete end-to-end via TestClient — works on a tiny task
+# (h) /complete end-to-end via TestClient - works on a tiny task
 #     (regression: existing /complete path stays green).
 # ---------------------------------------------------------------------------
 
 
-def test_complete_endpoint_still_responds_200(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_complete_endpoint_still_responds_200(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="bernstein.core.routes.task_crud")
     app = create_app(jsonl_path=tmp_path / "tasks.jsonl")
 
@@ -492,7 +475,7 @@ def test_complete_endpoint_still_responds_200(
         )
         assert create_resp.status_code == 201, create_resp.text
         task_id = create_resp.json()["id"]
-        # Claim and complete — no worker session, so the hook should
+        # Claim and complete - no worker session, so the hook should
         # no-op cleanly with reason=no_session.
         assert client.post(f"/tasks/{task_id}/claim").status_code == 200
         resp = client.post(

@@ -312,9 +312,7 @@ class OpenAIAgentsAdapter(PluginAdapter):
 
             max_turns = _resolve_max_turns()
 
-        _tool_names = [
-            str(t.get("name", "<unnamed>")) if isinstance(t, dict) else "<non-dict-tool>" for t in tools
-        ]
+        _tool_names = [str(t.get("name", "<unnamed>")) if isinstance(t, dict) else "<non-dict-tool>" for t in tools]
         logger.info(
             "_build_manifest tool assembly session=%s: resolved tool_source=%r, gateway tool_names=%r "
             "(count=%d), mcp_servers=%r, allow_run_command=%s",

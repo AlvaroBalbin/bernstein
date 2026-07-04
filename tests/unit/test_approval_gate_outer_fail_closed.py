@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from bernstein.core.models import AgentSession, ModelConfig, Task
+
 from bernstein.core.tasks.task_lifecycle import _evaluate_approval_gate
 
 

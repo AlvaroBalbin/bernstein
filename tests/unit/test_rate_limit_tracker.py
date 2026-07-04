@@ -296,7 +296,7 @@ class TestRouterRateLimitIntegration:
 
 # ---------------------------------------------------------------------------
 # Regression: risky bare-substring patterns must not false-positive on
-# structured JSON log data (2026-07-02 incident — runs 4/5/6 killed).
+# structured JSON log data (2026-07-02 incident - runs 4/5/6 killed).
 # ---------------------------------------------------------------------------
 
 
@@ -346,7 +346,7 @@ class TestRiskyBareTokenFalsePositives:
 
     def test_max_tokens_removed_outright_even_with_error_context(self, tmp_path: Path) -> None:
         """max_tokens was removed from the pattern list entirely, not just
-        demoted to risky — it must not fire even next to the word "error"."""
+        demoted to risky - it must not fire even next to the word "error"."""
         log = tmp_path / "agent.log"
         log.write_text('{"error": "none", "max_tokens": 16384}\n')
         tracker = RateLimitTracker()
@@ -355,7 +355,7 @@ class TestRiskyBareTokenFalsePositives:
 
 class TestRiskyBareTokenTruePositives:
     """Genuine provider errors with real error context must still be
-    detected — the fix must not blind the classifier entirely."""
+    detected - the fix must not blind the classifier entirely."""
 
     def test_detects_413_with_error_context(self, tmp_path: Path) -> None:
         log = tmp_path / "agent.log"
@@ -408,7 +408,7 @@ class TestDataLineAndGenericWordFalsePositives:
         log.write_text(
             '{"type": "tool_call", "name": "run_command", "args": {"argv": ["pnpm", "test"], "timeout": 5}}\n'
             '{"type": "tool_result", "name": "read_file", "ok": true, "result": {"bytes": 64133, "preview": "if (unauthorized) throw new Error(\'forbidden\'); // rate limit retry"}}\n'
-            '{"type": "tool_result", "name": "run_command", "ok": false, "result": {"stderr_preview": "Error: connect ECONNREFUSED 127.0.0.1:5432 — test timed out"}}\n'
+            '{"type": "tool_result", "name": "run_command", "ok": false, "result": {"stderr_preview": "Error: connect ECONNREFUSED 127.0.0.1:5432 - test timed out"}}\n'
             '{"type": "heartbeat", "phase": "running", "timeout": 429}\n'
             '{"type": "tool_result", "name": "read_file", "result": {"preview": "max_tokens: 16384, TimeoutError handling, status 413 code"}}\n'
         )
@@ -429,7 +429,7 @@ class TestDataLineAndGenericWordFalsePositives:
             "timeout": "openai.APITimeoutError: HTTP request failed: read timeout\n",
             "context_overflow": '{"type": "error", "message": "Error code: 413 - request too large: maximum context length exceeded"}\n',
             "auth_error": "openai.AuthenticationError: Error code: 401 - invalid api key\n",
-            "api_error": "httpx.ConnectError: connection refused (APIConnectionError) — request failed\n",
+            "api_error": "httpx.ConnectError: connection refused (APIConnectionError) - request failed\n",
         }
         for expected, line in cases.items():
             log = tmp_path / f"{expected}.log"
@@ -459,13 +459,11 @@ class TestCompletionProgressSkipSet:
 
     def test_progress_type_prose_with_timeout_does_not_match(self, tmp_path):
         log = tmp_path / "agent.log"
-        log.write_text(
-            '{"type": "progress", "message": "I set a 10s timeout on the curl call and it succeeded"}\n'
-        )
+        log.write_text('{"type": "progress", "message": "I set a 10s timeout on the curl call and it succeeded"}\n')
         assert self._tracker().detect_failure_type(log) is None
 
     def test_bare_timeout_without_error_context_does_not_match(self, tmp_path):
-        """"timeout" is a _RISKY_BARE_TOKENS entry: even on an unstructured
+        """ "timeout" is a _RISKY_BARE_TOKENS entry: even on an unstructured
         line (not completion/progress), a bare mention with no error-context
         word on the same line must not trigger a match."""
         log = tmp_path / "agent.log"

@@ -28,9 +28,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def test_claim_version_conflict_logs_expected_vs_actual(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_claim_version_conflict_logs_expected_vs_actual(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="bernstein.core.routes.task_crud")
     app = create_app(jsonl_path=tmp_path / "tasks.jsonl")
 
@@ -60,7 +58,9 @@ def test_claim_version_conflict_logs_expected_vs_actual(
         assert second.status_code == 409, second.text
 
     conflict_records = [
-        r.message for r in caplog.records if "task.claim 409" in r.message  # type: ignore[attr-defined]
+        r.message
+        for r in caplog.records
+        if "task.claim 409" in r.message  # type: ignore[attr-defined]
     ]
     assert conflict_records, f"expected a task.claim 409 log line, got: {caplog.text}"  # type: ignore[attr-defined]
     line = conflict_records[0]

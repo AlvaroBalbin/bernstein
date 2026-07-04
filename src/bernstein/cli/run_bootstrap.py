@@ -769,7 +769,7 @@ def _signal_orchestrator_shutdown(*, reason: str = "cli detected run completion"
             "(connection refused - orchestrator process already exited via self-stop)",
             target,
         )
-    except Exception as exc:  # noqa: BLE001 - best-effort backstop, never fatal
+    except Exception as exc:
         logger.info(
             "cli_shutdown_signal: sent target=%s result=error error=%s "
             "(non-fatal - orchestrator quiescence self-stop is the primary path)",

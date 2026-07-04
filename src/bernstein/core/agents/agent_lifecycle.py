@@ -317,7 +317,7 @@ def _save_partial_work(spawner: Any, session: Any) -> bool:
         committed = result.returncode == 0
     except Exception:
         logger.exception(
-            "Partial-work WIP commit failed during reap (session_id=%s role=%s worktree=%s) — reap continues",
+            "Partial-work WIP commit failed during reap (session_id=%s role=%s worktree=%s) - reap continues",
             session.id,
             session.role,
             wt,
@@ -329,7 +329,7 @@ def _save_partial_work(spawner: Any, session: Any) -> bool:
     except Exception:
         logger.exception(
             "reap_completed_agent (merge) failed during partial-work save "
-            "(session_id=%s role=%s worktree=%s) — reap continues",
+            "(session_id=%s role=%s worktree=%s) - reap continues",
             session.id,
             session.role,
             wt,
@@ -948,8 +948,7 @@ def _handle_failure_detection(
     # (matched pattern=..., line_type=..., excerpt=...) immediately before
     # this line -- log_path here is the pointer that ties the two together.
     logger.warning(
-        "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) "
-        "-> throttling provider %r",
+        "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) -> throttling provider %r",
         _failure_type,
         session.id,
         session.provider,
@@ -1182,9 +1181,7 @@ def _probe_fast_exit(
     if log_path.exists():
         log_path_str = str(log_path)
         with contextlib.suppress(OSError):
-            log_tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[
-                -_FAST_EXIT_LOG_TAIL_LINES:
-            ]
+            log_tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-_FAST_EXIT_LOG_TAIL_LINES:]
 
     # Runner manifests (e.g. openai_agents_runner.py) are preserved by
     # _preserve_runner_logs() into agent_logs/<session_id>/ before the
@@ -1689,9 +1686,7 @@ def handle_orphaned_task(
     # emitting any metrics -- this is a dead agent, so this is the only
     # remaining source of truth for what it actually spent (see
     # _read_runner_cost_usd docstring / D2 openrouter FAIL-NOTE 2026-07-03).
-    _orphan_cost_usd, _orphan_tokens_in, _orphan_tokens_out = _read_runner_cost_usd(
-        orch._workdir, session, task_id
-    )
+    _orphan_cost_usd, _orphan_tokens_in, _orphan_tokens_out = _read_runner_cost_usd(orch._workdir, session, task_id)
 
     emit_orphan_metrics(
         orch._workdir,
@@ -2010,7 +2005,7 @@ def _reap_wall_clock_timeout(
         except Exception:
             logger.exception(
                 "record_agent_lifetime failed during wall-clock reap "
-                "(session_id=%s role=%s model=%s lifetime_seconds=%s) — reap continues",
+                "(session_id=%s role=%s model=%s lifetime_seconds=%s) - reap continues",
                 session.id,
                 session.role,
                 getattr(session.model_config, "model", None),
@@ -2059,7 +2054,7 @@ def _reap_heartbeat_timeout(
         except Exception:
             logger.exception(
                 "record_agent_lifetime failed during heartbeat-timeout reap "
-                "(session_id=%s role=%s model=%s lifetime_seconds=%s age=%.0fs) — reap continues",
+                "(session_id=%s role=%s model=%s lifetime_seconds=%s age=%.0fs) - reap continues",
                 session.id,
                 session.role,
                 getattr(session.model_config, "model", None),

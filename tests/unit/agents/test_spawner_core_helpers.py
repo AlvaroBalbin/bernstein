@@ -121,7 +121,7 @@ def test_render_auth_section_has_no_read_file_token_fallback() -> None:
     e2da807d removed the read_file fallback from the manager templates because
     read_file is confined to the agent worktree and the token lives outside it.
     The rendered section must not instruct agents to read the token via
-    read_file — the only read_file mention allowed is the explicit prohibition.
+    read_file - the only read_file mention allowed is the explicit prohibition.
     """
     out = _render_auth_section(Path("/tmp/tok.jwt"))
     assert "**Do not use the `read_file` tool to obtain your token.**" in out
@@ -281,9 +281,7 @@ def test_set_shutdown_event_stores_event(tmp_path: Path) -> None:
     assert spawner._shutdown_event is event
 
 
-def test_spawn_refused_during_shutdown_is_logged(
-    tmp_path: Path, make_task: Any, caplog: Any
-) -> None:
+def test_spawn_refused_during_shutdown_is_logged(tmp_path: Path, make_task: Any, caplog: Any) -> None:
     """Logging gap: a spawn attempt during shutdown raised
     ``ShutdownInProgress`` with no log line -- an operator reading only the
     server-side log (not the orchestrator's exception traceback) had no way
@@ -307,9 +305,9 @@ def test_spawn_refused_during_shutdown_is_logged(
         pass
 
     messages = [r.message for r in caplog.records]
-    assert any(
-        "spawn refused" in m and "shutdown_event is set" in m and "task-shutdown-1" in m for m in messages
-    ), messages
+    assert any("spawn refused" in m and "shutdown_event is set" in m and "task-shutdown-1" in m for m in messages), (
+        messages
+    )
 
 
 def test_set_merge_queue_stores_queue(tmp_path: Path) -> None:

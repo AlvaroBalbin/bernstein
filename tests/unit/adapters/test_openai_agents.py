@@ -1067,9 +1067,7 @@ class TestRunnerHelpers:
         finally:
             core_defaults.reset()
 
-    def test_log_max_turns_exceeded_reports_turns_and_completed_work(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_log_max_turns_exceeded_reports_turns_and_completed_work(self, caplog: pytest.LogCaptureFixture) -> None:
         """Bug 13: hitting the cap must WARN with the configured cap, turns
         actually used, and whether the agent had already POSTed /complete."""
         from types import SimpleNamespace
@@ -1099,9 +1097,7 @@ class TestRunnerHelpers:
             for rec in caplog.records
         ), f"missing/incomplete MaxTurns warning: {[r.getMessage() for r in caplog.records]}"
 
-    def test_log_max_turns_exceeded_handles_missing_run_data(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_log_max_turns_exceeded_handles_missing_run_data(self, caplog: pytest.LogCaptureFixture) -> None:
         """No run_data on the exception must still produce a WARNING with
         unknowns, never a crash."""
         from bernstein.adapters.openai_agents_runner import _log_max_turns_exceeded
@@ -2180,7 +2176,9 @@ class TestManifestControlKnobs:
 
 
 class TestBug13CostMetering:
-    def _manifest(self, *, model: str, heartbeat_dir: str | None = None, session_id: str = "sess-bug13") -> RunnerManifest:
+    def _manifest(
+        self, *, model: str, heartbeat_dir: str | None = None, session_id: str = "sess-bug13"
+    ) -> RunnerManifest:
         return RunnerManifest(
             session_id=session_id,
             prompt="hello",

@@ -152,8 +152,7 @@ def _run_merge_and_push(
     # a missing ``role`` attribute -- the log line must NEVER raise.
     author_role = getattr(session, "role", "<unknown>")
     logger.info(
-        "merge_preflight: from=<worktree=%s> to=<main=%s> branch=agent/%s "
-        "author=<spawner:%s> reason=<reap-and-merge>",
+        "merge_preflight: from=<worktree=%s> to=<main=%s> branch=agent/%s author=<spawner:%s> reason=<reap-and-merge>",
         worktree_root,
         worktree_root,
         session.id,

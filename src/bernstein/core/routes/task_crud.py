@@ -267,9 +267,7 @@ def _is_salvage_branch(branch_name: str | None) -> bool:
         return False
     if branch_name.startswith("salvage/"):
         return True
-    if "bernstein-salvage" in branch_name:
-        return True
-    return False
+    return "bernstein-salvage" in branch_name
 
 
 def _run_auto_commit_pre_complete(
@@ -284,7 +282,7 @@ def _run_auto_commit_pre_complete(
     worker's ``agent/<session-id>`` branch.  Salvage / graveyard
     branches are skipped.
 
-    Logging contract (house rule 2 — full logging, never silent):
+    Logging contract (house rule 2 - full logging, never silent):
 
       * ``auto_commit_pre_complete: task=<id> session=<s> reason=already_committed``
       * ``auto_commit_pre_complete: task=<id> session=<s> reason=skipped_salvage_branch branch=<name>``
@@ -293,7 +291,7 @@ def _run_auto_commit_pre_complete(
       * ``auto_commit_pre_complete_failed: task=<id> session=<s> error=<msg> files=<list>`` (WARN)
 
     All errors are swallowed (fail-open) so the orchestrator's lifecycle
-    machinery still observes a /complete — see spec step 6.
+    machinery still observes a /complete - see spec step 6.
     """
     session_id = task.claimed_by_session
     if not session_id:
@@ -328,7 +326,7 @@ def _run_auto_commit_pre_complete(
         )
         if branch_proc.returncode == 0:
             branch_name = branch_proc.stdout.strip() or None
-    except Exception as exc:  # pragma: no cover — defensive
+    except Exception as exc:  # pragma: no cover  # intentional-broad-except: branch lookup is best-effort
         logger.debug(
             "auto_commit_pre_complete: task=%s session=%s branch_lookup_error=%s",
             task.id,
@@ -362,7 +360,7 @@ def _run_auto_commit_pre_complete(
                 session_id,
             )
             return
-    except Exception as exc:
+    except Exception as exc:  # intentional-broad-except: already-committed check is best-effort
         logger.warning(
             "auto_commit_pre_complete_failed: task=%s session=%s error=%s stage=already_committed_check",
             task.id,
@@ -393,9 +391,7 @@ def _run_auto_commit_pre_complete(
                 timeout=5,
             )
             if diff_proc.returncode == 0:
-                files_to_commit.extend(
-                    line.strip() for line in diff_proc.stdout.splitlines() if line.strip()
-                )
+                files_to_commit.extend(line.strip() for line in diff_proc.stdout.splitlines() if line.strip())
 
         status_proc = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
@@ -415,7 +411,7 @@ def _run_auto_commit_pre_complete(
                     path = path.split(" -> ", 1)[1].strip()
                 if path and not _is_auto_commit_denied(path):
                     files_to_commit.append(path)
-    except Exception as exc:
+    except Exception as exc:  # intentional-broad-except: file enumeration is best-effort
         logger.warning(
             "auto_commit_pre_complete_failed: task=%s session=%s error=%s stage=file_enumeration",
             task.id,
@@ -503,7 +499,7 @@ def _run_auto_commit_pre_complete(
             session_id,
             commit_set,
         )
-    except Exception as exc:
+    except Exception as exc:  # intentional-broad-except: auto-commit is best-effort, never blocks completion
         logger.warning(
             "auto_commit_pre_complete_failed: task=%s session=%s error=%s files=%s",
             task.id,
@@ -1091,7 +1087,7 @@ async def complete_task(task_id: str, body: TaskCompleteRequest, request: Reques
             # Defect 33: auto-commit the worker's uncommitted work BEFORE
             # the store transitions the task to done, so the commit message
             # is visible to the janitor (which reads ``git log`` after
-            # /complete lands).  Failures are swallowed — the orchestrator
+            # /complete lands).  Failures are swallowed - the orchestrator
             # will catch a 0-diff task on /complete's branch and trigger
             # the bounded-reopen path.  Logging contract in
             # ``_run_auto_commit_pre_complete``.

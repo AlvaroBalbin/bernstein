@@ -1049,9 +1049,7 @@ class TestRecordAgentLifetime:
         assert len(recent) == 1
         assert recent[0].agent_id == "agent-underscore"
 
-    def test_record_agent_lifetime_logs_info(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_record_agent_lifetime_logs_info(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         """Every record_agent_lifetime call emits an INFO line with
         session/role/model/lifetime so the data flow is visible in logs."""
         coordinator = EvolutionCoordinator(tmp_path)
@@ -1066,6 +1064,6 @@ class TestRecordAgentLifetime:
             )
 
         messages = [r.message for r in caplog.records if r.name == "bernstein.evolution"]
-        assert any(
-            "agent-logged" in m and "qa" in m and "haiku" in m and "99.5" in m for m in messages
-        ), f"expected INFO log with session/role/model/lifetime, got: {messages}"
+        assert any("agent-logged" in m and "qa" in m and "haiku" in m and "99.5" in m for m in messages), (
+            f"expected INFO log with session/role/model/lifetime, got: {messages}"
+        )

@@ -4203,7 +4203,9 @@ class TestShutdownFinalOnQuiescenceSelfStop:
         )
         assert "No issues detected; run looks healthy." not in retro_content
 
-    def test_regeneration_is_not_duplicated_by_run_post_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_regeneration_is_not_duplicated_by_run_post_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """`_regenerate_final_retrospective` must be idempotent: calling it again
         (as run()'s post-tick-loop code does on every normal exit) after the
         tick-level self-stop already wrote the final report must be a no-op,
@@ -4331,9 +4333,9 @@ class TestShutdownFinalOnQuiescenceSelfStop:
 
         assert orch._running is False, "tick 2 must self-stop on confirmed quiescence"
         assert orch._final_retrospective_regenerated is True
-        assert (
-            "shutdown-final regeneration triggered via tick-quiescence-self-stop" in caplog.text
-        ), "the explicit trigger log line must fire (this missing line hid the bug twice)"
+        assert "shutdown-final regeneration triggered via tick-quiescence-self-stop" in caplog.text, (
+            "the explicit trigger log line must fire (this missing line hid the bug twice)"
+        )
 
         final_content = retro_path.read_text()
         assert final_content != interim_content, "final retrospective must overwrite the interim snapshot"
@@ -6225,6 +6227,7 @@ class TestSelfStopOrderingDrain:
         # server, the orchestrator can see them, but the chain that drains
         # them has not run yet (or has been bypassed).
         import bernstein.core.orchestration.orchestrator as orch_mod
+
         monkeypatch.setattr(
             orch_mod,
             "process_completed_tasks",
@@ -6312,8 +6315,7 @@ class TestSelfStopOrderingDrain:
         orch.tick()
 
         assert summary_path.exists(), (
-            "summary.md should fire once the session is dead and "
-            "_processed_done_tasks has the task id (chain drained)"
+            "summary.md should fire once the session is dead and _processed_done_tasks has the task id (chain drained)"
         )
         assert orch._pending_post_complete_count == 0
 
@@ -6334,9 +6336,9 @@ class TestSelfStopOrderingDrain:
             orch.tick()
 
         run_end_lines = [
-            rec for rec in caplog.records
-            if rec.name == "bernstein.core.orchestration.orchestrator"
-            and rec.getMessage().startswith("run_end_check:")
+            rec
+            for rec in caplog.records
+            if rec.name == "bernstein.core.orchestration.orchestrator" and rec.getMessage().startswith("run_end_check:")
         ]
         assert run_end_lines, (
             f"run_end_check log line MUST be emitted on the quiescent tick; "
@@ -6351,9 +6353,7 @@ class TestSelfStopOrderingDrain:
         assert "summary_written=" in msg
         assert "-> action=" in msg
         action = msg.split("-> action=")[1].split(" ")[0].strip()
-        assert action in {"fire_summary", "defer_summary", "wait"}, (
-            f"unexpected action value {action!r}"
-        )
+        assert action in {"fire_summary", "defer_summary", "wait"}, f"unexpected action value {action!r}"
 
     def test_run_summary_firing_log_emitted_with_all_inputs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -6369,13 +6369,9 @@ class TestSelfStopOrderingDrain:
         with caplog.at_level(logging.INFO):
             orch.tick()
 
-        firing_lines = [
-            rec for rec in caplog.records
-            if rec.getMessage().startswith("run_summary_firing:")
-        ]
+        firing_lines = [rec for rec in caplog.records if rec.getMessage().startswith("run_summary_firing:")]
         assert firing_lines, (
-            "run_summary_firing log line MUST be emitted at the top of "
-            "_generate_run_summary with all inputs"
+            "run_summary_firing log line MUST be emitted at the top of _generate_run_summary with all inputs"
         )
         msg = firing_lines[-1].getMessage()
         assert "tick=#" in msg
@@ -6400,6 +6396,7 @@ class TestSelfStopOrderingDrain:
         orch = self._build(tmp_path, done_tasks=done)
 
         import bernstein.core.orchestration.orchestrator as orch_mod
+
         monkeypatch.setattr(
             orch_mod,
             "process_completed_tasks",
@@ -6409,14 +6406,8 @@ class TestSelfStopOrderingDrain:
         with caplog.at_level(logging.INFO):
             orch.tick()
 
-        run_end_lines = [
-            rec for rec in caplog.records
-            if rec.getMessage().startswith("run_end_check:")
-        ]
+        run_end_lines = [rec for rec in caplog.records if rec.getMessage().startswith("run_end_check:")]
         assert run_end_lines
         msg = run_end_lines[-1].getMessage()
         assert "defer_summary" in msg
-        assert "T-stuck" in msg, (
-            "defer_summary log MUST include the task ids still pending "
-            "the post-/complete chain"
-        )
+        assert "T-stuck" in msg, "defer_summary log MUST include the task ids still pending the post-/complete chain"

@@ -832,14 +832,14 @@ def retry_or_fail_task(
 
     # Auto-spawn guard: this generic retry path is a SECOND spawn site for
     # auto-spawned meta-tasks (e.g. an evolution-loop "Upgrade: ..." proposal
-    # or a watchdog "Watchdog triage: ..." task) — it recreates a brand-new
+    # or a watchdog "Watchdog triage: ..." task) - it recreates a brand-new
     # open task row with the same title whenever the meta-task's own agent
     # dies, completely bypassing the AutoSpawnGuard that
     # ``orchestrator_evolve._create_upgrade_tasks`` / the watchdog's
     # ``_create_triage_task`` consult at CREATION time. Left unguarded, a
     # meta-task that structurally cannot succeed (e.g. the environment
     # defect it exists to work around) gets re-spawned via retry up to
-    # ``max_retries`` times with zero forward progress — the exact
+    # ``max_retries`` times with zero forward progress - the exact
     # "9 Upgrade: Improve task success rate" rows seen in
     # work/bernstein/proofs/d2/minimax/sdd-snapshot/runtime/tasks.jsonl,
     # where 2 of the 3 real-lineage recreations went through THIS function,
@@ -867,7 +867,7 @@ def retry_or_fail_task(
             if not decision.allowed:
                 logger.info(
                     "Refusing to re-spawn meta-task %s (title=%r) via retry: auto-spawn guard reason=%s "
-                    "ancestry_depth=%d current_count=%d cap=%d — routing to permanent failure instead of "
+                    "ancestry_depth=%d current_count=%d cap=%d - routing to permanent failure instead of "
                     "creating a new task row",
                     task_id,
                     task.title,
@@ -880,7 +880,7 @@ def retry_or_fail_task(
         else:
             logger.info(
                 "Auto-spawn guard skipped for retry of meta-task %s (title=%r): no workdir supplied "
-                "(legacy/ad-hoc caller) — falling back to historical unguarded retry behaviour",
+                "(legacy/ad-hoc caller) - falling back to historical unguarded retry behaviour",
                 task_id,
                 task.title,
             )
@@ -1493,6 +1493,17 @@ def _refetch_task_for_claim_conflict(client: httpx.Client, base: str, task_id: s
     except httpx.HTTPError as exc:
         logger.warning(
             "claim-conflict re-GET of task %s failed: %s -- treating as unclaimable this attempt",
+            task_id,
+            exc,
+        )
+        return None
+    except (KeyError, ValueError, TypeError) as exc:
+        # A 2xx response whose body is missing/malformed (not a well-formed
+        # task dict) is a re-fetch failure just like an HTTP error: we no
+        # longer trust the data, so stop claiming and move on rather than
+        # crashing the whole tick.
+        logger.warning(
+            "claim-conflict re-GET of task %s returned an unparseable body: %s -- treating as unclaimable this attempt",
             task_id,
             exc,
         )
@@ -2816,11 +2827,11 @@ def _create_approval_pr(
     pr_url = orch._approval_gate.create_pr(
         task,
         worktree_path=worktree_path,
-        _session_id=session.id,
+        session_id=session.id,
         labels=orch._config.pr_labels,
         _role=session.role,
-        _model=session.model_config.model,
-        _cost_usd=cost_usd,
+        model=session.model_config.model,
+        cost_usd=cost_usd,
         test_summary=test_summary,
     )
     if pr_url:
@@ -3113,8 +3124,7 @@ def _record_completion_metrics(
                 task_m.tokens_completion = sidecar_out
                 task_m.tokens_used = sidecar_in + sidecar_out
     logger.info(
-        "completion_cost_source: task_id=%s agent_id=%s source=%s cost_usd=%.6f "
-        "tokens_prompt=%d tokens_completion=%d",
+        "completion_cost_source: task_id=%s agent_id=%s source=%s cost_usd=%.6f tokens_prompt=%d tokens_completion=%d",
         task.id,
         session.id if session else getattr(sidecar_session, "id", "none") if sidecar_session else "none",
         cost_source,
@@ -3134,9 +3144,7 @@ def _record_completion_metrics(
     else:
         tokens_sidecar_source = ""
 
-    _record_cost_and_convergence(
-        orch, task, session, task_m, cost_usd, janitor_passed, tokens_sidecar_source
-    )
+    _record_cost_and_convergence(orch, task, session, task_m, cost_usd, janitor_passed, tokens_sidecar_source)
     collector.complete_task(
         task.id,
         success=janitor_passed,
@@ -3365,7 +3373,7 @@ def _enqueue_alive_exit_janitor_pass(
     ``process_completed_tasks`` + ``_process_single_completed_task`` for
     months, but in practice it can be skipped when the orchestrator
     self-stops before the next tick (item 30 defect evidence:
-    attempt-83808a8a — backend/qa tasks had ``metrics/tasks.jsonl`` rows
+    attempt-83808a8a - backend/qa tasks had ``metrics/tasks.jsonl`` rows
     missing because ``_apply_janitor_verdict_action`` was never invoked).
     This helper makes the enqueue observable and reachable from callers
     outside the orchestrator's main tick (drain, retry, manual invocations).
@@ -3488,8 +3496,6 @@ def process_completed_tasks(
 
     if not new_tasks:
         return
-
-    server_url: str | None = getattr(orch._config, "server_url", None)
 
     # Fan-out: submit verification calls in parallel. llm_judge signals need
     # the async run_janitor pipeline; everything else uses verify_task.
@@ -3661,7 +3667,7 @@ def _apply_janitor_verdict_action(orch: Any, task: Task, janitor_passed: bool) -
       ``BERNSTEIN_JANITOR_REOPEN_MAX``) is not exhausted, the task is
       reopened under the SAME id via ``POST /tasks/{id}/reopen`` and will
       be re-claimed by the normal scheduling path (AutoSpawnGuard and the
-      retry machinery are untouched — no new task is created).
+      retry machinery are untouched - no new task is created).
     * Otherwise it is permanently failed via ``POST /tasks/{id}/fail``.
 
     Every decision is logged as ``janitor_verdict_action: ...`` with its

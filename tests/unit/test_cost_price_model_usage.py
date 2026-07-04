@@ -37,7 +37,9 @@ class TestPriceModelUsage:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         with caplog.at_level("WARNING"):
-            result = price_model_usage("some-brand-new-model-nobody-priced-yet", input_tokens=7_000, output_tokens=3_000)
+            result = price_model_usage(
+                "some-brand-new-model-nobody-priced-yet", input_tokens=7_000, output_tokens=3_000
+            )
 
         assert result.priced is False
         assert result.cost_usd == 0.0
@@ -45,10 +47,7 @@ class TestPriceModelUsage:
         assert result.input_tokens == 7_000
         assert result.output_tokens == 3_000
 
-        assert any(
-            rec.levelname == "WARNING" and "no pricing-table entry" in rec.message
-            for rec in caplog.records
-        )
+        assert any(rec.levelname == "WARNING" and "no pricing-table entry" in rec.message for rec in caplog.records)
 
     def test_zero_tokens_prices_to_zero_for_known_model(self) -> None:
         result = price_model_usage("gpt-5-mini", input_tokens=0, output_tokens=0)
@@ -88,6 +87,30 @@ class TestPriceModelUsage:
         result = price_model_usage("sonnet", input_tokens=1_000_000, output_tokens=1_000_000)
         assert result.priced is True
         assert result.cost_usd == pytest.approx(3.0 + 15.0)
+
+    def test_mini_flash_variants_price_at_own_rate_not_parent(self) -> None:
+        """Longest-key-first matching hazard: the parent stems 'gpt-5', 'o4',
+        and 'gemini-3' are substrings of their 'gpt-5-mini', 'o4-mini', and
+        'gemini-3-flash' variants. Dict-order-first matching returned the
+        (more expensive) parent, over-pricing the variant. Matching must pick
+        the longest key so each variant prices at its own rate."""
+        # gpt-5-mini: own rate $0.5/$2.5, NOT parent gpt-5 $2.5/$15.
+        gpt5_mini = price_model_usage("gpt-5-mini", input_tokens=1_000_000, output_tokens=1_000_000)
+        assert gpt5_mini.priced is True
+        assert gpt5_mini.cost_usd == pytest.approx(0.5 + 2.5)
+        assert gpt5_mini.cost_usd != pytest.approx(2.5 + 15.0)
+
+        # o4-mini: own rate $1.1/$4.4, NOT parent o4 $3.0/$12.
+        o4_mini = price_model_usage("o4-mini", input_tokens=1_000_000, output_tokens=1_000_000)
+        assert o4_mini.priced is True
+        assert o4_mini.cost_usd == pytest.approx(1.1 + 4.4)
+        assert o4_mini.cost_usd != pytest.approx(3.0 + 12.0)
+
+        # gemini-3-flash: own rate $0.15/$1.0, NOT parent gemini-3 $3.0/$15.
+        gemini_flash = price_model_usage("gemini-3-flash", input_tokens=1_000_000, output_tokens=1_000_000)
+        assert gemini_flash.priced is True
+        assert gemini_flash.cost_usd == pytest.approx(0.15 + 1.0)
+        assert gemini_flash.cost_usd != pytest.approx(3.0 + 15.0)
 
     def test_every_pricing_table_entry_is_self_priceable(self) -> None:
         """Every key in the table must price itself as a positive number

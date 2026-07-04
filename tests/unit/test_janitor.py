@@ -221,6 +221,43 @@ class TestPathExistsGlobAndFuzzy:
         assert passed is False
         assert any("no match" in rec.message and "seed-workers" in rec.message for rec in caplog.records)
 
+    def test_literal_path_with_glob_metachar_matched_literally(self, tmp_path: Path) -> None:
+        """A real file whose literal path contains a glob metacharacter (e.g.
+        a Next.js dynamic-route file `app/users/[id]/page.tsx`) must be
+        matched literally, NOT silently reinterpreted as a glob pattern that
+        would fail to match its own brackets."""
+        route_dir = tmp_path / "app" / "users" / "[id]"
+        route_dir.mkdir(parents=True)
+        (route_dir / "page.tsx").write_text("export default 1")
+
+        signal = CompletionSignal(type="path_exists", value="app/users/[id]/page.tsx")
+        with patch.dict("os.environ", {"BERNSTEIN_JANITOR_FUZZY_PATHS": "0"}):
+            passed, detail = evaluate_signal(signal, tmp_path)
+        assert passed is True
+        assert detail == "exists"
+
+    def test_literal_path_with_bracket_fixture_matched_literally(self, tmp_path: Path) -> None:
+        """`foo[1].json` on disk must satisfy a literal `foo[1].json` check;
+        glob would read `[1]` as a character class and miss the real file."""
+        (tmp_path / "foo[1].json").write_text("{}")
+
+        signal = CompletionSignal(type="path_exists", value="foo[1].json")
+        passed, detail = evaluate_signal(signal, tmp_path)
+        assert passed is True
+        assert detail == "exists"
+
+    def test_glob_still_honored_when_literal_missing(self, tmp_path: Path) -> None:
+        """When no literal file matches, a criterion with glob syntax still
+        falls through to glob interpretation (opt-in per-check)."""
+        nested = tmp_path / "packages" / "db"
+        nested.mkdir(parents=True)
+        (nested / "seed-workers.test.ts").write_text("x")
+
+        signal = CompletionSignal(type="path_exists", value="packages/*/seed-workers.test.ts")
+        passed, detail = evaluate_signal(signal, tmp_path)
+        assert passed is True
+        assert "glob pattern matched" in detail
+
 
 # --- glob_exists ---
 
@@ -286,7 +323,7 @@ class TestTestPasses:
         caplog.set_level("INFO", logger="bernstein.core.quality.janitor")
         signal = CompletionSignal(
             type="test_passes",
-            value=f'{sys.executable} -c "import sys; sys.stderr.write(\'boom\'); raise SystemExit(1)"',
+            value=f"{sys.executable} -c \"import sys; sys.stderr.write('boom'); raise SystemExit(1)\"",
         )
         passed, _ = evaluate_signal(signal, tmp_path)
         assert passed is False
@@ -334,10 +371,7 @@ def _init_git_repo_with_branch(tmp_path: Path, branch_name: str) -> Path:
 
 class TestExtractBranchRef:
     def test_extracts_ref_from_rev_parse_verify(self) -> None:
-        assert (
-            _extract_branch_ref("git rev-parse --verify fix-905-demo-worker-record")
-            == "fix-905-demo-worker-record"
-        )
+        assert _extract_branch_ref("git rev-parse --verify fix-905-demo-worker-record") == "fix-905-demo-worker-record"
 
     def test_extracts_ref_from_git_log_with_pipe(self) -> None:
         command = "git log -1 --format=%s fix-905-demo-worker-record | grep -q '#905'"
@@ -380,9 +414,7 @@ class TestResolveBranchRef:
 class TestBranchCheckAcceptanceEndToEnd:
     """Exercises the actual bug-12 scenario through evaluate_signal()."""
 
-    def test_janitor_accepts_slash_branch_when_signal_expects_hyphens(
-        self, tmp_path: Path
-    ) -> None:
+    def test_janitor_accepts_slash_branch_when_signal_expects_hyphens(self, tmp_path: Path) -> None:
         _init_git_repo_with_branch(tmp_path, "fix/905-demo-worker-record")
         signal = CompletionSignal(
             type="test_passes",
@@ -391,9 +423,7 @@ class TestBranchCheckAcceptanceEndToEnd:
         passed, _ = evaluate_signal(signal, tmp_path)
         assert passed is True
 
-    def test_janitor_accepts_commit_message_check_across_naming_drift(
-        self, tmp_path: Path
-    ) -> None:
+    def test_janitor_accepts_commit_message_check_across_naming_drift(self, tmp_path: Path) -> None:
         _init_git_repo_with_branch(tmp_path, "fix/905-demo-worker-record")
         signal = CompletionSignal(
             type="test_passes",
@@ -426,9 +456,7 @@ class TestBranchCheckAcceptanceEndToEnd:
         assert "fix/905-demo-worker-record" in combined
         assert "rewriting command" in combined
 
-    def test_resolve_branch_check_command_is_noop_for_non_git_commands(
-        self, tmp_path: Path
-    ) -> None:
+    def test_resolve_branch_check_command_is_noop_for_non_git_commands(self, tmp_path: Path) -> None:
         command = f'{sys.executable} -c "raise SystemExit(0)"'
         assert _resolve_branch_check_command(command, tmp_path) == command
 
@@ -1309,6 +1337,49 @@ class TestEmptyDiffGuardAndAttribution:
         assert results[0].passed is False
         failed = [d for d, ok, _ in results[0].signal_results if not ok]
         assert any("empty_diff" in d for d in failed), f"failed={failed}"
+
+    @pytest.mark.asyncio
+    async def test_unattributable_diff_with_nontrivial_signal_accepted_with_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A task that landed real work in a commit whose message omits the
+        task id and which has no owned_files (attribution returns empty) must
+        NOT be hard-rejected when it has a passing non-trivial completion
+        signal (a passing test_passes). Instead it is accepted and flagged for
+        review, so real completions are not false-rejected just because the
+        commit did not stamp the task id."""
+        _init_git_repo(tmp_path)
+        # A real landing commit whose message does NOT reference the task id.
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "feature.py").write_text("VALUE = 1\n")
+        subprocess.run(["git", "add", "src/feature.py"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add feature"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        task = _make_task(
+            id="NOSTAMP-1",
+            signals=[
+                CompletionSignal(
+                    type="test_passes",
+                    value=f'{sys.executable} -c "raise SystemExit(0)"',
+                )
+            ],
+        )
+
+        with caplog.at_level("WARNING"):
+            results = await run_janitor([task], tmp_path)
+
+        assert len(results) == 1
+        assert results[0].passed is True, f"signal_results={results[0].signal_results}"
+        # Not hard-rejected: no failing empty_diff signal.
+        failed = [d for d, ok, _ in results[0].signal_results if not ok]
+        assert not any("empty_diff" in d and "warn" not in d for d in failed), f"failed={failed}"
+        assert any("empty diff, flagged for review" in rec.message for rec in caplog.records), (
+            "expected an empty-diff WARN log flagging the task for review"
+        )
 
     @pytest.mark.asyncio
     async def test_research_noop_task_type_exempt(self, tmp_path: Path) -> None:
