@@ -195,15 +195,31 @@ async def _run_candidate(
 
     model_id = member.get("model")
     label = f"candidates[{index}]={model_id}"
-    client_kwargs = _resolve_member_client_kwargs(member)
-    client = AsyncOpenAI(**client_kwargs)
+    # Setup failures (a missing/invalid ``api_key_env`` variable, client
+    # construction, the clone) must ALSO only exclude this one candidate:
+    # anything escaping this coroutine propagates through the caller's
+    # ``asyncio.gather`` and cancels every sibling candidate, violating the
+    # one-bad-candidate-must-never-kill-the-council contract documented on
+    # this function and relied on at the gather call site.
+    try:
+        client_kwargs = _resolve_member_client_kwargs(member)
+        client = AsyncOpenAI(**client_kwargs)
 
-    candidate_model = OpenAIChatCompletionsModel(model=model_id, openai_client=client)
-    candidate_model_settings = _build_member_model_settings(agent, member, label=label)
-    clone_kwargs: dict[str, Any] = {"model": candidate_model}
-    if candidate_model_settings is not None:
-        clone_kwargs["model_settings"] = candidate_model_settings
-    candidate_agent = agent.clone(**clone_kwargs)
+        candidate_model = OpenAIChatCompletionsModel(model=model_id, openai_client=client)
+        candidate_model_settings = _build_member_model_settings(agent, member, label=label)
+        clone_kwargs: dict[str, Any] = {"model": candidate_model}
+        if candidate_model_settings is not None:
+            clone_kwargs["model_settings"] = candidate_model_settings
+        candidate_agent = agent.clone(**clone_kwargs)
+    except Exception as exc:  # intentional-broad-except: one bad candidate must never kill the council
+        logger.warning(
+            "run_council._run_candidate: %s SETUP FAILED before dispatch: %s: %s - "
+            "excluding it from judge synthesis, continuing with remaining candidates",
+            label,
+            type(exc).__name__,
+            sanitize_log(str(exc)),
+        )
+        return None
 
     run_kwargs: dict[str, Any] = {} if max_turns is None else {"max_turns": max_turns}
     logger.info(
