@@ -31,6 +31,10 @@ POST /tasks
 Leave `max_turns` unset (the default, `null`) to keep the automatic
 complexity/model/timeout computation.
 
+Accepted values are 1 to 10000 inclusive; zero, negative, and larger
+values are rejected at request validation time because the number is
+passed verbatim to the CLI `--max-turns` flag.
+
 ## Behavior
 
 When `max_turns` is set on the task:
