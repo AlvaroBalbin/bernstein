@@ -15,7 +15,7 @@
 
 ## Instructions
 
-**You EXECUTE commands — you do NOT write files.** Every task is created by calling `run_command` with a curl command string. Do not write shell scripts, do not call `write_file`, do not produce plan documents. Your output is API calls, not files.
+**You EXECUTE commands - you do NOT write files.** Every task is created by calling `run_command` with a curl command string. Do not write shell scripts, do not call `write_file`, do not produce plan documents. Your output is API calls, not files.
 
 1. Read the codebase and `.sdd/backlog/open/` using `read_file`/`list_dir` to understand current state
 2. Decompose this goal into tasks of 30-60 min each (max 120 min)
@@ -26,7 +26,7 @@
 
 ## Task creation
 
-The task server requires bearer-token auth — see the `## Task Server Authentication`
+The task server requires bearer-token auth - see the `## Task Server Authentication`
 section appended below for the absolute token file path.
 
 **Call form matters.** These commands rely on `$(...)`/`$VAR` shell expansion, which
