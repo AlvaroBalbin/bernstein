@@ -148,6 +148,26 @@ _BASE_ALLOWLIST: frozenset[str] = frozenset(
         # outside the run it belongs to. It is a plain identifier, not a
         # credential, so passing it through is safe.
         "BERNSTEIN_RUN_ID",
+        # ``BERNSTEIN_ALLOWED_API_KEY_ENVS`` must propagate to the spawned
+        # runner subprocess: the runner's own ``validate_api_key_env_name()``
+        # reads this allowlist to accept operator-defined credential
+        # variable names (e.g. ``ALIBABA_CLOUD_API_KEY``). Without it in the
+        # passthrough set, the filtered env silently drops the allowlist and
+        # the runner rejects any non-standard API key env name it wasn't
+        # hardcoded to recognize.
+        "BERNSTEIN_ALLOWED_API_KEY_ENVS",
+        # ``BERNSTEIN_OPENAI_AGENTS_TOOL_SOURCE`` is set by run.py before
+        # spawning the openai_agents runner subprocess, telling it which
+        # tool source (e.g. built-in vs MCP-provided) to wire up. It must
+        # pass through build_filtered_env() or the runner falls back to a
+        # default tool source instead of the one the operator configured.
+        "BERNSTEIN_OPENAI_AGENTS_TOOL_SOURCE",
+        # ``BERNSTEIN_BUILTIN_ALLOW_RUN_COMMAND`` opts the spawned openai_agents
+        # runner into registering the builtin run_command tool. Set alongside
+        # BERNSTEIN_OPENAI_AGENTS_TOOL_SOURCE=builtin in run.py; without it in
+        # the passthrough set the filtered env drops it and the manager agent's
+        # run_command calls fail with ModelBehaviorError: Tool run_command not found.
+        "BERNSTEIN_BUILTIN_ALLOW_RUN_COMMAND",
     }
 )
 
