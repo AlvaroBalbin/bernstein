@@ -30,6 +30,8 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 
+from bernstein.core.security.sanitize import sanitize_log
+
 logger = logging.getLogger(__name__)
 
 # Grace-window semantics: as of the heartbeat-renewal model, holds are no
@@ -118,7 +120,7 @@ class HoldRegistry:
         logger.info(
             "HoldRegistry.acquire: id=%s reason=%r ttl_seconds=%.1f expires_at=%.1f (active_count=%d)",
             hold.id,
-            reason,
+            sanitize_log(reason),
             ttl_seconds,
             hold.expires_at,
             len(self._holds),
@@ -137,12 +139,14 @@ class HoldRegistry:
         with self._lock:
             hold = self._holds.pop(hold_id, None)
         if hold is None:
-            logger.warning("HoldRegistry.release: hold_id=%s not found (already released or expired?)", hold_id)
+            logger.warning(
+                "HoldRegistry.release: hold_id=%s not found (already released or expired?)", sanitize_log(hold_id)
+            )
             return False
         logger.info(
             "HoldRegistry.release: id=%s reason=%r (held for %.1fs)",
-            hold_id,
-            hold.reason,
+            sanitize_log(hold_id),
+            sanitize_log(hold.reason),
             time.time() - hold.created_at,
         )
         return True
@@ -163,7 +167,7 @@ class HoldRegistry:
             if hold is None:
                 logger.warning(
                     "HoldRegistry.renew: hold_id=%s not found (never existed, already released, or already expired)",
-                    hold_id,
+                    sanitize_log(hold_id),
                 )
                 return False
             if hold.expires_at < now:
@@ -171,7 +175,7 @@ class HoldRegistry:
                 self._holds.pop(hold_id, None)
                 logger.warning(
                     "HoldRegistry.renew: hold_id=%s found but already expired at %.1f (now=%.1f) - dropping",
-                    hold_id,
+                    sanitize_log(hold_id),
                     hold.expires_at,
                     now,
                 )
@@ -181,7 +185,7 @@ class HoldRegistry:
             self._holds[hold_id] = renewed
         logger.info(
             "hold %s renewed, new expires_at=%.1f (ttl_seconds=%.1f, last_renewed_at=%.1f)",
-            hold_id,
+            sanitize_log(hold_id),
             new_expires_at,
             renewed.ttl_seconds,
             now,
@@ -197,7 +201,7 @@ class HoldRegistry:
         """
         with self._lock:
             hold = self._holds.get(hold_id)
-        logger.info("HoldRegistry.get: hold_id=%s found=%s", hold_id, hold is not None)
+        logger.info("HoldRegistry.get: hold_id=%s found=%s", sanitize_log(hold_id), hold is not None)
         return hold
 
     def list_active(self) -> list[Hold]:
@@ -215,7 +219,7 @@ class HoldRegistry:
                     logger.info(
                         "HoldRegistry: hold id=%s reason=%r expired at %.1f (ttl_seconds=%.1f)",
                         expired.id,
-                        expired.reason,
+                        sanitize_log(expired.reason),
                         expired.expires_at,
                         expired.ttl_seconds,
                     )

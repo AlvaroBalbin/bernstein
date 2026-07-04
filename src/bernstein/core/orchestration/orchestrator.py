@@ -126,6 +126,7 @@ from bernstein.core.runtime_state import (
     rotate_log_file,
     write_session_replay_metadata,
 )
+from bernstein.core.security.sanitize import sanitize_log
 from bernstein.core.semantic_cache import ResponseCacheManager
 from bernstein.core.signals import read_unresolved_pivots
 from bernstein.core.slo import SLOTracker, apply_error_budget_adjustments
@@ -1934,7 +1935,7 @@ class Orchestrator:
                             )
                             _active_holds = []
                         if _active_holds:
-                            _hold_reasons = [str(h.get("reason", "<no reason>")) for h in _active_holds]
+                            _hold_reasons = [sanitize_log(str(h.get("reason", "<no reason>"))) for h in _active_holds]
                             logger.info(
                                 "Quiescence detected but %d active hold(s) present (tick #%d) - skipping self-stop: %s",
                                 len(_active_holds),
