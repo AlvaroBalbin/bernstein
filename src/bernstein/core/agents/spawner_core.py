@@ -808,7 +808,7 @@ def _render_prompt(
             context (INFORMS / TRANSFORMS outputs).
         max_turns: Optional best-effort resolution of the agent's tool-use
             turn cap, known at the spawn call site (see
-            ``AgentSpawner._spawn_agent``'s resolution logic just before
+            ``AgentSpawner.spawn_for_tasks``'s resolution logic just before
             this function is called). When present, renders a static
             "## Turn budget" section so the model self-polices instead of
             exploring until ``MaxTurnsExceeded`` fires with zero output
