@@ -1522,9 +1522,20 @@ def _probe_liveness_signals(orch: Any, session: AgentSession, now: float) -> dic
     log_path = _resolve_agent_log_path(orch._workdir, session)
     log_age = _mtime_age(log_path, now)
 
+    # The git signal is only meaningful when this agent has its own worktree:
+    # the worktree ``.git`` mtime reflects THIS agent's commit/branch activity.
+    # When no per-agent worktree exists there is deliberately NO git signal
+    # (git_age stays None) rather than falling back to the root ``workdir/.git``
+    # mtime -- the root repo is shared mutable state touched by the
+    # orchestrator's own git operations, sibling agents, and repo setup, so
+    # its freshness cannot be attributed to this agent. Treating it as a
+    # liveness signal made genuinely dead agents look alive on any busy (or
+    # freshly initialised) repo, deferring the fail path indefinitely. In the
+    # worktrees-disabled layout the agent-specific signals are the heartbeat
+    # file and the root ``.sdd/runtime/<id>.log`` resolved above.
     _wt_dir = _resolve_agent_worktree_dir(orch._workdir, session)
-    git_path = (_wt_dir / ".git") if _wt_dir is not None else (orch._workdir / ".git")
-    git_age = _mtime_age(git_path, now)
+    git_path = (_wt_dir / ".git") if _wt_dir is not None else None
+    git_age = _mtime_age(git_path, now) if git_path is not None else None
 
     fresh_ages = [a for a in (heartbeat_age, log_age, git_age) if a is not None and a < _ORPHAN_LIVENESS_GRACE_S]
     has_fresh_signal = bool(fresh_ages)
@@ -1546,7 +1557,7 @@ def _probe_liveness_signals(orch: Any, session: AgentSession, now: float) -> dic
         f"{heartbeat_age:.1f}" if heartbeat_age is not None else "missing",
         log_path,
         f"{log_age:.1f}" if log_age is not None else "missing",
-        git_path,
+        git_path if git_path is not None else "no-per-agent-worktree",
         f"{git_age:.1f}" if git_age is not None else "missing",
         _ORPHAN_LIVENESS_GRACE_S,
         verdict,
