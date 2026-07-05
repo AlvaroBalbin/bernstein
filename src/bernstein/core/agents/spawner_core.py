@@ -2899,7 +2899,10 @@ class AgentSpawner:
                 from bernstein.adapters.openai_agents_runner import _resolve_max_turns
 
                 _effective_max_turns = _resolve_max_turns()
-                _max_turns_source = "openai_agents_runner._resolve_max_turns (env BERNSTEIN_MAX_TURNS / tuning.agent.max_turns / SDK default)"
+                _max_turns_source = (
+                    "openai_agents_runner._resolve_max_turns "
+                    "(env BERNSTEIN_MAX_TURNS / tuning.agent.max_turns / SDK default)"
+                )
             except Exception as exc:
                 logger.debug(
                     "Turn-budget prompt injection: _resolve_max_turns() unavailable for session=%s (%s); "
