@@ -111,8 +111,20 @@ def compute_max_turns(
         min_turns: Absolute minimum turns.
         max_turns_cap: Absolute maximum turns.
         explicit_max_turns: When set (e.g. from ``TaskCreate.max_turns``), bypasses
-            all complexity/model/timeout math below and is used verbatim. This lets
-            API callers take exact control over agent turn budgets.
+            all complexity/model/timeout math below but is still clamped to the
+            absolute ``[min_turns, max_turns_cap]`` bounds. This lets API callers
+            take exact control over agent turn budgets within those bounds.
+
+            Validation layering for explicit max_turns (single story):
+
+            1. API boundary: ``TaskCreate.max_turns`` (``server_models.py``)
+               rejects out-of-range values with a 422 (``ge=1, le=10_000``).
+            2. Resolution (here): callers that resolve a turn budget through
+               this function get the explicit value clamped to the same
+               absolute bounds as computed values.
+            3. Adapter (``claude.py`` ``_build_command``): last-resort
+               rejection of non-positive values arriving via paths that
+               bypass both, e.g. ``Task`` records deserialized from disk.
 
     Returns:
         MaxTurnsConfig with the computed (or explicit) value and reasoning.
