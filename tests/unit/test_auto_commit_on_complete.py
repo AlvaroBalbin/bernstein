@@ -47,6 +47,13 @@ from bernstein.core.tasks.models import Task, TaskStatus
         ".env.local",
         ".env.production",
         "config/.env",
+        # Regression: switching the ".env" glob from substring containment
+        # to exact path/basename matching must not fail open for NESTED
+        # dotenv variants -- "config/.env.local" has basename ".env.local",
+        # which matches neither the exact ".env" glob nor the full-path
+        # ".env.*" check, so the ".env.*" branch must consult the basename.
+        "config/.env.local",
+        "backend/.env.production",
     ],
 )
 def test_is_auto_commit_denied_true(path: str) -> None:
