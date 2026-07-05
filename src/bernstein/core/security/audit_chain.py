@@ -61,6 +61,15 @@ EVENT_MULTIMODAL_ATTACH = "multimodal.attach"
 #: offending span -- never the span content itself.
 EVENT_COMPACTION_SENSITIVE_GATE = "compaction.sensitive_gate"
 
+#: Issue #2246 -- emitted once per context compaction (proactive or
+#: reactive). The event carries the full compaction receipt: pre/post
+#: context SHA-256, token counts, validator verdicts, retry count, and
+#: gate-outcome references. See
+#: :mod:`bernstein.core.tokens.compaction_receipt` for the payload
+#: builder and the verification helper that fails a run when a
+#: journaled compaction lacks a chain-verifiable receipt.
+EVENT_COMPACTION_RECEIPT = "compaction.receipt"
+
 #: Issue #2245 -- emitted whenever ``bernstein cost profile-report``
 #: writes a content-addressed per-profile cost report. The event
 #: records the report's SHA-256, the ledger line-hash range the report
@@ -458,6 +467,7 @@ def record_eval_ab_comparison(
 
 __all__ = [
     "AGENT_FRESH_RESTART_ON_RETRY",
+    "EVENT_COMPACTION_RECEIPT",
     "EVENT_COMPACTION_SENSITIVE_GATE",
     "EVENT_COST_PROFILE_REPORT",
     "EVENT_EVAL_AB_COMPARISON",
