@@ -2892,26 +2892,50 @@ class AgentSpawner:
         # adapter call (not done anywhere in this codebase today - see grep
         # for "mcp_config...max_turns" - so in practice they match for every
         # current call path).
-        _effective_max_turns = getattr(tasks[0], "max_turns", None)
+        #
+        # Explicit values follow the same max-over-tasks rule as the
+        # explicit_max_turns threading in the spawn loop below, so the
+        # prompt describes the same cap the adapter is handed. The
+        # env/tuning fallback mirrors a resolver that ONLY the
+        # openai_agents runner enforces; other adapters compute their own
+        # turn budgets (e.g. the claude adapter's effort/scope-based
+        # computation in _build_command), so applying the fallback there
+        # would state a cap the adapter never enforces and would add the
+        # budget section to every default spawn's prompt. Gate the
+        # fallback to spawns resolved to the openai_agents adapter;
+        # everything else renders the section only for an explicit
+        # Task.max_turns. Default spawns on other adapters keep a
+        # byte-identical prompt.
+        _effective_max_turns = max((t.max_turns for t in tasks if t.max_turns is not None), default=None)
         _max_turns_source = "task.max_turns (explicit per-task override)"
         if _effective_max_turns is None:
-            try:
-                from bernstein.adapters.openai_agents_runner import _resolve_max_turns
+            _budget_adapter_name = adapter_name_for_provider(provider_name, model_config.model)
+            if _budget_adapter_name is None:
+                from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
 
-                _effective_max_turns = _resolve_max_turns()
-                _max_turns_source = (
-                    "openai_agents_runner._resolve_max_turns "
-                    "(env BERNSTEIN_MAX_TURNS / tuning.agent.max_turns / SDK default)"
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Turn-budget prompt injection: _resolve_max_turns() unavailable for session=%s (%s); "
-                    "prompt will omit the turn-budget section",
-                    session_id,
-                    exc,
-                )
-                _effective_max_turns = None
-                _max_turns_source = "unresolved (import/call failed)"
+                _spawns_turn_capped_runner = isinstance(self._adapter, OpenAIAgentsAdapter)
+            else:
+                _spawns_turn_capped_runner = _budget_adapter_name == "openai_agents"
+            if _spawns_turn_capped_runner:
+                try:
+                    from bernstein.adapters.openai_agents_runner import _resolve_max_turns
+
+                    _effective_max_turns = _resolve_max_turns()
+                    _max_turns_source = (
+                        "openai_agents_runner._resolve_max_turns "
+                        "(env BERNSTEIN_MAX_TURNS / tuning.agent.max_turns / SDK default)"
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Turn-budget prompt injection: _resolve_max_turns() unavailable for session=%s (%s); "
+                        "prompt will omit the turn-budget section",
+                        session_id,
+                        exc,
+                    )
+                    _effective_max_turns = None
+                    _max_turns_source = "unresolved (import/call failed)"
+            else:
+                _max_turns_source = "skipped (adapter does not enforce the openai_agents turn-cap resolver)"
         logger.info(
             "Turn-budget max_turns resolution for session=%s: value=%r source=%s",
             session_id,
@@ -3668,19 +3692,28 @@ class AgentSpawner:
         # (work/bernstein/m27-nudge-plan.md) - crash-recovery sessions are
         # exactly the kind of short, tightly-budgeted resume where a model
         # exploring instead of finishing is most costly.
-        _resume_max_turns = getattr(tasks[0], "max_turns", None)
+        #
+        # Resume spawns go straight to ``self._adapter`` (no provider
+        # routing below), so the env/tuning fallback - which only the
+        # openai_agents runner enforces - applies only when that adapter
+        # is the openai_agents one. See the matching gate and rationale in
+        # spawn_for_tasks() above.
+        _resume_max_turns = max((t.max_turns for t in tasks if t.max_turns is not None), default=None)
         if _resume_max_turns is None:
-            try:
-                from bernstein.adapters.openai_agents_runner import _resolve_max_turns
+            from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
 
-                _resume_max_turns = _resolve_max_turns()
-            except Exception as exc:
-                logger.debug(
-                    "Turn-budget prompt injection: _resolve_max_turns() unavailable for resume session=%s (%s)",
-                    session_id,
-                    exc,
-                )
-                _resume_max_turns = None
+            if isinstance(self._adapter, OpenAIAgentsAdapter):
+                try:
+                    from bernstein.adapters.openai_agents_runner import _resolve_max_turns
+
+                    _resume_max_turns = _resolve_max_turns()
+                except Exception as exc:
+                    logger.debug(
+                        "Turn-budget prompt injection: _resolve_max_turns() unavailable for resume session=%s (%s)",
+                        session_id,
+                        exc,
+                    )
+                    _resume_max_turns = None
         logger.info(
             "Turn-budget max_turns resolution for resume session=%s: value=%r",
             session_id,
