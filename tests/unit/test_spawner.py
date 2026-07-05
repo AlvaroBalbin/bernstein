@@ -2177,6 +2177,7 @@ class TestInlineCouncilForwarding:
             role_model_policy={
                 "backend": {
                     "provider": "openai_agents",
+                    "model": "gpt-5-mini",
                     "council": self._COUNCIL_BLOCK,
                 }
             },
