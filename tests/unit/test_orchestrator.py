@@ -6113,6 +6113,33 @@ def test_record_live_costs_enforces_max_cost_per_agent(tmp_path: Path) -> None:
     mock_retry.assert_called_once()
 
 
+def test_orchestrator_honors_external_bernstein_run_id(tmp_path: Path) -> None:
+    """An externally-set BERNSTEIN_RUN_ID (exported by run.py before the
+    orchestrator starts) must be adopted as the orchestrator's run id, not
+    overwritten with a fresh timestamp -- otherwise phase results and
+    per-agent instrumentation land under two different run directories."""
+    import os
+
+    transport = _mock_transport({})
+    with patch.dict(os.environ, {"BERNSTEIN_RUN_ID": "external-run-42"}, clear=False):
+        orch = _build_orchestrator(tmp_path, transport=transport)
+        assert orch._run_id == "external-run-42"
+        assert os.environ["BERNSTEIN_RUN_ID"] == "external-run-42"
+
+
+def test_orchestrator_generates_run_id_when_env_unset(tmp_path: Path) -> None:
+    """Without an external BERNSTEIN_RUN_ID the orchestrator still generates
+    a timestamp id and exports it for spawned-agent instrumentation."""
+    import os
+
+    transport = _mock_transport({})
+    env = {k: v for k, v in os.environ.items() if k != "BERNSTEIN_RUN_ID"}
+    with patch.dict(os.environ, env, clear=True):
+        orch = _build_orchestrator(tmp_path, transport=transport)
+        assert orch._run_id
+        assert os.environ["BERNSTEIN_RUN_ID"] == orch._run_id
+
+
 def test_kill_agent_for_cost_cap_reaps_heartbeat_loop(tmp_path: Path) -> None:
     """The cost-cap forced-kill path must reap the session's backgrounded
     heartbeat shell loop (Defect-10) so it does not outlive the agent."""
