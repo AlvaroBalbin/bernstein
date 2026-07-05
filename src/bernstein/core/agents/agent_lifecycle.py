@@ -654,6 +654,23 @@ def _try_compact_and_retry(
         result.correlation_id,
     )
 
+    # Receipt the compaction (issue #2246): chain event, replay-journal
+    # step, ledger row, and metric point. Recording is best-effort and
+    # never alters the retry behaviour below; a missing receipt is caught
+    # by the run's audit verification instead.
+    if result.gate_action != "refused":
+        try:
+            _record_reactive_compaction_receipt(
+                orch=orch,
+                session=session,
+                task_id=task_id,
+                pre_text=description_text,
+                result=result,
+                chain=_gate_chain,
+            )
+        except Exception as _receipt_exc:
+            logger.warning("Reactive compaction receipt failed for %s: %s", task_id, _receipt_exc)
+
     # Retry the task with compacted description and a nudge meta-message.
     retry_or_fail_task(
         task_id,
@@ -702,6 +719,70 @@ def _try_compact_and_retry(
             logger.debug("WAL write failed for context_overflow_compacted %s", task_id)
 
     return True
+
+
+def _record_reactive_compaction_receipt(
+    *,
+    orch: Any,
+    session: AgentSession,
+    task_id: str,
+    pre_text: str,
+    result: Any,
+    chain: Any,
+) -> None:
+    """Anchor the reactive compaction in chain, journal, ledger, metrics.
+
+    Runs the zero-LLM validators purely for the receipt record - on the
+    reactive path they never gate the retry (the fallback behaviour is
+    unchanged; the verdicts are evidence, not a gate). See
+    :mod:`bernstein.core.tokens.compaction_receipt` for the anchors.
+
+    Args:
+        orch: Orchestrator instance.
+        session: The dead agent session that overflowed.
+        task_id: Task being compact-retried.
+        pre_text: Task description before compaction.
+        result: The ``CompactionResult`` from the pipeline.
+        chain: Audit chain store resolved for this run (may be None).
+    """
+    from bernstein.core.tokens.compaction_receipt import (
+        build_receipt,
+        record_compaction_artifacts,
+    )
+    from bernstein.core.tokens.compaction_validate import run_validators
+
+    receipt = build_receipt(
+        task_id=task_id,
+        worker_id=session.id,
+        trigger="reactive",
+        pre_text=pre_text,
+        post_text=result.compacted_text,
+        tokens_before=result.tokens_before,
+        tokens_after=result.tokens_after,
+        verdicts=run_validators(pre_text, result.compacted_text),
+        retry_count=0,
+        gate_action=result.gate_action,
+        gate_rule_ids=result.gate_rule_ids,
+        correlation_id=result.correlation_id,
+    )
+    _workdir = getattr(orch, "_workdir", None)
+    record_compaction_artifacts(
+        receipt=receipt,
+        chain=chain,
+        workdir=Path(_workdir) if _workdir is not None else None,
+        spend_ledger=getattr(orch, "_spend_ledger", None),
+    )
+    try:
+        get_collector().record_compaction(
+            session.id,
+            result.tokens_before,
+            result.tokens_after,
+            reason="provider_413",
+            trigger="reactive",
+            correlation_id=receipt.correlation_id,
+        )
+    except Exception as exc:
+        logger.debug("Reactive compaction metric write failed for %s: %s", task_id, exc)
 
 
 def _patch_retry_with_compaction(
@@ -931,6 +1012,29 @@ def _read_runner_cost_usd(
     return price_result.cost_usd, total_in, total_out
 
 
+# Failure types detected via log-pattern scanning that are unambiguous,
+# fatal, and MUST fail/retry the task immediately rather than falling
+# through to the generic "died without output" path (which defers behind
+# the double-fork liveness-signal grace window in
+# ``_probe_liveness_signals`` - correct for a process that genuinely might
+# still be alive under an untracked re-exec, but wrong here because the
+# runner already logged an unambiguous fatal exception before it exited).
+#
+# Root-cause fix (task-claimed-stuck bug, 2026-07-05): a MaxTurnsExceeded
+# death was not classified as ANY of these types before, so it fell all the
+# way through ``detect_failure_type`` -> ``_handle_orphan_no_signals`` ->
+# the liveness-deferral / clean-exit branches, and (depending on timing)
+# could sit "claimed" far longer than necessary before ``retry_or_fail_task``
+# ever ran - up to the orchestrator's 30-minute wall-clock reap ceiling in
+# the worst case. Generalized to the other deterministic-fatal log signals
+# (timeout, auth_error, api_error) per the same reasoning - previously only
+# "rate_limit" and "context_overflow" were actually handled here; the other
+# three were detected by ``detect_failure_type`` but silently fell through
+# to ``return False`` below, losing both the fast-fail and the diagnostic
+# reason string.
+_FAST_FAIL_LOG_FAILURE_TYPES: frozenset[str] = frozenset({"max_turns", "timeout", "auth_error", "api_error"})
+
+
 def _handle_failure_detection(
     orch: Any,
     task: Task,
@@ -940,7 +1044,11 @@ def _handle_failure_detection(
     start_ts: float,
     tasks_snapshot: dict[str, list[Task]],
 ) -> bool:
-    """Detect rate-limit/context-overflow failures and handle them. Returns True if handled."""
+    """Detect fatal failure signatures in the agent log and handle them.
+
+    Returns True if handled (task already failed/retried/compacted - caller
+    must not fall through to the generic orphan-no-signals path).
+    """
     _rl_tracker = getattr(orch, "_rate_limit_tracker", None)
     if _rl_tracker is None or not session.provider:
         return False
@@ -962,22 +1070,40 @@ def _handle_failure_detection(
         )
         return False
 
-    _rl_tracker.throttle_provider(session.provider, getattr(orch, "_router", None))
-    # Triggering evidence: the specific pattern/excerpt that caused this
-    # throttle decision is logged by RateLimitTracker._scan_log_for_patterns
-    # (matched pattern=..., line_type=..., excerpt=...) immediately before
-    # this line -- log_path here is the pointer that ties the two together.
-    logger.warning(
-        "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) -> throttling provider %r",
-        _failure_type,
-        session.id,
-        session.provider,
-        task_id,
-        _log_path,
-        session.provider,
-    )
+    _fallback_model: str | None = None
+    if _failure_type == "max_turns":
+        # A max-turns cap is task-scoped: the agent exhausted its own turn
+        # budget, which says nothing about provider health. Skip the
+        # provider throttle (exponential backoff + background suppression)
+        # and the cascade model fallback that the provider-scoped failure
+        # types below get -- both would penalize a healthy provider for a
+        # per-task configuration ceiling. Fall through to the fast-fail
+        # branch, which retries the task with the same routing.
+        logger.warning(
+            "Failure detected (max_turns) in log for session %s (provider=%r, task=%s, log_path=%s)"
+            " - turn-cap exhaustion is task-scoped, provider not throttled",
+            session.id,
+            session.provider,
+            task_id,
+            _log_path,
+        )
+    else:
+        _rl_tracker.throttle_provider(session.provider, getattr(orch, "_router", None))
+        # Triggering evidence: the specific pattern/excerpt that caused this
+        # throttle decision is logged by RateLimitTracker._scan_log_for_patterns
+        # (matched pattern=..., line_type=..., excerpt=...) immediately before
+        # this line -- log_path here is the pointer that ties the two together.
+        logger.warning(
+            "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) -> throttling provider %r",
+            _failure_type,
+            session.id,
+            session.provider,
+            task_id,
+            _log_path,
+            session.provider,
+        )
 
-    _fallback_model = _run_cascade_fallback(orch, task, task_id, session, _rl_tracker, _failure_type)
+        _fallback_model = _run_cascade_fallback(orch, task, task_id, session, _rl_tracker, _failure_type)
 
     if _failure_type == "rate_limit":
         _handle_rate_limit_orphan(orch, task, task_id, session, base, start_ts, _fallback_model)
@@ -994,6 +1120,31 @@ def _handle_failure_detection(
         )
         error_type = "context_overflow_compacted" if _compacted else "context_overflow_compact_failed"
         emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=error_type)
+        orch._record_provider_health(session, success=False)
+        return True
+
+    if _failure_type in _FAST_FAIL_LOG_FAILURE_TYPES:
+        reason = f"Agent {session.id} died; {_failure_type} detected in agent log (exit_code={session.exit_code!r})"
+        try:
+            retry_or_fail_task(
+                task_id,
+                reason,
+                client=orch._client,
+                server_url=base,
+                max_task_retries=orch._config.max_task_retries,
+                retried_task_ids=orch._retried_task_ids,
+                tasks_snapshot=tasks_snapshot,
+                workdir=getattr(orch, "_workdir", None),
+                **_retry_escalation_context(orch),
+            )
+            logger.warning(
+                "Task '%s' failed/retried fast (log-detected fatal error): %s",
+                task.title,
+                reason,
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Failed to retry/fail task %s after %s detection: %s", task_id, _failure_type, exc)
+        emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=_failure_type)
         orch._record_provider_health(session, success=False)
         return True
 
