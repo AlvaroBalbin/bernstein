@@ -480,3 +480,74 @@ class TestCompletionProgressSkipSet:
             '{"type": "error", "message": "Error code: 429 - rate limit exceeded"}\n'
         )
         assert self._tracker().detect_failure_type(log) == "rate_limit"
+
+
+class TestMaxTurnsDetection:
+    """A MaxTurnsExceeded death was never classified by detect_failure_type,
+    so the orchestrator treated it as ambiguous and the task sat 'claimed'
+    behind the liveness grace window. The runner's cap-hit WARNING and the
+    SDK exception signature now classify as "max_turns"."""
+
+    def _tracker(self):
+        from bernstein.core.observability.rate_limit_tracker import RateLimitTracker
+
+        return RateLimitTracker()
+
+    def test_runner_cap_hit_warning_detected(self, tmp_path):
+        log = tmp_path / "agent.log"
+        log.write_text(
+            "MaxTurnsExceeded: session hit the turn cap "
+            "(max_turns=30, turns_used=30, work_already_completed=no). "
+            "Raise tuning.agent.max_turns / BERNSTEIN_MAX_TURNS / manifest max_turns "
+            "if this workflow legitimately needs more turns.\n"
+        )
+        assert self._tracker().detect_failure_type(log) == "max_turns"
+
+    def test_sdk_exception_message_detected(self, tmp_path):
+        log = tmp_path / "agent.log"
+        log.write_text("agents.exceptions.MaxTurnsExceeded: Max turns (30) exceeded\n")
+        assert self._tracker().detect_failure_type(log) == "max_turns"
+
+    def test_quoted_in_tool_result_does_not_match(self, tmp_path):
+        """An agent reading/editing code that mentions the exception (e.g.
+        this very repo) echoes the string inside tool traffic - data-line
+        types are never substring-scanned."""
+        import json as _json
+
+        log = tmp_path / "agent.log"
+        log.write_text(
+            _json.dumps(
+                {
+                    "type": "tool_result",
+                    "name": "read_file",
+                    "result": {"preview": 'raise MaxTurnsExceeded(f"Max turns ({max_turns}) exceeded")'},
+                }
+            )
+            + "\n"
+        )
+        assert self._tracker().detect_failure_type(log) is None
+
+    def test_quoted_in_progress_prose_does_not_match(self, tmp_path):
+        import json as _json
+
+        log = tmp_path / "agent.log"
+        log.write_text(
+            _json.dumps(
+                {
+                    "type": "progress",
+                    "message": "adding MaxTurnsExceeded so max turns exceeded deaths are classified",
+                }
+            )
+            + "\n"
+        )
+        assert self._tracker().detect_failure_type(log) is None
+
+    def test_max_turns_takes_priority_over_timeout(self, tmp_path):
+        """A cap-hit run whose log also carries a transient timeout error must
+        classify as the unambiguous max_turns, not the vaguer timeout."""
+        log = tmp_path / "agent.log"
+        log.write_text(
+            "openai.APITimeoutError: HTTP request failed: read timeout\n"
+            "agents.exceptions.MaxTurnsExceeded: Max turns (30) exceeded\n"
+        )
+        assert self._tracker().detect_failure_type(log) == "max_turns"
