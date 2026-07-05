@@ -1035,7 +1035,9 @@ def _render_prompt(
     # and any future caller that switches to it.
     if max_turns is not None and max_turns > 0:
         halfway_turn = max(1, max_turns // 2)
-        near_end_turn = max(halfway_turn + 1, min(max_turns, max_turns - 3))
+        # Mirrors spawner_core._render_prompt: near_end is 3 turns before
+        # the cap, never below/at halfway, and never past max_turns itself.
+        near_end_turn = min(max_turns, max(halfway_turn + 1, max_turns - 3))
         turn_budget_block = (
             "\n## Turn budget\n"
             f"You have a hard budget of {max_turns} tool-use turns for this task.\n\n"
