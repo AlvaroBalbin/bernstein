@@ -14,10 +14,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from bernstein.core.models import Task, TaskStatus, TaskType
-from bernstein.core.tasks.auto_spawn_guard import AutoSpawnGuard
 
 from bernstein.core.orchestration.evolution import UpgradeStatus
 from bernstein.core.orchestration.orchestrator_evolve import _create_upgrade_tasks
+from bernstein.core.tasks.auto_spawn_guard import AutoSpawnGuard
 
 
 def _proposal(
