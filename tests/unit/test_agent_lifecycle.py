@@ -768,3 +768,76 @@ def test_reap_heartbeat_timeout_logs_and_continues_when_evolution_raises(tmp_pat
     assert any(session.id in r.getMessage() for r in error_records), caplog.text
     assert any("record_agent_lifetime" in r.getMessage() for r in error_records), caplog.text
     assert any(r.exc_info for r in error_records), "expected logger.exception to attach a traceback"
+
+
+# ---------------------------------------------------------------------------
+# Log-detected fatal failures: fast-fail via retry_or_fail_task
+# ---------------------------------------------------------------------------
+
+
+def _make_orch_fast_fail(tmp_path, failure_type: str) -> SimpleNamespace:  # type: ignore[no-untyped-def]
+    """Orch mock whose tracker classifies the dead agent's log as *failure_type*."""
+    orch = _make_orch(
+        tmp_path,
+        CascadeExhausted(excluded_providers=frozenset({"claude"}), reason="all alternates throttled"),
+    )
+    orch._rate_limit_tracker.detect_failure_type.return_value = failure_type
+    orch._config = SimpleNamespace(
+        server_url="http://server",
+        recovery="restart",
+        max_crash_retries=3,
+        max_task_retries=3,
+    )
+    return orch
+
+
+def test_handle_orphaned_task_max_turns_fast_fails_without_provider_throttle(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """MaxTurnsExceeded (task-claimed-stuck fix): the task is failed/retried
+    immediately instead of deferring behind the liveness grace window, and
+    the provider is NOT throttled or cascade-reassigned - a turn cap is a
+    per-task ceiling, not a provider-health signal."""
+    task = _make_task()
+    task.status = TaskStatus.CLAIMED
+    session = AgentSession(
+        id="sess-1",
+        role="backend",
+        provider="claude",
+        model_config=ModelConfig("sonnet", "high"),
+        task_ids=[task.id],
+    )
+    orch = _make_orch_fast_fail(tmp_path, "max_turns")
+
+    with patch("bernstein.core.agents.agent_lifecycle.retry_or_fail_task") as retry_or_fail_task:
+        handle_orphaned_task(orch, task.id, session, {"claimed": [task], "open": [], "in_progress": [], "done": []})
+
+    retry_or_fail_task.assert_called_once()
+    assert "max_turns" in retry_or_fail_task.call_args.args[1]
+    orch._rate_limit_tracker.throttle_provider.assert_not_called()
+    orch._cascade_manager.find_fallback.assert_not_called()
+    orch._record_provider_health.assert_called_once_with(session, success=False)
+
+
+def test_handle_orphaned_task_provider_fatal_types_fast_fail_and_throttle(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """timeout/auth_error/api_error used to be detected but never acted on
+    (they fell through to the generic no-signals path and its liveness
+    deferral); they now fast-fail via retry_or_fail_task while keeping the
+    provider throttle they always triggered."""
+    for failure_type in ("timeout", "auth_error", "api_error"):
+        task = _make_task(task_id=f"T-{failure_type}")
+        task.status = TaskStatus.CLAIMED
+        session = AgentSession(
+            id=f"sess-{failure_type}",
+            role="backend",
+            provider="claude",
+            model_config=ModelConfig("sonnet", "high"),
+            task_ids=[task.id],
+        )
+        orch = _make_orch_fast_fail(tmp_path, failure_type)
+
+        with patch("bernstein.core.agents.agent_lifecycle.retry_or_fail_task") as retry_or_fail_task:
+            handle_orphaned_task(orch, task.id, session, {"claimed": [task], "open": [], "in_progress": [], "done": []})
+
+        retry_or_fail_task.assert_called_once()
+        assert failure_type in retry_or_fail_task.call_args.args[1]
+        orch._rate_limit_tracker.throttle_provider.assert_called_once()
+        orch._record_provider_health.assert_called_once_with(session, success=False)
