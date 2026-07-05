@@ -989,22 +989,40 @@ def _handle_failure_detection(
         )
         return False
 
-    _rl_tracker.throttle_provider(session.provider, getattr(orch, "_router", None))
-    # Triggering evidence: the specific pattern/excerpt that caused this
-    # throttle decision is logged by RateLimitTracker._scan_log_for_patterns
-    # (matched pattern=..., line_type=..., excerpt=...) immediately before
-    # this line -- log_path here is the pointer that ties the two together.
-    logger.warning(
-        "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) -> throttling provider %r",
-        _failure_type,
-        session.id,
-        session.provider,
-        task_id,
-        _log_path,
-        session.provider,
-    )
+    _fallback_model: str | None = None
+    if _failure_type == "max_turns":
+        # A max-turns cap is task-scoped: the agent exhausted its own turn
+        # budget, which says nothing about provider health. Skip the
+        # provider throttle (exponential backoff + background suppression)
+        # and the cascade model fallback that the provider-scoped failure
+        # types below get -- both would penalize a healthy provider for a
+        # per-task configuration ceiling. Fall through to the fast-fail
+        # branch, which retries the task with the same routing.
+        logger.warning(
+            "Failure detected (max_turns) in log for session %s (provider=%r, task=%s, log_path=%s)"
+            " - turn-cap exhaustion is task-scoped, provider not throttled",
+            session.id,
+            session.provider,
+            task_id,
+            _log_path,
+        )
+    else:
+        _rl_tracker.throttle_provider(session.provider, getattr(orch, "_router", None))
+        # Triggering evidence: the specific pattern/excerpt that caused this
+        # throttle decision is logged by RateLimitTracker._scan_log_for_patterns
+        # (matched pattern=..., line_type=..., excerpt=...) immediately before
+        # this line -- log_path here is the pointer that ties the two together.
+        logger.warning(
+            "Failure detected (%s) in log for session %s (provider=%r, task=%s, log_path=%s) -> throttling provider %r",
+            _failure_type,
+            session.id,
+            session.provider,
+            task_id,
+            _log_path,
+            session.provider,
+        )
 
-    _fallback_model = _run_cascade_fallback(orch, task, task_id, session, _rl_tracker, _failure_type)
+        _fallback_model = _run_cascade_fallback(orch, task, task_id, session, _rl_tracker, _failure_type)
 
     if _failure_type == "rate_limit":
         _handle_rate_limit_orphan(orch, task, task_id, session, base, start_ts, _fallback_model)
