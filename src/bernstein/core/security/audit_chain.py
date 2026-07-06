@@ -148,6 +148,15 @@ EVENT_MANDATE_REVOCATION = "mandate.revocation"
 #: operator install signature, and the worktree id -- never diff content.
 EVENT_THREAD_APPROVAL = "thread.approval"
 
+#: Issue #2300 -- emitted whenever a signed OTel GenAI span set is projected
+#: from a run's event journal. The event records the run id, the journal head
+#: the projection anchors to, the derived OTLP trace id, the span count, and
+#: the sha256 of the canonical signed span set. A verifier holding the journal
+#: can reproject byte-identically and confirm the exported spans are a faithful
+#: projection of the chain rather than free-standing telemetry -- never the
+#: span attribute payloads themselves.
+EVENT_OTEL_PROJECTION = "otel.projection"
+
 
 # ---------------------------------------------------------------------------
 # AuditChainStore
@@ -876,6 +885,51 @@ def record_thread_approval(
     )
 
 
+def record_otel_projection(
+    *,
+    chain: AuditChainStore,
+    run_id: str,
+    journal_head: str,
+    trace_id: str,
+    span_count: int,
+    projection_sha256: str,
+    actor: str = "otel_projection",
+) -> AuditEvent:
+    """Append an ``otel.projection`` event into *chain*.
+
+    Binds a signed OTel span set to the run journal it projects: a verifier
+    holding the journal reprojects byte-identically and confirms the exported
+    spans are a faithful projection of the chain rather than free-standing
+    telemetry.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        run_id: The run identifier (journal run id).
+        journal_head: The run's journal head hash the projection anchors to.
+        trace_id: The OTLP trace id derived from the run's first entry hash.
+        span_count: Number of projected spans.
+        projection_sha256: SHA-256 of the canonical signed span set.
+        actor: Recorded actor; defaults to ``"otel_projection"``.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded
+        in its details payload.
+    """
+    return chain.log_with_prev_digest(
+        event_type=EVENT_OTEL_PROJECTION,
+        actor=actor,
+        resource_type="otel_projection",
+        resource_id=trace_id,
+        details={
+            "run_id": run_id,
+            "journal_head": journal_head,
+            "trace_id": trace_id,
+            "span_count": span_count,
+            "projection_sha256": projection_sha256,
+        },
+    )
+
+
 __all__ = [
     "AGENT_FRESH_RESTART_ON_RETRY",
     "EVENT_COMPACTION_RECEIPT",
@@ -886,6 +940,7 @@ __all__ = [
     "EVENT_MANDATE_REVOCATION",
     "EVENT_MEMORY_WRITE",
     "EVENT_MULTIMODAL_ATTACH",
+    "EVENT_OTEL_PROJECTION",
     "EVENT_SKILL_INSTALL_RECEIPT",
     "EVENT_SKILL_USAGE",
     "EVENT_TEMPLATE_COMPRESSION_RECEIPT",
@@ -905,6 +960,7 @@ __all__ = [
     "record_mandate_revocation",
     "record_memory_write",
     "record_multimodal_attach",
+    "record_otel_projection",
     "record_sensitive_gate",
     "record_skill_install_receipt",
     "record_skill_usage",
