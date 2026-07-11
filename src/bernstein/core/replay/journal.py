@@ -39,16 +39,25 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 #: Name of the canonical per-run event journal inside ``.sdd/runs/<id>/``.
 JOURNAL_FILENAME = "journal.jsonl"
+
+#: run_id alphabet: the git-ref-safe set the ledger/worktree ids use, with no
+#: path separators, so a matching run_id can never add a directory component to
+#: the journal path (py/path-injection). Mirrors
+#: ``core.run_service.paths.validate_run_id``.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,256}$")
 
 #: Env var bounding how many past run journals survive on disk. Replaces
 #: the old ``BERNSTEIN_RECORD`` on/off gate with a size-control knob.
@@ -137,29 +146,18 @@ class EventJournal:
     def __init__(self, run_id: str, sdd_dir: Path) -> None:
         self._run_id = run_id
         self._runs_root = sdd_dir / "runs"
-        # Path-injection guard (py/path-injection). A run_id names one journal
-        # directory and must be a single path segment. First a filesystem-free
-        # lexical check (no time-of-check/time-of-use window) that rejects
-        # traversal, separators, and absolute paths outright.
-        if (
-            not run_id
-            or run_id in {".", ".."}
-            or "/" in run_id
-            or "\\" in run_id
-            or "\x00" in run_id
-            or Path(run_id).is_absolute()
-        ):
+        # Path-injection guard (py/path-injection). run_id must match the
+        # git-ref-safe alphabet the ledger/worktree ids use (no path
+        # separators), mirroring core.run_service.paths.validate_run_id, and
+        # "." / ".." are rejected outright. The anchored regexp is the
+        # sanitiser the path is built from; the realpath-containment check is
+        # the backstop for a symlinked run directory.
+        if run_id in {".", ".."} or not _RUN_ID_RE.match(run_id):
             raise ValueError(f"unsafe run_id for journal path: {run_id!r}")
-        # Pin the directory name to os.path.basename so no directory component
-        # can survive into the path; for a run_id that passed the check above
-        # this is a no-op, but it is the sanitiser the path is built from.
-        safe_run_id = os.path.basename(run_id)
-        self._path = self._runs_root / safe_run_id / JOURNAL_FILENAME
-        # Defence in depth: refuse a resolved path that still escapes the runs
-        # root, e.g. through a symlinked run directory.
+        self._path = self._runs_root / run_id / JOURNAL_FILENAME
         runs_root_real = os.path.realpath(self._runs_root)
         if os.path.commonpath((runs_root_real, os.path.realpath(self._path))) != runs_root_real:
-            raise ValueError(f"run_id escapes the journal runs root: {run_id!r}")
+            raise ValueError(f"run_id {run_id!r} escapes the journal runs root")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._index = 0
