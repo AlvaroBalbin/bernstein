@@ -139,7 +139,24 @@ class EventJournal:
     def __init__(self, run_id: str, sdd_dir: Path) -> None:
         self._run_id = run_id
         self._runs_root = sdd_dir / "runs"
+        # Path-injection guard (py/path-injection). Validate run_id lexically
+        # first: a run_id must be a single, non-traversing path segment. This
+        # check never touches the filesystem, so it has no time-of-check /
+        # time-of-use window -- it rejects every "..", separator, or absolute
+        # run_id before a path is ever built. The realpath-containment check
+        # below is defence in depth for the resolved directory.
+        if (
+            not run_id
+            or run_id in {".", ".."}
+            or "/" in run_id
+            or "\\" in run_id
+            or "\x00" in run_id
+            or os.path.isabs(run_id)
+        ):
+            raise ValueError(f"unsafe run_id for journal path: {run_id!r}")
         self._path = self._runs_root / run_id / JOURNAL_FILENAME
+        if not self._path.resolve().is_relative_to(self._runs_root.resolve()):
+            raise ValueError(f"run_id escapes the journal runs root: {run_id!r}")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._index = 0
