@@ -88,6 +88,8 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "hook-gate",
         # Durable work ledger: resumable task-graph state (issue #2358)
         "ledger",
+        # Detached run service: submit, disconnect, reattach later (issue #2352)
+        "run-service",
         # Tournament runs: parallel attempts selected by deterministic evaluators (issue #2353)
         "tournament",
         # Auth

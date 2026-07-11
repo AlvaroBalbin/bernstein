@@ -1259,6 +1259,11 @@ from bernstein.cli.commands.ledger_cmd import ledger_group  # noqa: E402
 
 cli.add_command(ledger_group, "ledger")
 
+# Detached run service: submit a goal, disconnect, reattach later (#2352).
+from bernstein.cli.commands.run_service_cmd import run_service_group  # noqa: E402
+
+cli.add_command(run_service_group, "run-service")
+
 # Tournament runs: parallel attempts selected by deterministic evaluators (#2353).
 from bernstein.cli.commands.tournament_cmd import tournament_group  # noqa: E402
 
