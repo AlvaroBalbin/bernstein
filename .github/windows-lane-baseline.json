@@ -1,6 +1,6 @@
 {
   "established": false,
-  "note": "Windows lane green history is recorded on a real Windows runner. Flip `established` to true after the readiness gate in docs/operations/merge-gate.md holds (justified skips, N-run green streak on main, no continue-on-error masking, conformance stop/restart green). Until then the lane is advisory: red is surfaced as a warning by scripts/windows_lane_gate.py but does not block the merge queue.",
+  "note": "Windows lane gate mechanism is shipped and the dedicated `Adapter conformance + e2e (windows)` job (required, in ci-gate needs) runs the real spawn/stop/restart contract for claude/codex/gemini plus the Windows worktree-isolation contract. The full unit `Test (windows-latest, ...)` matrix is kept advisory for now: main still carries pre-existing Windows-only failures outside this issue's scope (e.g. tests/unit/adapters/test_openai_agents_builtins.py glob-expansion behavior). Flip `established` to true only after those are fixed and the lane holds a green streak on main; see docs/operations/merge-gate.md#windows-lane-promotion. Until then a red unit-lane result is surfaced as a ::warning:: by scripts/windows_lane_gate.py and does not block.",
   "streak_required": 10,
-  "flip_procedure": "docs/operations/merge-gate.md#windows-lane-promotion-prepared-not-yet-flipped"
+  "flip_procedure": "docs/operations/merge-gate.md#windows-lane-promotion"
 }
