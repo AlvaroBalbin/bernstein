@@ -179,18 +179,36 @@ def _project_task_helper(data: dict[str, Any]) -> Any:
     head_hash = _get_journal_head(task_id)
     mcp_task_id = f"{task_id}:{head_hash}" if head_hash else task_id
 
+    # Map every Bernstein TaskStatus onto an MCP Tasks status. Terminal states
+    # MUST project to a terminal MCP status: a spec-compliant client only calls
+    # getTaskResult once get_task reports terminal, so leaving e.g. the normal
+    # ``done -> closed`` success path as "working" makes the client poll forever.
     status_str = data.get("status", "open")
-    if status_str in ("open", "claimed", "in_progress"):
-        mcp_status = "working"
-    elif status_str == "blocked":
-        mcp_status = "input_required"
-    elif status_str == "done":
-        mcp_status = "completed"
-    elif status_str == "failed":
-        mcp_status = "failed"
-    elif status_str == "cancelled":
-        mcp_status = "cancelled"
-    else:
+    _MCP_STATUS_BY_TASK_STATUS = {
+        # in-progress / recoverable -> working
+        "open": "working",
+        "claimed": "working",
+        "in_progress": "working",
+        "waiting_for_subtasks": "working",
+        "orphaned": "working",
+        # needs input or approval -> input_required
+        "blocked": "input_required",
+        "pending_approval": "input_required",
+        "planned": "input_required",
+        "blocked_by_abandon": "input_required",
+        # terminal success -> completed
+        "done": "completed",
+        "closed": "completed",
+        # terminal failure -> failed
+        "failed": "failed",
+        "abandoned": "failed",
+        "refused": "failed",
+        # terminal cancel -> cancelled
+        "cancelled": "cancelled",
+    }
+    mcp_status = _MCP_STATUS_BY_TASK_STATUS.get(status_str)
+    if mcp_status is None:
+        logger.warning("Unrecognized task status %r; defaulting MCP status to working", status_str)
         mcp_status = "working"
 
     status_message = data.get("result_summary")
@@ -686,7 +704,17 @@ def _register_tasks_extension(mcp: FastMCP[None], server_url: str) -> None:
             resp = await client.get(f"{server_url}/tasks/{task_id}", headers=_auth_headers())
             resp.raise_for_status()
             data = resp.json()
-        is_error = data.get("status") == "failed"
+        status = data.get("status")
+        error_states = {"failed", "refused", "abandoned", "orphaned", "blocked_by_abandon"}
+        terminal_states = error_states | {"done", "closed", "cancelled"}
+        # Only a terminal task has a final result. Calling getTaskResult on an
+        # in-flight task must not fabricate a "Task completed" success.
+        if status not in terminal_states:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Result not available; task still {status}")],
+                isError=True,
+            )
+        is_error = status in error_states
         result_summary = data.get("result_summary") or ""
         if not result_summary:
             result_summary = "Task failed" if is_error else "Task completed"

@@ -2503,27 +2503,47 @@ class AgentSpawner:
 
     def spawn_for_tasks(self, tasks: list[Task], model_override: str | None = None) -> AgentSession:
         """Route, render prompt, and spawn an agent for a task batch."""
+        import os
+
         from bernstein.core.telemetry import start_span
 
         if not tasks:
             raise ValueError("Cannot spawn agent with empty task list")
 
-        if tasks:
-            meta = tasks[0].metadata or {}
-            for k in ("traceparent", "tracestate", "baggage"):
-                if meta.get(k):
-                    import os
-                    os.environ[k.upper()] = str(meta[k])
+        # Propagate W3C trace-context (if the task carries it) to the spawned
+        # agent subprocess via the environment. This MUST be scoped to this one
+        # spawn: os.environ is process-global, so a value left set here would be
+        # inherited by the next task's subprocess -- and, worse, read by
+        # record_artifact_write and folded into another task's HMAC-signed
+        # lineage entry (silent false attestation). Always set-or-clear all three
+        # keys for this task and restore the prior environment in ``finally`` so a
+        # task without trace-context can never inherit a previous task's value.
+        meta = tasks[0].metadata or {}
+        _trace_keys = ("TRACEPARENT", "TRACESTATE", "BAGGAGE")
+        _saved_env: dict[str, str | None] = {k: os.environ.get(k) for k in _trace_keys}
+        for _k in _trace_keys:
+            _value = meta.get(_k.lower())
+            if _value:
+                os.environ[_k] = str(_value)
+            else:
+                os.environ.pop(_k, None)
 
-        with start_span(
-            "agent.spawn",
-            attributes={
-                "role": tasks[0].role,
-                "task_count": len(tasks),
-                "model_override": model_override,
-            },
-        ):
-            return self._spawn_for_tasks_internal(tasks, model_override=model_override)
+        try:
+            with start_span(
+                "agent.spawn",
+                attributes={
+                    "role": tasks[0].role,
+                    "task_count": len(tasks),
+                    "model_override": model_override,
+                },
+            ):
+                return self._spawn_for_tasks_internal(tasks, model_override=model_override)
+        finally:
+            for _k, _prev in _saved_env.items():
+                if _prev is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _prev
 
     def _apply_provider_availability(
         self,
