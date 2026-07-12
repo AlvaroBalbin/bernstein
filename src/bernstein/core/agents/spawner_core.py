@@ -2511,7 +2511,7 @@ class AgentSpawner:
         if tasks:
             meta = tasks[0].metadata or {}
             for k in ("traceparent", "tracestate", "baggage"):
-                if k in meta and meta[k]:
+                if meta.get(k):
                     import os
                     os.environ[k.upper()] = str(meta[k])
 

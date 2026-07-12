@@ -1027,11 +1027,11 @@ def record_artifact_write(
     if not _lineage_enabled():
         return None
     ts = timestamp if timestamp is not None else time.time_ns()
-    
-    traceparent = os.environ.get("TRACEPARENT") or os.environ.get("traceparent")
-    tracestate = os.environ.get("TRACESTATE") or os.environ.get("tracestate")
-    baggage = os.environ.get("BAGGAGE") or os.environ.get("baggage")
-    
+
+    traceparent = os.environ.get("TRACEPARENT") or os.environ.get("traceparent".lower())
+    tracestate = os.environ.get("TRACESTATE") or os.environ.get("tracestate".lower())
+    baggage = os.environ.get("BAGGAGE") or os.environ.get("baggage".lower())
+
     return LineageSpine(lineage_root, run_id=run_id, hmac_key=hmac_key).record(
         artifact_path=artifact_path,
         content=content,

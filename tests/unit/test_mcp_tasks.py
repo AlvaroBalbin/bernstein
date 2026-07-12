@@ -2,26 +2,32 @@
 
 from __future__ import annotations
 
-import os
-import json
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.server.fastmcp import Context
 from mcp.types import (
     GetTaskRequest,
+    GetTaskRequestParams,
     GetTaskResult,
     GetTaskPayloadRequest,
+    GetTaskPayloadRequestParams,
     CallToolResult,
     ListTasksRequest,
     ListTasksResult,
     CancelTaskRequest,
+    CancelTaskRequestParams,
     CancelTaskResult,
     CreateTaskResult,
+    TextContent,
 )
 
-from bernstein.mcp.server import create_mcp_server, _get_journal_head, _project_task_helper
+from bernstein.mcp.server import (
+    create_mcp_server,
+    _get_journal_head,  # pyright: ignore[reportPrivateUsage]
+    _project_task_helper,  # pyright: ignore[reportPrivateUsage]
+)
 from bernstein.core.lineage.spine import LineageSpine, SpineStatus
 from bernstein.adapters.base import record_artifact_write
 from bernstein.core.routes.task_crud import create_task
@@ -32,14 +38,14 @@ _KEY = b"k" * 32
 
 
 @pytest.fixture
-def mock_client():
+def mock_client() -> AsyncMock:
     client = AsyncMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
     return client
 
 
-def _make_task_dict(task_id: str, status: str = "open", result_summary: str | None = None) -> dict:
+def _make_task_dict(task_id: str, status: str = "open", result_summary: str | None = None) -> dict[str, Any]:
     return {
         "id": task_id,
         "title": "Test task",
@@ -52,12 +58,12 @@ def _make_task_dict(task_id: str, status: str = "open", result_summary: str | No
 
 
 @pytest.mark.asyncio
-async def test_get_journal_head_empty_when_missing():
+async def test_get_journal_head_empty_when_missing() -> None:
     assert _get_journal_head("non-existent-task") == ""
 
 
 @pytest.mark.asyncio
-async def test_project_task_helper():
+async def test_project_task_helper() -> None:
     data = _make_task_dict("t-123", status="done", result_summary="Success summary")
     task_obj = _project_task_helper(data)
     assert task_obj.taskId == "t-123"
@@ -66,13 +72,9 @@ async def test_project_task_helper():
 
 
 @pytest.mark.asyncio
-async def test_get_task_endpoint(mock_client):
+async def test_get_task_endpoint(mock_client: AsyncMock) -> None:
     mcp = create_mcp_server()
-    handler = mcp._mcp_server.request_handlers[GetTaskRequest]
-    print("DEBUG: handler.__closure__:", [c.cell_contents for c in handler.__closure__])
-    from typing import get_type_hints
-    import inspect
-    print("DEBUG: globals of handler:", handler.__code__.co_names)
+    handler = mcp._mcp_server.request_handlers[GetTaskRequest]  # pyright: ignore[reportPrivateUsage]
 
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
@@ -80,7 +82,7 @@ async def test_get_task_endpoint(mock_client):
     mock_client.get = AsyncMock(return_value=mock_response)
 
     with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
-        req = GetTaskRequest(params={"taskId": "task-abc"})
+        req = GetTaskRequest(params=GetTaskRequestParams(taskId="task-abc"))
         server_res = await handler(req)
         res = server_res.root
         assert isinstance(res, GetTaskResult)
@@ -90,9 +92,9 @@ async def test_get_task_endpoint(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_get_task_result_endpoint(mock_client):
+async def test_get_task_result_endpoint(mock_client: AsyncMock) -> None:
     mcp = create_mcp_server()
-    handler = mcp._mcp_server.request_handlers[GetTaskPayloadRequest]
+    handler = mcp._mcp_server.request_handlers[GetTaskPayloadRequest]  # pyright: ignore[reportPrivateUsage]
 
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
@@ -100,18 +102,20 @@ async def test_get_task_result_endpoint(mock_client):
     mock_client.get = AsyncMock(return_value=mock_response)
 
     with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
-        req = GetTaskPayloadRequest(params={"taskId": "task-abc"})
+        req = GetTaskPayloadRequest(params=GetTaskPayloadRequestParams(taskId="task-abc"))
         server_res = await handler(req)
         res = server_res.root
         assert isinstance(res, CallToolResult)
         assert not res.isError
-        assert res.content[0].text == "Done task"
+        first_content = res.content[0]
+        assert isinstance(first_content, TextContent)
+        assert first_content.text == "Done task"
 
 
 @pytest.mark.asyncio
-async def test_list_tasks_endpoint(mock_client):
+async def test_list_tasks_endpoint(mock_client: AsyncMock) -> None:
     mcp = create_mcp_server()
-    handler = mcp._mcp_server.request_handlers[ListTasksRequest]
+    handler = mcp._mcp_server.request_handlers[ListTasksRequest]  # pyright: ignore[reportPrivateUsage]
 
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
@@ -126,6 +130,7 @@ async def test_list_tasks_endpoint(mock_client):
         server_res = await handler(req)
         res = server_res.root
         assert isinstance(res, ListTasksResult)
+        assert res.tasks is not None
         assert len(res.tasks) == 2
         assert res.tasks[0].taskId == "task-1"
         assert res.tasks[0].status == "completed"
@@ -134,10 +139,9 @@ async def test_list_tasks_endpoint(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_cancel_task_endpoint(mock_client):
+async def test_cancel_task_endpoint(mock_client: AsyncMock) -> None:
     mcp = create_mcp_server()
-    handler = mcp._mcp_server.request_handlers[CancelTaskRequest]
-    print("DEBUG: cancel_task handler.__closure__:", [c.cell_contents for c in handler.__closure__])
+    handler = mcp._mcp_server.request_handlers[CancelTaskRequest]  # pyright: ignore[reportPrivateUsage]
 
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
@@ -145,7 +149,7 @@ async def test_cancel_task_endpoint(mock_client):
     mock_client.post = AsyncMock(return_value=mock_response)
 
     with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
-        req = CancelTaskRequest(params={"taskId": "task-abc"})
+        req = CancelTaskRequest(params=CancelTaskRequestParams(taskId="task-abc"))
         server_res = await handler(req)
         res = server_res.root
         assert isinstance(res, CancelTaskResult)
@@ -154,10 +158,10 @@ async def test_cancel_task_endpoint(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_bernstein_run_with_client_supports_tasks(mock_client):
+async def test_bernstein_run_with_client_supports_tasks(mock_client: AsyncMock) -> None:
     from mcp.types import CallToolRequest, CallToolRequestParams
     mcp = create_mcp_server()
-    handler = mcp._mcp_server.request_handlers[CallToolRequest]
+    handler = mcp._mcp_server.request_handlers[CallToolRequest]  # pyright: ignore[reportPrivateUsage]
     
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
@@ -198,14 +202,14 @@ async def test_bernstein_run_with_client_supports_tasks(mock_client):
     assert res.task.status == "working"
     
     # Assert trace context headers were forwarded
-    headers = mock_client.post.call_args.kwargs.get("headers") or {}
+    headers = cast(dict[str, Any], mock_client.post.call_args.kwargs.get("headers") or {})
     assert headers.get("traceparent") == "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     assert headers.get("tracestate") == "state-xyz"
     assert headers.get("baggage") == "baggage-abc"
 
 
 @pytest.mark.asyncio
-async def test_trace_context_propagation_to_lineage(tmp_path, monkeypatch):
+async def test_trace_context_propagation_to_lineage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BERNSTEIN_LINEAGE_ENABLED", "1")
     monkeypatch.setenv("TRACEPARENT", "00-abc-123-01")
     monkeypatch.setenv("TRACESTATE", "state-abc")
@@ -237,7 +241,7 @@ async def test_trace_context_propagation_to_lineage(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_create_task_endpoint_ingests_trace_headers():
+async def test_create_task_endpoint_ingests_trace_headers() -> None:
     # Mock FastAPI request
     mock_request = MagicMock()
     mock_request.app.state.sdd_dir = Path("/tmp")
@@ -261,8 +265,7 @@ async def test_create_task_endpoint_ingests_trace_headers():
         title="Test",
         description="Desc",
         role="backend",
-        task_type=TaskType.STANDARD,
-        status=TaskStatus.OPEN,
+        task_type=TaskType.STANDARD.value,
     )
 
     with patch("bernstein.core.routes.task_crud._get_store", return_value=mock_store), \

@@ -24,38 +24,28 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP, Context
-from mcp.types import (
-    GetTaskRequest,
-    GetTaskResult,
-    GetTaskPayloadRequest,
-    CallToolResult,
-    ListTasksRequest,
-    ListTasksResult,
-    CancelTaskRequest,
-    CancelTaskResult,
-    CreateTaskResult,
-    Task,
-    TextContent,
-)
+from mcp.server.fastmcp import Context, FastMCP
 
 # Patch FastMCP FuncMetadata to support CreateTaskResult without validation error
 from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
-
-_orig_convert_result = FuncMetadata.convert_result
-
-
-def _patched_convert_result(self, result: Any) -> Any:
-    if isinstance(result, CreateTaskResult):
-        return result
-    return _orig_convert_result(self, result)
-
-
-FuncMetadata.convert_result = _patched_convert_result
+from mcp.types import (
+    CallToolResult,
+    CancelTaskRequest,
+    CancelTaskResult,
+    CreateTaskResult,
+    GetTaskPayloadRequest,
+    GetTaskRequest,
+    GetTaskResult,
+    ListTasksRequest,
+    ListTasksResult,
+    Task,
+    TextContent,
+)
 
 from bernstein.core.protocols.mcp.tool_tiers import (
     ToolTier,
@@ -69,6 +59,17 @@ from bernstein.mcp.input_validation import (
     to_jsonrpc_error,
     validate_tool_call,
 )
+
+_orig_convert_result = FuncMetadata.convert_result
+
+
+def _patched_convert_result(self, result: Any) -> Any:
+    if isinstance(result, CreateTaskResult):
+        return result
+    return _orig_convert_result(self, result)
+
+
+FuncMetadata.convert_result = _patched_convert_result
 
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8052"
 
@@ -155,8 +156,9 @@ def _register_health_tool(mcp: FastMCP[None]) -> None:
 
 def _get_journal_head(task_id: str) -> str:
     from pathlib import Path
-    from bernstein.core.tasks.checkpoint_retry import task_run_id
+
     from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
 
     run_id = task_run_id(task_id)
     sdd_dir = Path.cwd() / ".sdd"
@@ -171,9 +173,8 @@ def _get_journal_head(task_id: str) -> str:
 
 
 def _project_task_helper(data: dict[str, Any]) -> Any:
-    from datetime import datetime, timezone
-    from mcp.types import Task
-    
+    from datetime import datetime
+
     task_id = data["id"]
     head_hash = _get_journal_head(task_id)
     mcp_task_id = f"{task_id}:{head_hash}" if head_hash else task_id
@@ -206,17 +207,14 @@ def _project_task_helper(data: dict[str, Any]) -> Any:
             status_message = "Task was cancelled"
 
     created_at_ts = data.get("created_at")
-    if created_at_ts:
-        created_at = datetime.fromtimestamp(created_at_ts, tz=timezone.utc)
-    else:
-        created_at = datetime.now(timezone.utc)
+    created_at = datetime.fromtimestamp(created_at_ts, tz=UTC) if created_at_ts else datetime.now(UTC)
 
     return Task(
         taskId=mcp_task_id,
         status=mcp_status,
         statusMessage=status_message,
         createdAt=created_at,
-        lastUpdatedAt=datetime.now(timezone.utc),
+        lastUpdatedAt=datetime.now(UTC),
         ttl=None,
         pollInterval=5000,
     )
@@ -271,7 +269,7 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 "complexity": complexity,
                 "estimated_minutes": estimated_minutes,
             }
-            
+
             client_supports_tasks = False
             traceparent = None
             tracestate = None
@@ -303,7 +301,7 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 resp = await client.post(f"{server_url}/tasks", json=payload, headers=headers)
                 resp.raise_for_status()
                 data: dict[str, Any] = resp.json()
-            
+
             if client_supports_tasks:
                 task_obj = _project_task_helper(data)
                 return CreateTaskResult(task=task_obj)
@@ -691,10 +689,7 @@ def _register_tasks_extension(mcp: FastMCP[None], server_url: str) -> None:
         is_error = data.get("status") == "failed"
         result_summary = data.get("result_summary") or ""
         if not result_summary:
-            if is_error:
-                result_summary = "Task failed"
-            else:
-                result_summary = "Task completed"
+            result_summary = "Task failed" if is_error else "Task completed"
         return CallToolResult(
             content=[TextContent(type="text", text=result_summary)],
             isError=is_error,
