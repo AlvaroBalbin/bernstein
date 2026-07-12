@@ -198,7 +198,11 @@ class TestShellCommandEmbedding:
         p.write_text(f"Branch: !{'`git rev-parse --abbrev-ref HEAD`'}")
         result = _execute_shell_commands(p.read_text())
         assert "Branch:" in result
-        assert "task" not in result.lower() or "main" in result.lower() or "master" in result.lower()
+        # Verify the shell command was actually executed (template marker removed)
+        assert "!`" not in result, "shell command was not executed"
+        # The branch name should be non-empty after "Branch: "
+        branch = result.split("Branch: ", 1)[1].strip()
+        assert branch, "branch name should not be empty"
 
     def test_shell_command_failed(self, tmp_path: Path) -> None:
         p = tmp_path / "tmpl.md"

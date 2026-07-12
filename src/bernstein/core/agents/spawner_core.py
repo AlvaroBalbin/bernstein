@@ -2508,6 +2508,13 @@ class AgentSpawner:
         if not tasks:
             raise ValueError("Cannot spawn agent with empty task list")
 
+        if tasks:
+            meta = tasks[0].metadata or {}
+            for k in ("traceparent", "tracestate", "baggage"):
+                if k in meta and meta[k]:
+                    import os
+                    os.environ[k.upper()] = str(meta[k])
+
         with start_span(
             "agent.spawn",
             attributes={

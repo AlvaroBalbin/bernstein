@@ -750,6 +750,17 @@ async def create_task(body: TaskCreate, request: Request) -> TaskResponse:
     store = _get_store(request)
     sse_bus = _get_sse_bus(request)
     effective_body = body.model_copy(update={"tenant_id": request_tenant_id(request)})
+    if effective_body.metadata is None:
+        effective_body.metadata = {}
+    traceparent = request.headers.get("traceparent")
+    tracestate = request.headers.get("tracestate")
+    baggage = request.headers.get("baggage")
+    if traceparent:
+        effective_body.metadata["traceparent"] = traceparent
+    if tracestate:
+        effective_body.metadata["tracestate"] = tracestate
+    if baggage:
+        effective_body.metadata["baggage"] = baggage
 
     # Auto-classify role if not specified
     if effective_body.role == "auto":
