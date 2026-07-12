@@ -12,10 +12,10 @@
         "docker-compose",
         "dockerfile"
       ],
-      "matchPackagePatterns": [
-        "^python$",
-        "actions/python-versions",
-        "actions/setup-python"
+      "matchPackageNames": [
+        "python",
+        "/actions/python-versions/",
+        "/actions/setup-python/"
       ],
       "allowedVersions": "<=3.13"
     },
