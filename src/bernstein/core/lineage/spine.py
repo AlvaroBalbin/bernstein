@@ -127,22 +127,32 @@ def compute_entry_hash(
     step_id: str,
     model: str,
     timestamp: int,
+    traceparent: str | None = None,
+    tracestate: str | None = None,
+    baggage: str | None = None,
 ) -> str:
     """Return ``entry_hash = H(prev_hash, artifact_path, content_hash, ...)``.
 
     The pre-image is the canonical JSON of the ordered field tuple, so
     the digest is deterministic across processes and platforms.
     """
+    fields = {
+        "prev_hash": prev_hash,
+        "artifact_path": artifact_path,
+        "content_hash": content_hash,
+        "actor": actor,
+        "step_id": step_id,
+        "model": model,
+        "timestamp": timestamp,
+    }
+    if traceparent is not None:
+        fields["traceparent"] = traceparent
+    if tracestate is not None:
+        fields["tracestate"] = tracestate
+    if baggage is not None:
+        fields["baggage"] = baggage
     preimage = json.dumps(
-        {
-            "prev_hash": prev_hash,
-            "artifact_path": artifact_path,
-            "content_hash": content_hash,
-            "actor": actor,
-            "step_id": step_id,
-            "model": model,
-            "timestamp": timestamp,
-        },
+        fields,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -174,10 +184,13 @@ class SpineEntry:
     timestamp: int
     entry_hash: str
     hmac: str
+    traceparent: str | None = None
+    tracestate: str | None = None
+    baggage: str | None = None
 
     def body(self) -> dict[str, Any]:
         """Return the HMAC/hash-covered body (all fields except ``hmac``)."""
-        return {
+        res = {
             "v": self.v,
             "prev_hash": self.prev_hash,
             "artifact_path": self.artifact_path,
@@ -188,6 +201,13 @@ class SpineEntry:
             "timestamp": self.timestamp,
             "entry_hash": self.entry_hash,
         }
+        if self.traceparent is not None:
+            res["traceparent"] = self.traceparent
+        if self.tracestate is not None:
+            res["tracestate"] = self.tracestate
+        if self.baggage is not None:
+            res["baggage"] = self.baggage
+        return res
 
     def to_row(self) -> bytes:
         """Serialise the entry to its canonical single-line JSONL form."""
@@ -353,6 +373,9 @@ class LineageSpine:
         step_id: str,
         model: str,
         timestamp: int,
+        traceparent: str | None = None,
+        tracestate: str | None = None,
+        baggage: str | None = None,
     ) -> str:
         """Append one entry for an artifact write. Returns its entry hash.
 
@@ -365,6 +388,9 @@ class LineageSpine:
             model: Model string recorded for provenance.
             timestamp: Integer timestamp (ns or s; caller-chosen but
                 stable, so identical fixtures replay byte-identically).
+            traceparent: Optional W3C traceparent context.
+            tracestate: Optional W3C tracestate context.
+            baggage: Optional W3C baggage context.
 
         Raises:
             ValueError: When ``artifact_path`` is absolute or contains a
@@ -383,6 +409,9 @@ class LineageSpine:
                 step_id=step_id,
                 model=model,
                 timestamp=timestamp,
+                traceparent=traceparent,
+                tracestate=tracestate,
+                baggage=baggage,
             )
             body = {
                 "v": SPINE_ENTRY_VERSION,
@@ -395,6 +424,12 @@ class LineageSpine:
                 "timestamp": timestamp,
                 "entry_hash": e_hash,
             }
+            if traceparent is not None:
+                body["traceparent"] = traceparent
+            if tracestate is not None:
+                body["tracestate"] = tracestate
+            if baggage is not None:
+                body["baggage"] = baggage
             tag = _compute_hmac(self._hmac_key, body)
             entry = SpineEntry(
                 v=SPINE_ENTRY_VERSION,
@@ -407,6 +442,9 @@ class LineageSpine:
                 timestamp=timestamp,
                 entry_hash=e_hash,
                 hmac=tag,
+                traceparent=traceparent,
+                tracestate=tracestate,
+                baggage=baggage,
             )
             self.run_dir.mkdir(parents=True, exist_ok=True)
             with self.spine_path.open("ab") as fh:
@@ -447,6 +485,9 @@ class LineageSpine:
                     timestamp=int(row["timestamp"]),
                     entry_hash=str(row["entry_hash"]),
                     hmac=str(row["hmac"]),
+                    traceparent=row.get("traceparent"),
+                    tracestate=row.get("tracestate"),
+                    baggage=row.get("baggage"),
                 )
             except (KeyError, TypeError, ValueError):
                 logger.debug("spine: skipping row with bad shape in %s", self.spine_path)
@@ -517,6 +558,9 @@ class LineageSpine:
                     step_id=str(row["step_id"]),
                     model=str(row["model"]),
                     timestamp=int(row["timestamp"]),
+                    traceparent=row.get("traceparent"),
+                    tracestate=row.get("tracestate"),
+                    baggage=row.get("baggage"),
                 )
             except (TypeError, ValueError):
                 errors.append(f"line {line_no}: unhashable field types")

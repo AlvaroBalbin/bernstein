@@ -25,11 +25,28 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+
+# Patch FastMCP FuncMetadata to support CreateTaskResult without validation error
+from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
+from mcp.types import (
+    CallToolResult,
+    CancelTaskRequest,
+    CancelTaskResult,
+    CreateTaskResult,
+    GetTaskPayloadRequest,
+    GetTaskRequest,
+    GetTaskResult,
+    ListTasksRequest,
+    ListTasksResult,
+    Task,
+    TextContent,
+)
 
 from bernstein.core.protocols.mcp.tool_tiers import (
     ToolTier,
@@ -43,6 +60,17 @@ from bernstein.mcp.input_validation import (
     to_jsonrpc_error,
     validate_tool_call,
 )
+
+_orig_convert_result = FuncMetadata.convert_result
+
+
+def _patched_convert_result(self, result: Any) -> Any:
+    if isinstance(result, CreateTaskResult):
+        return result
+    return _orig_convert_result(self, result)
+
+
+FuncMetadata.convert_result = _patched_convert_result
 
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8052"
 
@@ -127,6 +155,90 @@ def _register_health_tool(mcp: FastMCP[None]) -> None:
         return json.dumps({"status": "ok"})
 
 
+def _get_journal_head(task_id: str) -> str:
+    from pathlib import Path
+
+    from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+
+    run_id = task_run_id(task_id)
+    sdd_dir = Path.cwd() / ".sdd"
+    try:
+        journal_path = sdd_dir / "runs" / run_id / "journal.jsonl"
+        if journal_path.exists():
+            journal = EventJournal.resume(run_id, sdd_dir)
+            return journal.head()
+    except Exception:
+        pass
+    return ""
+
+
+def _project_task_helper(data: dict[str, Any]) -> Any:
+    from datetime import datetime
+
+    task_id = data["id"]
+    head_hash = _get_journal_head(task_id)
+    mcp_task_id = f"{task_id}:{head_hash}" if head_hash else task_id
+
+    # Map every Bernstein TaskStatus onto an MCP Tasks status. Terminal states
+    # MUST project to a terminal MCP status: a spec-compliant client only calls
+    # getTaskResult once get_task reports terminal, so leaving e.g. the normal
+    # ``done -> closed`` success path as "working" makes the client poll forever.
+    status_str = data.get("status", "open")
+    _MCP_STATUS_BY_TASK_STATUS = {
+        # in-progress / recoverable -> working
+        "open": "working",
+        "claimed": "working",
+        "in_progress": "working",
+        "waiting_for_subtasks": "working",
+        "orphaned": "working",
+        # needs input or approval -> input_required
+        "blocked": "input_required",
+        "pending_approval": "input_required",
+        "planned": "input_required",
+        "blocked_by_abandon": "input_required",
+        # terminal success -> completed
+        "done": "completed",
+        "closed": "completed",
+        # terminal failure -> failed
+        "failed": "failed",
+        "abandoned": "failed",
+        "refused": "failed",
+        # terminal cancel -> cancelled
+        "cancelled": "cancelled",
+    }
+    mcp_status = _MCP_STATUS_BY_TASK_STATUS.get(status_str)
+    if mcp_status is None:
+        logger.warning("Unrecognized task status %r; defaulting MCP status to working", status_str)
+        mcp_status = "working"
+
+    status_message = data.get("result_summary")
+    if not status_message:
+        if mcp_status == "working":
+            status_message = "Task is running"
+        elif mcp_status == "input_required":
+            status_message = "Task requires input or approval"
+        elif mcp_status == "completed":
+            status_message = "Task completed successfully"
+        elif mcp_status == "failed":
+            status_message = "Task failed"
+        elif mcp_status == "cancelled":
+            status_message = "Task was cancelled"
+
+    created_at_ts = data.get("created_at")
+    created_at = datetime.fromtimestamp(created_at_ts, tz=UTC) if created_at_ts else datetime.now(UTC)
+
+    return Task(
+        taskId=mcp_task_id,
+        status=mcp_status,
+        statusMessage=status_message,
+        createdAt=created_at,
+        lastUpdatedAt=datetime.now(UTC),
+        ttl=None,
+        pollInterval=5000,
+    )
+
+
 def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
     """Register read-only query tools: run, status, tasks, cost."""
 
@@ -138,6 +250,7 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
         scope: str = "medium",
         complexity: str = "medium",
         estimated_minutes: int = 30,
+        ctx: Context | None = None,
     ) -> str:
         """Start an orchestration run by posting a task to the Bernstein server.
 
@@ -175,10 +288,43 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 "complexity": complexity,
                 "estimated_minutes": estimated_minutes,
             }
+
+            client_supports_tasks = False
+            traceparent = None
+            tracestate = None
+            baggage = None
+
+            if ctx is not None:
+                try:
+                    rc = ctx.request_context
+                    if rc is not None:
+                        if rc.experimental is not None:
+                            client_supports_tasks = bool(getattr(rc.experimental, "client_supports_tasks", False))
+                        if rc.meta is not None:
+                            extra = rc.meta.model_extra or {}
+                            traceparent = extra.get("traceparent")
+                            tracestate = extra.get("tracestate")
+                            baggage = extra.get("baggage")
+                except Exception:
+                    pass
+
+            headers = _auth_headers()
+            if traceparent:
+                headers["traceparent"] = traceparent
+            if tracestate:
+                headers["tracestate"] = tracestate
+            if baggage:
+                headers["baggage"] = baggage
+
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-                resp = await client.post(f"{server_url}/tasks", json=payload, headers=_auth_headers())
+                resp = await client.post(f"{server_url}/tasks", json=payload, headers=headers)
                 resp.raise_for_status()
                 data: dict[str, Any] = resp.json()
+
+            if client_supports_tasks:
+                task_obj = _project_task_helper(data)
+                return CreateTaskResult(task=task_obj)
+
             return json.dumps(
                 {"task_id": data["id"], "title": data["title"], "status": data["status"]},
                 indent=2,
@@ -583,9 +729,11 @@ def _apply_cost_meter(mcp: FastMCP[None]) -> None:
         tool_name = tool.name
 
         @functools.wraps(original)
-        async def metered(*args: Any, __orig: Any = original, __name: str = tool_name, **kwargs: Any) -> str:
+        async def metered(*args: Any, __orig: Any = original, __name: str = tool_name, **kwargs: Any) -> Any:
             with measure_call(__name) as meter:
                 payload = await __orig(*args, **kwargs)
+            if not isinstance(payload, str):
+                return payload
             return wrap_envelope(payload, meter)
 
         tool.fn = metered
@@ -609,6 +757,85 @@ def _apply_tool_tier(mcp: FastMCP[None], active_tier: ToolTier) -> None:
     out_of_tier = [name for name in list(mcp._tool_manager._tools) if not tool_in_tier(name, active_tier)]
     for name in out_of_tier:
         mcp._tool_manager._tools.pop(name, None)
+
+
+def _register_tasks_extension(mcp: FastMCP[None], server_url: str) -> None:
+    """Register custom experimental handlers for the MCP Tasks extension."""
+    import httpx
+
+    @mcp._mcp_server.experimental.get_task()
+    async def get_task(req: GetTaskRequest) -> GetTaskResult:
+        parts = req.params.taskId.split(":", 1)
+        task_id = parts[0]
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.get(f"{server_url}/tasks/{task_id}", headers=_auth_headers())
+            resp.raise_for_status()
+            data = resp.json()
+        task_obj = _project_task_helper(data)
+        return GetTaskResult(
+            taskId=task_obj.taskId,
+            status=task_obj.status,
+            statusMessage=task_obj.statusMessage,
+            createdAt=task_obj.createdAt,
+            lastUpdatedAt=task_obj.lastUpdatedAt,
+            ttl=None,
+            pollInterval=5000,
+        )
+
+    @mcp._mcp_server.experimental.get_task_result()
+    async def get_task_result(req: GetTaskPayloadRequest) -> CallToolResult:
+        parts = req.params.taskId.split(":", 1)
+        task_id = parts[0]
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.get(f"{server_url}/tasks/{task_id}", headers=_auth_headers())
+            resp.raise_for_status()
+            data = resp.json()
+        status = data.get("status")
+        error_states = {"failed", "refused", "abandoned", "orphaned", "blocked_by_abandon"}
+        terminal_states = error_states | {"done", "closed", "cancelled"}
+        # Only a terminal task has a final result. Calling getTaskResult on an
+        # in-flight task must not fabricate a "Task completed" success.
+        if status not in terminal_states:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Result not available; task still {status}")],
+                isError=True,
+            )
+        is_error = status in error_states
+        result_summary = data.get("result_summary") or ""
+        if not result_summary:
+            result_summary = "Task failed" if is_error else "Task completed"
+        return CallToolResult(
+            content=[TextContent(type="text", text=result_summary)],
+            isError=is_error,
+        )
+
+    @mcp._mcp_server.experimental.list_tasks()
+    async def list_tasks(req: ListTasksRequest) -> ListTasksResult:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.get(f"{server_url}/tasks", headers=_auth_headers())
+            resp.raise_for_status()
+            tasks_data = resp.json()
+        mcp_tasks = [_project_task_helper(t) for t in tasks_data]
+        return ListTasksResult(tasks=mcp_tasks)
+
+    @mcp._mcp_server.experimental.cancel_task()
+    async def cancel_task(req: CancelTaskRequest) -> CancelTaskResult:
+        parts = req.params.taskId.split(":", 1)
+        task_id = parts[0]
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.post(f"{server_url}/tasks/{task_id}/cancel", headers=_auth_headers())
+            resp.raise_for_status()
+            data = resp.json()
+        task_obj = _project_task_helper(data)
+        return CancelTaskResult(
+            taskId=task_obj.taskId,
+            status=task_obj.status,
+            statusMessage=task_obj.statusMessage,
+            createdAt=task_obj.createdAt,
+            lastUpdatedAt=task_obj.lastUpdatedAt,
+            ttl=None,
+            pollInterval=5000,
+        )
 
 
 def create_mcp_server(
@@ -649,6 +876,7 @@ def create_mcp_server(
     _register_action_tools(mcp, server_url)
     _register_task_handle_tool(mcp)
     _register_skill_tools(mcp)
+    _register_tasks_extension(mcp, server_url)
     # rt-003: scenario <-> Routine bridge tools.
     from bernstein.mcp.routine_tools import register_scenario_tools
 
