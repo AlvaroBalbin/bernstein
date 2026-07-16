@@ -386,3 +386,89 @@ class TestRoleSkillMap:
 
     def test_docs_has_commit_protocol(self) -> None:
         assert "bernstein-commit-protocol.md" in ROLE_SKILL_MAP["docs"]
+
+
+class TestRevokedSkillGuard:
+    """Spawn-side kill switch: a signed revocation refuses injection (issue #2527)."""
+
+    def _make_skills_dir(self, tmp_path: Path) -> Path:
+        skills_dir = tmp_path / "templates" / "skills"
+        skills_dir.mkdir(parents=True)
+        for name in ("bernstein-completion-protocol", "bernstein-signal-check", "bernstein-test-runner"):
+            (skills_dir / f"{name}.md").write_text(
+                f"---\nname: {name}\ndescription: d\n---\nBody.\n",
+                encoding="utf-8",
+            )
+        return tmp_path / "templates" / "roles"
+
+    def _seed_revocation(self, workdir: Path, skill_id: str) -> None:
+        from bernstein.core.skills.catalog.fetcher import SkillCatalogFetcher, default_cache_path
+        from bernstein.core.skills.catalog.lockfile import CatalogLockEntry, upsert_catalog_install
+        from bernstein.core.skills.catalog.revocation import RevocationEntry, sign_revocation
+        from bernstein.core.skills.catalog.signature import generate_signer_keypair
+
+        priv, pub = generate_signer_keypair()
+        upsert_catalog_install(
+            workdir / "skills.lock",
+            CatalogLockEntry(
+                id=skill_id,
+                name=skill_id,
+                version="1.0.0",
+                manifest_url=f"github://acme/{skill_id}@v1.0.0",
+                manifest_sha256="a" * 64,
+                content_digest="b" * 64,
+                install_id="deadbeef",
+                chain_head="c" * 64,
+                installed_at="2026-07-16T00:00:00Z",
+            ),
+            workdir=workdir,
+        )
+        revocation = sign_revocation(
+            RevocationEntry(skill_id=skill_id, version_range="*", reason="CVE", issued_at="2026-07-16T00:00:00Z"),
+            priv,
+        )
+        SkillCatalogFetcher(cache_path=default_cache_path(workdir)).write_cache_payload(
+            {
+                "version": 1,
+                "generated_at": "2026-07-16T00:00:00Z",
+                "signer_pubkey": pub,
+                "entries": [
+                    {
+                        "id": skill_id,
+                        "name": skill_id,
+                        "version": "1.0.0",
+                        "description": "d",
+                        "source": {"kind": "github", "repo": f"acme/{skill_id}", "tag": "v1.0.0"},
+                        "content_digest": "b" * 64,
+                        "verified": True,
+                    }
+                ],
+                "revocations": [revocation.to_dict()],
+            }
+        )
+
+    def test_revoked_skill_is_not_injected_and_receipt_recorded(self, tmp_path: Path, monkeypatch: object) -> None:
+        from bernstein.core.security.audit import AuditLog
+
+        monkeypatch.setenv("BERNSTEIN_AUDIT_KEY_PATH", str(tmp_path / "audit.key"))  # type: ignore[attr-defined]
+        templates_dir = self._make_skills_dir(tmp_path)
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        self._seed_revocation(workdir, "bernstein-test-runner")
+
+        inject_skills(
+            workdir=workdir,
+            role="backend",  # backend injects bernstein-test-runner
+            tasks=[],
+            session_id="s-revoked",
+            templates_dir=templates_dir,
+        )
+
+        skills_out = workdir / ".claude" / "skills"
+        # The revoked skill is refused; an unaffected always-injected skill lands.
+        assert not (skills_out / "bernstein-test-runner.md").exists()
+        assert (skills_out / "bernstein-completion-protocol.md").exists()
+
+        log = AuditLog(workdir / ".sdd" / "audit")
+        events = log.query(event_type="skill.verification_refusal")
+        assert any(e.details["stage"] == "spawn" for e in events)

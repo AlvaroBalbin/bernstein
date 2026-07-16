@@ -113,17 +113,54 @@ class LineageReceipt:
 
 
 @dataclass(frozen=True)
+class TransparencyHead:
+    """One ``[[transparency_head]]`` row: the last verified catalog log head.
+
+    Recorded per catalog entry so the next install can verify a consistency
+    proof against it. A rewrite of an already-recorded state advances the head
+    inconsistently and the consistency proof against ``(tree_size, root_hash)``
+    fails -- the split-view / catalog-rewrite detection signature checking
+    alone cannot provide (issue #2527).
+
+    Attributes:
+        entry_id: The catalog entry this head was recorded for.
+        tree_size: Number of leaves in the log at record time.
+        root_hash: Merkle-Tree-Hash of the log at record time.
+        leaf_index: Index of the installed catalog state's leaf.
+        leaf_hash: Leaf digest of the installed catalog state.
+        signature: The signed head's detached signature.
+        recorded_at: ISO-8601 UTC string.
+    """
+
+    entry_id: str
+    tree_size: int
+    root_hash: str
+    leaf_index: int
+    leaf_hash: str
+    signature: str
+    recorded_at: str
+
+
+@dataclass(frozen=True)
 class CatalogLockState:
     """Parsed view of the catalog-extended ``skills.lock``."""
 
     local: list[LockEntry] = field(default_factory=list)
     catalog: list[CatalogLockEntry] = field(default_factory=list)
     receipts: list[LineageReceipt] = field(default_factory=list)
+    transparency: list[TransparencyHead] = field(default_factory=list)
 
     def find_catalog(self, entry_id: str) -> CatalogLockEntry | None:
         """Return the lock row for ``entry_id`` or ``None``."""
         for row in self.catalog:
             if row.id == entry_id:
+                return row
+        return None
+
+    def find_transparency(self, entry_id: str) -> TransparencyHead | None:
+        """Return the recorded transparency head for ``entry_id`` or ``None``."""
+        for row in self.transparency:
+            if row.entry_id == entry_id:
                 return row
         return None
 
@@ -222,7 +259,31 @@ def _read_catalog_state(path: Path) -> CatalogLockState:
             continue
         receipts.append(receipt)
 
-    return CatalogLockState(local=local, catalog=catalog_rows, receipts=receipts)
+    transparency: list[TransparencyHead] = []
+    for raw in cast("list[object]", data.get("transparency_head", [])):
+        if not isinstance(raw, dict):
+            continue
+        row = cast("dict[str, object]", raw)
+        try:
+            head = TransparencyHead(
+                entry_id=_required_str(row, "entry_id"),
+                tree_size=_required_int(row, "tree_size"),
+                root_hash=_required_str(row, "root_hash"),
+                leaf_index=_required_int(row, "leaf_index"),
+                leaf_hash=_required_str(row, "leaf_hash"),
+                signature=_required_str(row, "signature"),
+                recorded_at=_required_str(row, "recorded_at"),
+            )
+        except _MissingField:
+            continue
+        transparency.append(head)
+
+    return CatalogLockState(
+        local=local,
+        catalog=catalog_rows,
+        receipts=receipts,
+        transparency=transparency,
+    )
 
 
 class _MissingField(Exception):
@@ -233,6 +294,18 @@ def _required_str(row: dict[str, object], key: str) -> str:
     """Return ``row[key]`` as a string or raise :class:`_MissingField`."""
     value = row.get(key)
     if not isinstance(value, str) or not value:
+        raise _MissingField(key)
+    return value
+
+
+def _required_int(row: dict[str, object], key: str) -> int:
+    """Return ``row[key]`` as an int or raise :class:`_MissingField`.
+
+    Booleans are rejected (``bool`` is an ``int`` subclass) so a stray
+    ``true`` in the lockfile cannot masquerade as a tree size or leaf index.
+    """
+    value = row.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise _MissingField(key)
     return value
 
@@ -292,6 +365,20 @@ def _write_state(path: Path, state: CatalogLockState) -> None:
                 f"to_chain_head = {_toml_quote(receipt.to_chain_head)}",
                 f"manifest_sha256 = {_toml_quote(receipt.manifest_sha256)}",
                 f"timestamp = {_toml_quote(receipt.timestamp)}",
+                "",
+            )
+        )
+    for head in sorted(state.transparency, key=lambda h: h.entry_id):
+        lines.extend(
+            (
+                "[[transparency_head]]",
+                f"entry_id = {_toml_quote(head.entry_id)}",
+                f"tree_size = {head.tree_size}",
+                f"root_hash = {_toml_quote(head.root_hash)}",
+                f"leaf_index = {head.leaf_index}",
+                f"leaf_hash = {_toml_quote(head.leaf_hash)}",
+                f"signature = {_toml_quote(head.signature)}",
+                f"recorded_at = {_toml_quote(head.recorded_at)}",
                 "",
             )
         )
@@ -389,7 +476,12 @@ def upsert_catalog_install(
         )
         receipts = [*state.receipts, receipt]
 
-        new_state = CatalogLockState(local=state.local, catalog=catalog, receipts=receipts)
+        new_state = CatalogLockState(
+            local=state.local,
+            catalog=catalog,
+            receipts=receipts,
+            transparency=state.transparency,
+        )
         _write_state(lockfile_path, new_state)
         return new_state
     finally:
@@ -425,6 +517,34 @@ def record_pin(
             local=state.local,
             catalog=state.catalog,
             receipts=[*state.receipts, receipt],
+            transparency=state.transparency,
+        )
+        _write_state(lockfile_path, new_state)
+        return new_state
+    finally:
+        _release_lock(guard)
+
+
+def record_transparency_head(
+    lockfile_path: Path,
+    head: TransparencyHead,
+) -> CatalogLockState:
+    """Insert or replace the recorded transparency head for an entry.
+
+    The head is the anchor the next install's consistency proof is verified
+    against; recording it is what makes a later catalog rewrite detectable.
+    Written atomically alongside the rest of the lockfile.
+    """
+    guard = _acquire_lock(lockfile_path)
+    try:
+        state = _read_catalog_state(lockfile_path)
+        heads = [row for row in state.transparency if row.entry_id != head.entry_id]
+        heads.append(head)
+        new_state = CatalogLockState(
+            local=state.local,
+            catalog=state.catalog,
+            receipts=state.receipts,
+            transparency=heads,
         )
         _write_state(lockfile_path, new_state)
         return new_state
@@ -440,7 +560,8 @@ def remove_catalog_entry(
 
     Used by ``bernstein skills catalog uninstall``. The lockfile is
     rewritten atomically so concurrent readers either see the row or
-    don't.
+    don't. The recorded transparency head is retained so a reinstall still
+    verifies consistency against the last head this install saw.
     """
     guard = _acquire_lock(lockfile_path)
     try:
@@ -449,6 +570,7 @@ def remove_catalog_entry(
             local=state.local,
             catalog=[row for row in state.catalog if row.id != entry_id],
             receipts=state.receipts,
+            transparency=state.transparency,
         )
         _write_state(lockfile_path, new_state)
         return new_state
@@ -506,10 +628,12 @@ __all__ = [
     "CatalogLockEntry",
     "CatalogLockState",
     "LineageReceipt",
+    "TransparencyHead",
     "detect_drift",
     "fresh_install_id",
     "read_state",
     "record_pin",
+    "record_transparency_head",
     "remove_catalog_entry",
     "upsert_catalog_install",
     "worktree_id_for",

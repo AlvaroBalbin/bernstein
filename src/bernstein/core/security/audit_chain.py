@@ -124,6 +124,15 @@ EVENT_SKILL_INSTALL_RECEIPT = "skill.install_receipt"
 #: journal heads rather than from a mutable counter.
 EVENT_SKILL_USAGE = "skill.usage"
 
+#: Issue #2527 -- emitted whenever an install, doctor check, or spawn-side
+#: injection refuses a skill because a transparency (inclusion / consistency)
+#: proof failed or a signed revocation covers it. The chain-anchored refusal is
+#: independently verifiable: an operator can prove a known-bad version was
+#: contained, when, and why. See
+#: :mod:`bernstein.core.skills.catalog.transparency` and
+#: :mod:`bernstein.core.skills.catalog.revocation`.
+EVENT_SKILL_VERIFICATION_REFUSAL = "skill.verification_refusal"
+
 #: Issue #2306 -- emitted whenever a payment is authorized under a signed
 #: spending mandate. The event carries the consent receipt binding
 #: ``{mandate_hash, authorized_tool_calls_hash, settlement_ref,
@@ -1133,6 +1142,75 @@ def record_skill_usage(
             "run_id": run_id,
             "journal_head": journal_head,
         },
+    )
+
+
+@dataclass(frozen=True)
+class SkillVerificationRefusalDetails:
+    """Structured payload for the ``skill.verification_refusal`` event.
+
+    A refusal is recorded whenever an install, doctor check, or spawn-side
+    injection declines a skill because a transparency proof failed or a signed
+    revocation covers it. The receipt is chain-anchored and forensically
+    reconstructable: an operator can prove, from the audit chain alone, that a
+    known-bad version was refused, when, and why.
+    """
+
+    skill_id: str
+    stage: str
+    reason_code: str
+    detail: str
+    version: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "stage": self.stage,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "version": self.version,
+        }
+
+
+def record_skill_verification_refusal(
+    *,
+    chain: AuditChainStore,
+    skill_id: str,
+    stage: str,
+    reason_code: str,
+    detail: str,
+    version: str = "",
+    actor: str = "skill_catalog",
+) -> AuditEvent:
+    """Append a ``skill.verification_refusal`` event into *chain*.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        skill_id: Catalog id of the refused skill.
+        stage: Where the refusal happened -- ``"install"``, ``"doctor"``, or
+            ``"spawn"``.
+        reason_code: Machine-readable reason, e.g. ``"revoked"``,
+            ``"inclusion_proof_failed"``, ``"consistency_proof_failed"``.
+        detail: Human-readable explanation captured at refusal time.
+        version: The refused skill version, when known.
+        actor: Recorded actor; defaults to ``"skill_catalog"``.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded.
+    """
+    payload = SkillVerificationRefusalDetails(
+        skill_id=skill_id,
+        stage=stage,
+        reason_code=reason_code,
+        detail=detail,
+        version=version,
+    ).to_dict()
+    return chain.log_with_prev_digest(
+        event_type=EVENT_SKILL_VERIFICATION_REFUSAL,
+        actor=actor,
+        resource_type="skill_verification_refusal",
+        resource_id=skill_id,
+        details=payload,
     )
 
 
@@ -3873,6 +3951,7 @@ __all__ = [
     "EVENT_SIGNAL_GATE_PROJECTION",
     "EVENT_SKILL_INSTALL_RECEIPT",
     "EVENT_SKILL_USAGE",
+    "EVENT_SKILL_VERIFICATION_REFUSAL",
     "EVENT_SPEC_REQUIREMENT_SET",
     "EVENT_SPIFFE_SVID_BINDING",
     "EVENT_SUBAGENT_DELEGATION",
@@ -3892,6 +3971,7 @@ __all__ = [
     "MemoryWriteDetails",
     "MultimodalAttachDetails",
     "SkillInstallReceiptDetails",
+    "SkillVerificationRefusalDetails",
     "ThreadApprovalDetails",
     "reconstruct_mcp_call_order",
     "record_a2a_message_receipt",
@@ -3938,6 +4018,7 @@ __all__ = [
     "record_signal_gate_projection",
     "record_skill_install_receipt",
     "record_skill_usage",
+    "record_skill_verification_refusal",
     "record_spec_requirement_set",
     "record_spiffe_svid_binding",
     "record_subagent_delegation",

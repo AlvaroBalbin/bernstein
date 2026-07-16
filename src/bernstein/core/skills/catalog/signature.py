@@ -77,6 +77,12 @@ def canonical_entry_bytes(entry: SkillCatalogEntry) -> bytes:
         "homepage": entry.homepage,
         "tags": list(entry.tags),
     }
+    # Transitive-source pins are inside the signed envelope so the operator's
+    # key vouches for exactly what an install may pull in transitively. Added
+    # only when present so entries that declare no references keep byte-identical
+    # canonical bytes (and previously-issued signatures still verify).
+    if entry.references:
+        payload["references"] = [ref.to_dict() for ref in entry.references]
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -271,4 +277,5 @@ def attach_signature(entry: SkillCatalogEntry, signature: str) -> SkillCatalogEn
         homepage=entry.homepage,
         tags=entry.tags,
         verified=entry.verified,
+        references=entry.references,
     )

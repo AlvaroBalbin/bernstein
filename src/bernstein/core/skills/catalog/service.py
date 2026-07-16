@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,17 +40,30 @@ from bernstein.core.skills.catalog.installer import (
 from bernstein.core.skills.catalog.lockfile import (
     CATALOG_LOCK_FILENAME,
     CatalogLockEntry,
+    TransparencyHead,
     detect_drift,
     fresh_install_id,
     read_state,
     record_pin,
+    record_transparency_head,
     remove_catalog_entry,
     upsert_catalog_install,
+)
+from bernstein.core.skills.catalog.revocation import (
+    RevocationEntry,
+    parse_revocations,
 )
 from bernstein.core.skills.catalog.signature import (
     ManifestSignatureError,
     VerificationOutcome,
     verify_entry,
+)
+from bernstein.core.skills.catalog.transparency import (
+    InclusionReceipt,
+    TransparencyVerificationError,
+    build_inclusion_receipt,
+    leaf_hash_for_state,
+    parse_catalog_envelope,
 )
 from bernstein.core.skills.lifecycle import (
     InstallScope,
@@ -74,6 +88,11 @@ logger = logging.getLogger(__name__)
 
 _GENESIS_HEAD = "0" * 64
 
+#: Default poll interval (5 minutes) for the revocation kill switch. Bounds how
+#: long a compromised skill can keep being injected after a signed revocation
+#: is published (issue #2527).
+DEFAULT_REVOCATION_POLL_SECONDS = 5 * 60
+
 
 class SkillCatalogError(RuntimeError):
     """Raised on operator-visible catalog failures (not signature-specific)."""
@@ -94,6 +113,7 @@ class InstallOutcome:
     chain_head: str
     verified: bool
     verification_reason: str = ""
+    inclusion_receipt: InclusionReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +126,31 @@ class UpgradeOutcome:
     applied: bool
     skipped_reason: str = ""
     install: InstallOutcome | None = None
+
+
+@dataclass(frozen=True)
+class EntryVerifyResult:
+    """Per-entry outcome of ``bernstein skills catalog verify``."""
+
+    entry_id: str
+    version: str
+    ok: bool
+    detail: str
+    pinned_references: int = 0
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    """Offline verification report for ``bernstein skills catalog verify``."""
+
+    ok: bool
+    entries_checked: int
+    results: tuple[EntryVerifyResult, ...]
+    revoked: tuple[str, ...]
+
+    def failures(self) -> list[EntryVerifyResult]:
+        """Return the failing per-entry results."""
+        return [r for r in self.results if not r.ok]
 
 
 @dataclass(frozen=True)
@@ -136,6 +181,8 @@ class SkillCatalogServiceConfig:
     home: Path | None = None
     check_interval_seconds: int = DEFAULT_CHECK_INTERVAL_SECONDS
     audit_key_path: Path | None = None
+    require_transparency: bool = False
+    revocation_poll_interval_seconds: int = DEFAULT_REVOCATION_POLL_SECONDS
 
 
 class SkillCatalogService:
@@ -264,6 +311,17 @@ class SkillCatalogService:
                 f"signature verification failed for {entry_id!r}: {outcome.reason}",
             )
 
+        # Kill switch: a signed revocation covering this exact version is
+        # refused here so the install never even stages a known-bad skill.
+        self._enforce_revocation_at_install(catalog, entry)
+
+        # Transparency: require an inclusion proof for the fetched catalog
+        # state under a signed head, and a consistency proof against the last
+        # head recorded in ``skills.lock``. Refuse (with a chain-anchored
+        # refusal receipt) on any failure. Returns ``None`` for a legacy
+        # catalog that ships no transparency envelope.
+        inclusion_receipt = self._verify_transparency(catalog, entry)
+
         # Audit replay check: compare upstream manifest sha against the
         # chain's known-good set. A mismatch on a previously-installed
         # entry means upstream drifted; refuse.
@@ -353,6 +411,22 @@ class SkillCatalogService:
             from_chain_head=prev_chain_digest,
         )
 
+        # Record the verified transparency head so the *next* install can prove
+        # a consistency proof against it (rewrite / split-view detection).
+        if inclusion_receipt is not None:
+            record_transparency_head(
+                self.lockfile_path,
+                TransparencyHead(
+                    entry_id=entry.id,
+                    tree_size=inclusion_receipt.head.tree_size,
+                    root_hash=inclusion_receipt.head.root_hash,
+                    leaf_index=inclusion_receipt.leaf_index,
+                    leaf_hash=inclusion_receipt.leaf_hash,
+                    signature=inclusion_receipt.head.signature,
+                    recorded_at=datetime.now(tz=UTC).isoformat(),
+                ),
+            )
+
         # Anchor an install receipt in the lineage spine (issue #2301). The
         # receipt's canonical bytes are the spine-hashed artifact, so its
         # anchor is a chain-verifiable identity for the install; a matching
@@ -375,6 +449,7 @@ class SkillCatalogService:
             chain_head=chain_head,
             verified=outcome.verified,
             verification_reason=outcome.reason,
+            inclusion_receipt=inclusion_receipt,
         )
 
     @property
@@ -433,6 +508,123 @@ class SkillCatalogService:
             )
         except Exception as exc:
             logger.warning("skill install receipt emission failed for %s: %s", skill_hash, exc)
+
+    # ------------------------------------------------------------------
+    # Transparency + revocation enforcement (issue #2527)
+    # ------------------------------------------------------------------
+
+    def _verified_revocations(self, catalog: SkillCatalog) -> list[RevocationEntry]:
+        """Return the catalog's signed revocations that verify against its key."""
+        if not catalog.revocations:
+            return []
+        return parse_revocations(catalog.revocations, catalog.signer_pubkey)
+
+    def _enforce_revocation_at_install(self, catalog: SkillCatalog, entry: SkillCatalogEntry) -> None:
+        """Refuse an install whose ``(id, version)`` is covered by a revocation."""
+        for revocation in self._verified_revocations(catalog):
+            if revocation.covers(entry.id, entry.version):
+                detail = (
+                    f"skill {entry.id!r} version {entry.version} is revoked ({revocation.reason}); refusing install"
+                )
+                self._record_refusal(
+                    skill_id=entry.id,
+                    version=entry.version,
+                    stage="install",
+                    reason_code="revoked",
+                    detail=detail,
+                )
+                raise SkillCatalogError(detail)
+
+    def _verify_transparency(
+        self,
+        catalog: SkillCatalog,
+        entry: SkillCatalogEntry,
+    ) -> InclusionReceipt | None:
+        """Verify the catalog transparency envelope for an install.
+
+        Returns the verified :class:`InclusionReceipt` when the catalog ships a
+        transparency envelope, or ``None`` for a legacy catalog when
+        ``require_transparency`` is off. Refuses (recording a chain-anchored
+        refusal receipt) on any proof failure.
+        """
+        envelope = catalog.transparency
+        if envelope is None:
+            if self._config.require_transparency:
+                detail = (
+                    f"catalog for {entry.id!r} ships no transparency log head; "
+                    "refusing install under require_transparency"
+                )
+                self._record_refusal(
+                    skill_id=entry.id,
+                    version=entry.version,
+                    stage="install",
+                    reason_code="missing_transparency",
+                    detail=detail,
+                )
+                raise SkillCatalogError(detail)
+            return None
+
+        prior = read_state(self.lockfile_path).find_transparency(entry.id)
+        prev_size = prior.tree_size if prior is not None else 0
+        prev_root = prior.root_hash if prior is not None else ""
+        try:
+            view = parse_catalog_envelope(envelope)
+            state_leaf = leaf_hash_for_state(catalog.to_dict())
+            receipt = build_inclusion_receipt(
+                view,
+                entry_digest=entry.content_digest,
+                state_leaf=state_leaf,
+                prev_tree_size=prev_size,
+                prev_root_hash=prev_root,
+            )
+            receipt.verify(catalog.signer_pubkey)
+        except TransparencyVerificationError as exc:
+            reason_code = "consistency_proof_failed" if "consistency" in str(exc) else "inclusion_proof_failed"
+            detail = f"transparency verification failed for {entry.id!r}: {exc}"
+            self._record_refusal(
+                skill_id=entry.id,
+                version=entry.version,
+                stage="install",
+                reason_code=reason_code,
+                detail=detail,
+            )
+            raise SkillCatalogError(detail) from exc
+        return receipt
+
+    def _record_refusal(
+        self,
+        *,
+        skill_id: str,
+        version: str,
+        stage: str,
+        reason_code: str,
+        detail: str,
+    ) -> None:
+        """Append a chain-anchored ``skill.verification_refusal`` receipt.
+
+        Never raises into the refusal path: recording the receipt must not mask
+        the underlying refusal, which is surfaced by the caller regardless.
+        """
+        from bernstein.core.security.audit import load_or_create_audit_key
+        from bernstein.core.security.audit_chain import (
+            AuditChainStore,
+            record_skill_verification_refusal,
+        )
+
+        try:
+            hmac_key = load_or_create_audit_key(self._config.audit_key_path)
+            audit_dir = self._config.workdir / ".sdd" / "audit"
+            chain = AuditChainStore(audit_dir, key=hmac_key)
+            record_skill_verification_refusal(
+                chain=chain,
+                skill_id=skill_id,
+                stage=stage,
+                reason_code=reason_code,
+                detail=detail,
+                version=version,
+            )
+        except Exception as exc:  # pragma: no cover - refusal receipt is best-effort
+            logger.warning("skill refusal receipt emission failed for %s: %s", skill_id, exc)
 
     def upgrade(
         self,
@@ -600,6 +792,102 @@ class SkillCatalogService:
         raise SkillCatalogError(f"unknown action {action!r}; expected 'adopt' or 'pin'")
 
     # ------------------------------------------------------------------
+    # Offline verification (issue #2527)
+    # ------------------------------------------------------------------
+
+    def verify(self, *, force_refresh: bool = False) -> VerifyReport:
+        """Verify the catalog offline: transitive pins, inclusion, revocations.
+
+        For every entry this proves each transitive source is pinned by digest;
+        for every entry that ships a transparency envelope it verifies the
+        inclusion proof (and, for an installed entry, a consistency proof
+        against the head recorded in ``skills.lock``) against the signer key;
+        and it fails any installed entry a signed revocation covers.
+
+        A fetch that fails strict validation (an unpinned transitive source is
+        rejected at parse time) raises :class:`SkillCatalogValidationError`; the
+        CLI turns that into a failing report.
+        """
+        catalog = self.browse(force_refresh=force_refresh)
+        lock = read_state(self.lockfile_path)
+        revocations = self._verified_revocations(catalog)
+        revoked_ids = {
+            row.id for row in lock.catalog for revocation in revocations if revocation.covers(row.id, row.version)
+        }
+
+        envelope = catalog.transparency
+        view = None
+        state_leaf = None
+        envelope_error = ""
+        if envelope is not None:
+            try:
+                view = parse_catalog_envelope(envelope)
+                state_leaf = leaf_hash_for_state(catalog.to_dict())
+            except TransparencyVerificationError as exc:
+                envelope_error = str(exc)
+
+        results: list[EntryVerifyResult] = []
+        for entry in catalog.entries:
+            ok = True
+            details: list[str] = []
+
+            for index, ref in enumerate(entry.references):
+                if not re.fullmatch(r"[0-9a-f]{64}", ref.digest):
+                    ok = False
+                    details.append(f"reference[{index}] is not pinned by a valid digest")
+            if entry.references:
+                details.append(f"{len(entry.references)} transitive source(s) pinned")
+
+            recorded = lock.find_transparency(entry.id)
+            if envelope is not None:
+                if view is None:
+                    ok = False
+                    details.append(f"transparency envelope invalid: {envelope_error}")
+                else:
+                    prev_size = recorded.tree_size if recorded is not None else 0
+                    prev_root = recorded.root_hash if recorded is not None else ""
+                    try:
+                        receipt = build_inclusion_receipt(
+                            view,
+                            entry_digest=entry.content_digest,
+                            state_leaf=state_leaf or "",
+                            prev_tree_size=prev_size,
+                            prev_root_hash=prev_root,
+                        )
+                        receipt.verify(catalog.signer_pubkey)
+                        details.append(f"inclusion proof verified under signed head size={view.head.tree_size}")
+                        if prev_size > 0:
+                            details.append("consistency proof verified against recorded head")
+                    except TransparencyVerificationError as exc:
+                        ok = False
+                        details.append(f"transparency verification failed: {exc}")
+            elif recorded is not None:
+                ok = False
+                details.append("recorded transparency head but catalog ships no envelope to verify it")
+
+            if entry.id in revoked_ids:
+                ok = False
+                details.append("installed version is under a signed revocation")
+
+            results.append(
+                EntryVerifyResult(
+                    entry_id=entry.id,
+                    version=entry.version,
+                    ok=ok,
+                    detail="; ".join(details) or "ok",
+                    pinned_references=len(entry.references),
+                )
+            )
+
+        overall = all(r.ok for r in results)
+        return VerifyReport(
+            ok=overall,
+            entries_checked=len(results),
+            results=tuple(results),
+            revoked=tuple(sorted(revoked_ids)),
+        )
+
+    # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
@@ -624,7 +912,9 @@ class SkillCatalogService:
 
 
 __all__ = [
+    "DEFAULT_REVOCATION_POLL_SECONDS",
     "CatalogStatus",
+    "EntryVerifyResult",
     "InstallOutcome",
     "ManifestSignatureError",
     "SkillCatalogError",
@@ -632,4 +922,5 @@ __all__ = [
     "SkillCatalogServiceConfig",
     "UpgradeOutcome",
     "VerificationOutcome",
+    "VerifyReport",
 ]

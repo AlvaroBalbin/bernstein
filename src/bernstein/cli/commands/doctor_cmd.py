@@ -623,6 +623,50 @@ def check_knob_matrix_advisory() -> dict[str, Any]:
     }
 
 
+def check_skill_revocations() -> list[dict[str, Any]]:
+    """Flag catalog-installed skills covered by a signed revocation (issue #2527).
+
+    Reads the project's cached catalog and ``skills.lock`` and reports every
+    installed version a *signed* revocation covers, so an operator sees the
+    fleet-wide kill switch's effect within one poll interval. Advisory: it
+    never fails the process, and any error degrades to a single WARN row rather
+    than masking other checks.
+    """
+    try:
+        from bernstein.core.skills.catalog.enforcement import revoked_install_report
+
+        refused = revoked_install_report(Path.cwd())
+    except Exception as exc:  # pragma: no cover - defensive; advisory surface
+        return [
+            {
+                "name": "Skill revocations",
+                "status": _CHECK_WARN,
+                "detail": f"could not evaluate revocations: {exc}",
+                "fix": "",
+            }
+        ]
+
+    if not refused:
+        return [
+            {
+                "name": "Skill revocations",
+                "status": _CHECK_PASS,
+                "detail": "no installed skill is under a signed revocation",
+                "fix": "",
+            }
+        ]
+
+    return [
+        {
+            "name": f"Skill revocation: {item.skill_id} {item.version}",
+            "status": _CHECK_FAIL,
+            "detail": f"revoked ({item.reason}); range {item.version_range}",
+            "fix": f"Uninstall or upgrade {item.skill_id} out of {item.version_range}",
+        }
+        for item in refused
+    ]
+
+
 def check_eval_gate_min_n_advisory(workdir: Path | None = None) -> dict[str, Any]:
     """Warn when a stored eval gate decision was taken below the minimum n (#2520).
 
@@ -672,6 +716,7 @@ def run_all_checks() -> list[dict[str, Any]]:
     checks.extend(check_canary_last_green())
     checks.append(check_price_table_advisory())
     checks.append(check_knob_matrix_advisory())
+    checks.extend(check_skill_revocations())
     checks.append(check_eval_gate_min_n_advisory())
     checks.extend(check_api_keys())
     checks.extend(
