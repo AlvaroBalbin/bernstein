@@ -8,10 +8,10 @@ Sparklines are rendered with unicode block characters. Each tick is one daily sn
 
 | metric | sparkline | first | latest | min | max |
 | --- | --- | ---: | ---: | ---: | ---: |
-| coverage_pct | `▁▇▇▇▇▇▇█▁` | 13.50 | 13.50 | 13.50 | 81.00 |
-| code_smells | `█        ` | 153.00 | 13.00 | 0.00 | 153.00 |
+| coverage_pct | `▁▇▇▇▇▇▇▇█` | 13.50 | 81.10 | 13.50 | 81.10 |
+| code_smells | `█        ` | 153.00 | 14.00 | 0.00 | 153.00 |
 | bugs | `█        ` | 11.00 | 0.00 | 0.00 | 11.00 |
-| vulnerabilities | `▅      ██` | 2.00 | 3.00 | 0.00 | 3.00 |
+| vulnerabilities | `▅      █▂` | 2.00 | 1.00 | 0.00 | 3.00 |
 
 ## glitchtip
 
@@ -33,7 +33,7 @@ Sparklines are rendered with unicode block characters. Each tick is one daily sn
 
 | metric | sparkline | first | latest | min | max |
 | --- | --- | ---: | ---: | ---: | ---: |
-| open_alerts | `▂█ ▂  ▃  ` | 6.00 | 2.00 | 0.00 | 17.00 |
+| open_alerts | `▂█ ▂  ▃ ▁` | 6.00 | 4.00 | 0.00 | 17.00 |
 | critical_alerts | `         ` | 0.00 | 0.00 | 0.00 | 0.00 |
 | high_alerts | `   █  ▄ ▂` | 0.00 | 1.00 | 0.00 | 4.00 |
 
