@@ -1,6 +1,6 @@
 # CLI Reference
 
-Bernstein ships **174 CLI commands** registered in `cli/main.py`. This page is the single-source reference for every flag on every visible command. For driving Bernstein from a script, also read [`cli/task-lifecycle.md`](cli/task-lifecycle.md) and [`cli/replay.md`](cli/replay.md).
+Bernstein ships a large surface of CLI commands registered in `cli/main.py`. This page is the single-source reference for every flag on every visible command. For driving Bernstein from a script, also read [`cli/task-lifecycle.md`](cli/task-lifecycle.md) and [`cli/replay.md`](cli/replay.md).
 
 > **Find a command fast:** `Ctrl-F` for the command name. Every entry below cites its source as `cli/<file>:<line>`.
 > **Get rich help in the terminal:** `bernstein --help` (root rich-formatted help) and `bernstein help-all` (the same, exhaustive). Per-command help: `bernstein <command> --help` works on every visible command and group.
@@ -48,7 +48,7 @@ Any global flag may also be set via `bernstein.yaml` (e.g. `budget: 5.00`); the 
 
 ## Commands by category
 
-The 174 commands are organised below by purpose, not alphabetically. Use the table inside each category for quick lookup; the longer per-command entries follow for the highest-traffic commands.
+The commands are organised below by purpose, not alphabetically. Use the table inside each category for quick lookup; the longer per-command entries follow for the highest-traffic commands.
 
 ### Conventions
 
@@ -181,7 +181,7 @@ End a session with a summary, retrospective, and learning capture. Hides under n
 | `bernstein tasks` | Alias of `bernstein plan`. | `cli/main.py:706` |
 | `bernstein merge` | Merge a completed task's worktree. | `cli/commands/merge_cmd.py:64` |
 | `bernstein review` | Trigger queue review or run a review pipeline. | `cli/commands/task_cmd.py:175` |
-| `bernstein verify` | Verify WAL integrity, execution determinism, memory provenance, formal properties, or a wheelhouse. | `cli/verify_cmd.py` |
+| `bernstein verify` | Verify WAL integrity, execution determinism, memory provenance, formal properties, or a wheelhouse. | `cli/commands/verify_cmd.py` |
 | `bernstein from-ticket FILE` | Generate tasks from a ticket file. | `cli/commands/ticket_cmd.py:231` |
 | `bernstein ticket` | Ticket integration group. | `cli/commands/ticket_cmd.py:246` |
 | `bernstein validate PLAN.yaml` | Validate a plan file's schema. | `cli/plan_validate_cmd.py:142` |
@@ -349,7 +349,7 @@ set. (`cli/commands/advanced_cmd.py`, `core/observability/otel_projection.py`.)
 
 | Command | Purpose | Source |
 |---|---|---|
-| `bernstein verify` | Verify WAL integrity, execution determinism, memory provenance, formal properties, or a wheelhouse. | `cli/verify_cmd.py` |
+| `bernstein verify` | Verify WAL integrity, execution determinism, memory provenance, formal properties, or a wheelhouse. | `cli/commands/verify_cmd.py` |
 | `bernstein autofix` | Auto-repair CI failures (group). | `cli/commands/autofix_cmd.py:172` |
 | `bernstein ci` | CI integration commands (group). | `cli/commands/ci_cmd.py:49` |
 | `bernstein chaos` | Chaos engineering (group). | `cli/commands/chaos_cmd.py:32` |
@@ -456,7 +456,7 @@ Show what changed between two task states.
 |---|---|---|
 | `bernstein agents` | Agent catalog ops (group). | `cli/commands/agents_cmd.py:22` |
 | `bernstein test-adapter` | Spawn one adapter to verify its plumbing. | `cli/adapter_cmd.py:84` |
-| `bernstein worker` | Join a cluster as a remote worker node. | `cli/worker_cmd.py:371` |
+| `bernstein worker` | Join a cluster as a remote worker node. | `cli/commands/worker_cmd.py` |
 | `bernstein evolve` | Self-improvement loop. | `cli/evolve_cmd.py:48` |
 
 #### `bernstein agents`
@@ -588,7 +588,7 @@ digest. (`cli/commands/skill_cmd.py`.)
 | Command | Purpose | Source |
 |---|---|---|
 | `bernstein cloud` | Cloudflare cloud agent ops (group). | `cli/commands/cloud_cmd.py:35` |
-| `bernstein worker` | Join a cluster as worker (see [Adapters & agents](#adapters-agents)). | `cli/worker_cmd.py:371` |
+| `bernstein worker` | Join a cluster as worker (see [Adapters & agents](#adapters-agents)). | `cli/commands/worker_cmd.py` |
 | `bernstein gateway` | Gateway mgmt (group). | `cli/commands/gateway_cmd.py:28` |
 | `bernstein tunnel` | Tunnel mgmt (group). | `cli/commands/tunnel_cmd.py:62` |
 | `bernstein remote` | Remote-host execution (group). | `cli/commands/remote_cmd.py:52` |
@@ -828,7 +828,7 @@ hashes; the command exits non-zero otherwise.
 | `list` | List quarantined tasks. |
 | `clear` | Clear all quarantined tasks. `--confirm` to skip prompt. |
 
-(`cli/commands/advanced_cmd.py:1120-1174`.)
+(`cli/commands/advanced_cmd.py`.)
 
 #### `bernstein approve-tool` / `bernstein reject-tool`
 

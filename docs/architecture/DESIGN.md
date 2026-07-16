@@ -24,7 +24,7 @@ CLI (src/bernstein/cli/)
         -> Adapter-based process spawning (adapters/)
 ```
 
-Since v1.6, `core/` is organized into 55 sub-packages. Top-level modules like `core/server.py`, `core/orchestrator.py`, `core/spawner.py`, `core/task_lifecycle.py`, and `core/models.py` are thin re-export shims that redirect to their sub-packages.
+Since v1.6, `core/` is organized into ~60 sub-packages. Top-level modules like `core/server.py`, `core/orchestrator.py`, `core/spawner.py`, `core/task_lifecycle.py`, and `core/models.py` are thin re-export shims that redirect to their sub-packages.
 
 Primary orchestration modules:
 
@@ -85,6 +85,9 @@ Current source adapters:
 - `src/bernstein/core/trigger_sources/discord.py`
 - `src/bernstein/core/trigger_sources/file_watch.py`
 - `src/bernstein/core/trigger_sources/webhook.py`
+- `src/bernstein/core/trigger_sources/webhook_node.py`
+- `src/bernstein/core/trigger_sources/routine.py`
+- `src/bernstein/core/trigger_sources/schedule.py`
 
 Configuration source:
 
@@ -99,7 +102,7 @@ Boundary: trigger infrastructure is real and usable, but project-specific rule l
 Implemented pieces:
 
 - Worker CLI: `src/bernstein/cli/commands/worker_cmd.py`
-- Cluster data model/policy: `src/bernstein/core/protocols/cluster.py`
+- Cluster data model/policy: `src/bernstein/core/protocols/cluster/`
 - Cluster API routes in `src/bernstein/core/routes/task_cluster.py` and `src/bernstein/core/routes/tasks.py`
 
 Boundary:
@@ -303,4 +306,4 @@ transition table and events reference.
 
 - This file is not a roadmap backlog.
 - This file is not a generated protocol matrix.
-- This file is not a per-command CLI reference (see `GETTING_STARTED.md` and `bernstein --help`).
+- This file is not a per-command CLI reference (see [`getting-started/install.md`](../getting-started/install.md) and `bernstein --help`).
