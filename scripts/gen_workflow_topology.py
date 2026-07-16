@@ -202,6 +202,9 @@ def render_report(workflows: tuple[WorkflowInfo, ...]) -> str:
         "",
         "This report lists the workflow graph surfaces reviewers need to inspect when CI topology changes.",
         "",
+        "Drift on `main` self-heals: `.github/workflows/ci-topology-heal.yml` regenerates this report",
+        "after workflow changes merge and opens a squash auto-merge PR when the committed copy is stale.",
+        "",
         "## Workflow Summary",
         "",
     ]

@@ -1,0 +1,141 @@
+name: CI topology heal
+
+# Post-merge self-heal for docs/operations/ci-topology.md.
+#
+# Why this workflow exists
+# ------------------------
+# tests/unit/test_workflow_topology_report.py requires the committed report
+# to match the generator output for .github/workflows/**. Branch protection
+# does not require PR branches to be up to date with main, so when two PRs
+# that both edit workflow files merge close together, the second one lands
+# with a report regenerated against a pre-merge main. The committed report
+# on main then stays stale (CI red on main) until some later PR happens to
+# regenerate it.
+#
+# What it does
+# ------------
+# Every push to main that touches .github/workflows/** reruns the generator
+# against the merged tree. If the committed report differs, the workflow
+# opens (or force-updates) a PR on the fixed branch chore/ci-topology-heal
+# with the regenerated report and enables squash auto-merge. ci.yml
+# un-ignores docs/operations/ci-topology.md, so the heal PR runs the real
+# CI gate (including the freshness test) before auto-merge fires. When a
+# later push makes the report current again, the same action deletes the
+# now-empty branch and the open heal PR closes.
+#
+# Loop guards
+# -----------
+#   * The heal PR only ever contains docs/operations/ci-topology.md
+#     (add-paths), which cannot match this workflow's paths filter, so
+#     merging a heal PR can never retrigger this workflow.
+#   * Fixed concurrency group with cancel-in-progress so a burst of merges
+#     collapses into one run against the newest main tree.
+#   * Idempotent PR branch: reruns update the existing heal PR in place
+#     instead of stacking new ones.
+#
+# Token requirements
+# ------------------
+# BERNSTEIN_AUTOSYNC_TOKEN (the same PAT pre-merge-autosync uses; needs
+# contents:write + pull-requests:write on this repo) is preferred for both
+# the PR creation and the auto-merge enable: PRs created with GITHUB_TOKEN
+# do not trigger pull_request workflows, so their required checks never
+# report and auto-merge never fires. With the GITHUB_TOKEN fallback the
+# heal PR still opens, but the operator has to merge it by hand.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-topology-heal
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  heal:
+    name: Regenerate topology report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    # Canonical repo only: forks have neither the autosync token nor the
+    # branch-protection setup this flow assumes.
+    if: github.repository == 'sipyourdrink-ltd/bernstein'
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: '3.13'
+
+      - name: Install project dependencies
+        run: uv sync --no-dev --frozen
+
+      - name: Regenerate the topology report
+        run: uv run python scripts/gen_workflow_topology.py --update
+
+      - name: Report drift status
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/operations/ci-topology.md; then
+            echo "::notice::Committed topology report is current; no heal PR needed."
+          else
+            echo "::notice::Topology report drifted from the merged workflow graph; opening heal PR."
+            git --no-pager diff --stat -- docs/operations/ci-topology.md
+          fi
+
+      - name: Open or update the heal PR
+        id: heal_pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          branch: chore/ci-topology-heal
+          delete-branch: true
+          add-paths: |
+            docs/operations/ci-topology.md
+          commit-message: |
+            docs(ci): regenerate workflow topology report
+
+            A workflow change merged while its topology report was generated
+            against an older main, leaving docs/operations/ci-topology.md
+            stale. Regenerated from the current main workflow graph by
+            ci-topology-heal.yml.
+          title: 'docs(ci): regenerate workflow topology report'
+          body: |
+            The committed `docs/operations/ci-topology.md` no longer matches
+            the workflow graph on `main`. This happens when two PRs that both
+            edit `.github/workflows/**` merge close together: the second PR
+            regenerated the report against a pre-merge `main`, so the merged
+            result is stale and `test_workflow_topology_report_is_current`
+            fails on `main` until the report is refreshed.
+
+            This PR carries the report regenerated from the current `main`
+            tree by `.github/workflows/ci-topology-heal.yml`. Squash
+            auto-merge is enabled; no manual action is needed.
+          labels: |
+            ci
+            documentation
+
+      - name: Enable auto-merge (squash)
+        if: >-
+          steps.heal_pr.outputs.pull-request-operation == 'created' ||
+          steps.heal_pr.outputs.pull-request-operation == 'updated'
+        env:
+          GH_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ steps.heal_pr.outputs.pull-request-url }}
+        run: gh pr merge --auto --squash "$PR_URL"
