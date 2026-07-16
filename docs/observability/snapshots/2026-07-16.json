@@ -15,16 +15,16 @@
       "metrics": [
         {
           "name": "coverage_pct",
-          "value": "13.5%",
-          "numeric": 13.5,
+          "value": "81.1%",
+          "numeric": 81.1,
           "threshold": "80.0%",
-          "threshold_status": "fail",
+          "threshold_status": "ok",
           "delta": "new"
         },
         {
           "name": "code_smells",
-          "value": "13",
-          "numeric": 13.0,
+          "value": "14",
+          "numeric": 14.0,
           "threshold": "50",
           "threshold_status": "ok",
           "delta": "new"
@@ -39,8 +39,8 @@
         },
         {
           "name": "vulnerabilities",
-          "value": "3",
-          "numeric": 3.0,
+          "value": "1",
+          "numeric": 1.0,
           "threshold": "0",
           "threshold_status": "warn",
           "delta": "new"
@@ -162,13 +162,13 @@
     {
       "backend": "code-scanning",
       "status": "warn",
-      "detail": "2 open alert(s)",
+      "detail": "4 open alert(s)",
       "error": null,
       "metrics": [
         {
           "name": "open_alerts",
-          "value": "2",
-          "numeric": 2.0,
+          "value": "4",
+          "numeric": 4.0,
           "threshold": "0",
           "threshold_status": "warn",
           "delta": "new"
