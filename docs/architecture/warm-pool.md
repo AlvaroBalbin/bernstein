@@ -16,6 +16,25 @@ of this page explains lifecycle, sizing, and when to disable.
 
 ---
 
+## What is a worktree slot?
+
+A **worktree slot** is one pre-provisioned unit of the warm pool: a
+ready-to-claim git worktree (plus, optionally, a pre-started MCP server
+process) reserved for the next agent spawn. Each slot is a `PoolSlot`
+object with its own `slot_id`, a target role, a `worktree_path` on
+disk, and a `ready → claimed → expired` lifecycle. When a task
+arrives, the spawner claims a ready slot and skips the 5–15 s
+`git worktree add` cold-start; the pool then provisions a replacement
+slot in the background. `warm_pool.max_slots` caps how many slots sit
+idle at once.
+
+Worktree slots are about spawn latency. They are distinct from the
+concurrency slots that adaptive parallelism manages (how many agents
+run at once) and from cluster `--slots` (how many workers a remote node
+offers).
+
+---
+
 ## The problem: agent cold-start latency
 
 A fresh spawn does five sequential things:
