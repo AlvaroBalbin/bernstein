@@ -266,7 +266,6 @@ This report lists the workflow graph surfaces reviewers need to inspect when CI 
 | .github/workflows/docs-drift.yml | drift-check: upload docs-drift-report |
 | .github/workflows/eval-nightly.yml | bench: upload eval-nightly-${{ github.run_id }}<br>smoke: upload eval-nightly-smoke |
 | .github/workflows/flake-quarantine.yml | detect-and-quarantine: upload xflaky-reports |
-| .github/workflows/glitchtip-insights.yml | sweep: upload glitchtip-sweep |
 | .github/workflows/license-compliance.yml | license-check: upload license-report |
 | .github/workflows/mutation-fixed.yml | mutate: upload mutation-${{ matrix.module }}<br>summary: download - |
 | .github/workflows/nightly-deep-tests.yml | bandit-medium-and-high: upload nightly-bandit-results<br>mutmut-full: upload nightly-mutmut-results |
