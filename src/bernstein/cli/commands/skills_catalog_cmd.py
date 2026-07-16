@@ -370,6 +370,43 @@ def sync_cmd(scope: str) -> None:
         console.print(f"  - {entry_id}: lockfile {locked[:12]}... vs installed {actual[:12]}...")
 
 
+@catalog_group.command("verify")
+@click.option("--refresh", is_flag=True, help="Skip the freshness window.")
+@click.option(
+    "--scope",
+    type=click.Choice(["project", "user"]),
+    default="project",
+)
+def verify_cmd(refresh: bool, scope: str) -> None:
+    """Verify the catalog offline: transitive pins, inclusion proofs, revocations.
+
+    Fails (non-zero exit) when any entry references an unpinned transitive
+    source, an inclusion or consistency proof does not verify against the
+    signed log head, or an installed version is under a signed revocation.
+    """
+    service = _build_service(scope)
+    try:
+        report = service.verify(force_refresh=refresh)
+    except SkillCatalogValidationError as exc:
+        raise click.ClickException(f"Catalog rejected: {exc}") from exc
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    for result in report.results:
+        marker = "[green]ok[/green]" if result.ok else "[red]FAIL[/red]"
+        console.print(f"{marker} {result.entry_id} ({result.version}): {result.detail}")
+
+    if report.revoked:
+        console.print(f"[red]revoked installs:[/red] {', '.join(report.revoked)}")
+
+    if report.ok:
+        console.print(f"[green]verified[/green] {report.entries_checked} entr(y/ies) offline")
+    else:
+        raise click.ClickException(
+            f"catalog verification failed: {len(report.failures())} entr(y/ies) did not verify",
+        )
+
+
 @catalog_group.command("status")
 @click.option(
     "--scope",

@@ -267,8 +267,17 @@ def inject_skills(
             templates_to_inject.append(candidate.template_name)
             trigger_by_template[candidate.template_name] = "auto-route"
 
+    # Kill switch: refuse to inject any skill a signed revocation covers, and
+    # record a chain-anchored refusal receipt for every revoked install
+    # (issue #2527). Best-effort: a bad catalog cache must never wedge a spawn.
+    revoked_ids = _revoked_skill_ids(workdir)
+
     written_relpaths: list[str] = []
     for template_name in templates_to_inject:
+        if template_name.rsplit(".", 1)[0] in revoked_ids:
+            _logger.warning("Refusing to inject revoked skill %s (signed revocation)", template_name)
+            continue
+
         source_path = skills_source_dir / template_name
         if not source_path.exists():
             _logger.debug("Skill template not found: %s - skipping", source_path)
@@ -342,6 +351,24 @@ def inject_skills(
 
     if written_relpaths:
         _exclude_injected_paths(workdir, written_relpaths)
+
+
+def _revoked_skill_ids(workdir: Path) -> set[str]:
+    """Return the set of catalog-installed skill ids under a signed revocation.
+
+    Best-effort and side-effecting: it records a chain-anchored spawn-side
+    refusal receipt for every revoked install. Any failure (no catalog cache,
+    unreadable lockfile) resolves to an empty set so a spawn is never blocked
+    by the enforcement path itself.
+    """
+    try:
+        from bernstein.core.skills.catalog.enforcement import enforce_spawn_revocations
+
+        refused = enforce_spawn_revocations(workdir)
+        return {item.skill_id for item in refused}
+    except Exception:
+        _logger.debug("revocation enforcement skipped for %s", workdir, exc_info=True)
+        return set()
 
 
 def _extract_skill_version(content: str) -> str:

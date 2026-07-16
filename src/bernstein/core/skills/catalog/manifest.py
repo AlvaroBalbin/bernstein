@@ -18,7 +18,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 _CATALOG_REQUIRED: frozenset[str] = frozenset({"version", "generated_at", "entries"})
-_CATALOG_OPTIONAL: frozenset[str] = frozenset({"signer_pubkey"})
+#: ``transparency`` carries the signed Merkle log head + inclusion data for
+#: this catalog state (issue #2527); ``revocations`` carries signed revocation
+#: log entries. Both are metadata *about* the state and are deliberately not
+#: part of the state leaf pre-image (:meth:`SkillCatalog.to_dict`).
+_CATALOG_OPTIONAL: frozenset[str] = frozenset({"signer_pubkey", "transparency", "revocations"})
 _CATALOG_ALLOWED: frozenset[str] = _CATALOG_REQUIRED | _CATALOG_OPTIONAL
 
 _ENTRY_REQUIRED: frozenset[str] = frozenset(
@@ -31,12 +35,15 @@ _ENTRY_REQUIRED: frozenset[str] = frozenset(
         "content_digest",
     }
 )
+#: ``references`` pins every transitively-referenced source by digest so verify
+#: cannot pass while transitive content floats (issue #2527).
 _ENTRY_OPTIONAL: frozenset[str] = frozenset(
     {
         "signature",
         "homepage",
         "tags",
         "verified",
+        "references",
     }
 )
 _ENTRY_ALLOWED: frozenset[str] = _ENTRY_REQUIRED | _ENTRY_OPTIONAL
@@ -67,6 +74,15 @@ class SkillCatalogValidationError(ValueError):
 
     Callers should treat this as a hard failure and preserve any
     previously cached catalog instead of overwriting it.
+    """
+
+
+class UnpinnedTransitiveSourceError(SkillCatalogValidationError):
+    """Raised when an entry references a transitive source without a pinned digest.
+
+    A named subclass so ``bernstein skills catalog verify`` and the installer
+    can distinguish "this entry declares transitive content that is not frozen
+    by hash" from a generic schema error and report it precisely (issue #2527).
     """
 
 
@@ -129,6 +145,24 @@ class SkillSourceSpec:
 
 
 @dataclass(frozen=True)
+class SkillSourceRef:
+    """A transitively-referenced source, frozen by a pinned content digest.
+
+    A skill pack may pull in further sources (a plugin the skill declares, a
+    sub-pack it composes). Each such source must carry a ``digest`` so verify
+    freezes exactly what an install may transitively fetch: an unpinned
+    reference is refused with :class:`UnpinnedTransitiveSourceError`.
+    """
+
+    source: SkillSourceSpec
+    digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to the JSON wire format."""
+        return {"source": self.source.to_dict(), "digest": self.digest}
+
+
+@dataclass(frozen=True)
 class SkillCatalogEntry:
     """A single installable skill catalog entry.
 
@@ -162,9 +196,15 @@ class SkillCatalogEntry:
     homepage: str = ""
     tags: tuple[str, ...] = ()
     verified: bool = False
+    references: tuple[SkillSourceRef, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialise to the JSON wire format."""
+        """Serialise to the JSON wire format.
+
+        ``references`` is emitted only when present so existing catalogs -- and
+        the canonical entry bytes the signature covers -- are byte-identical
+        for entries that declare no transitive sources.
+        """
         out: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
@@ -180,17 +220,29 @@ class SkillCatalogEntry:
             out["homepage"] = self.homepage
         if self.tags:
             out["tags"] = list(self.tags)
+        if self.references:
+            out["references"] = [ref.to_dict() for ref in self.references]
         return out
 
 
 @dataclass(frozen=True)
 class SkillCatalog:
-    """A validated skill catalog payload."""
+    """A validated skill catalog payload.
+
+    ``transparency`` and ``revocations`` are the (optional) Merkle
+    transparency envelope for this state and the signed revocation log
+    entries (issue #2527). They are metadata *about* the state; the state leaf
+    pre-image (:meth:`to_dict`) deliberately excludes them so the leaf a client
+    recomputes is byte-stable regardless of which head or revocations ship
+    alongside it.
+    """
 
     version: int
     generated_at: str
     entries: tuple[SkillCatalogEntry, ...]
     signer_pubkey: str | None = field(default=None)
+    transparency: dict[str, Any] | None = field(default=None)
+    revocations: tuple[dict[str, Any], ...] = field(default=())
 
     def find(self, entry_id: str) -> SkillCatalogEntry | None:
         """Return the entry with the given ``id`` or ``None``."""
@@ -315,6 +367,54 @@ def _validate_source(raw: Any, field_path: str) -> SkillSourceSpec:
     )
 
 
+_REFERENCE_ALLOWED: frozenset[str] = frozenset({"source", "digest"})
+
+
+def _validate_reference(raw: Any, field_path: str) -> SkillSourceRef:
+    """Validate one transitive source reference, requiring a pinned digest.
+
+    Raises:
+        UnpinnedTransitiveSourceError: If ``digest`` is missing, empty, or not
+            a 64-char lowercase hex SHA-256 -- the transitive content is not
+            frozen, so verify must refuse it.
+        SkillCatalogValidationError: On any other structural problem.
+    """
+    if not isinstance(raw, dict):
+        raise SkillCatalogValidationError(
+            f"{field_path} must be an object, got {type(raw).__name__}",
+        )
+    keys = set(raw.keys())
+    unknown = keys - _REFERENCE_ALLOWED
+    if unknown:
+        raise SkillCatalogValidationError(
+            f"{field_path} has unknown field(s): {sorted(unknown)}",
+        )
+    if "source" not in raw:
+        raise SkillCatalogValidationError(f"{field_path} missing required field 'source'")
+    if "digest" not in raw:
+        raise UnpinnedTransitiveSourceError(
+            f"{field_path} references a transitive source with no pinned digest; "
+            "every transitively referenced source must be frozen by a 'digest'",
+        )
+    source = _validate_source(raw["source"], f"{field_path}.source")
+    digest = raw["digest"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise UnpinnedTransitiveSourceError(
+            f"{field_path}.digest must be a 64-char lowercase hex SHA-256 pinning the "
+            f"transitive source; got {digest!r}",
+        )
+    return SkillSourceRef(source=source, digest=digest)
+
+
+def _validate_references(raw: Any, field_path: str) -> tuple[SkillSourceRef, ...]:
+    """Validate the optional ``references`` list on an entry."""
+    if not isinstance(raw, list):
+        raise SkillCatalogValidationError(
+            f"{field_path} must be a list, got {type(raw).__name__}",
+        )
+    return tuple(_validate_reference(item, f"{field_path}[{i}]") for i, item in enumerate(raw))
+
+
 def _validate_entry(raw: Any, index: int) -> SkillCatalogEntry:
     """Validate a single entry dict."""
     if not isinstance(raw, dict):
@@ -357,6 +457,10 @@ def _validate_entry(raw: Any, index: int) -> SkillCatalogEntry:
     homepage = _ensure_str(raw.get("homepage", ""), f"entries[{index}].homepage", allow_empty=True)
     verified = _ensure_bool(raw.get("verified", False), f"entries[{index}].verified")
 
+    references: tuple[SkillSourceRef, ...] = ()
+    if "references" in raw:
+        references = _validate_references(raw["references"], f"entries[{index}].references")
+
     return SkillCatalogEntry(
         id=entry_id,
         name=_ensure_str(raw["name"], f"entries[{index}].name"),
@@ -368,6 +472,7 @@ def _validate_entry(raw: Any, index: int) -> SkillCatalogEntry:
         homepage=homepage,
         tags=tags,
         verified=verified,
+        references=references,
     )
 
 
@@ -418,6 +523,31 @@ def validate_catalog(payload: Any) -> SkillCatalog:
     if "signer_pubkey" in payload:
         signer_pubkey = _ensure_str(payload["signer_pubkey"], "signer_pubkey")
 
+    transparency: dict[str, Any] | None = None
+    if "transparency" in payload:
+        raw_transparency = payload["transparency"]
+        if not isinstance(raw_transparency, dict):
+            raise SkillCatalogValidationError(
+                f"field 'transparency' must be an object, got {type(raw_transparency).__name__}",
+            )
+        transparency = raw_transparency
+
+    revocations: tuple[dict[str, Any], ...] = ()
+    if "revocations" in payload:
+        raw_revocations = payload["revocations"]
+        if not isinstance(raw_revocations, list):
+            raise SkillCatalogValidationError(
+                f"field 'revocations' must be a list, got {type(raw_revocations).__name__}",
+            )
+        parsed_revocations: list[dict[str, Any]] = []
+        for r_index, item in enumerate(raw_revocations):
+            if not isinstance(item, dict):
+                raise SkillCatalogValidationError(
+                    f"revocations[{r_index}] must be an object, got {type(item).__name__}",
+                )
+            parsed_revocations.append(item)
+        revocations = tuple(parsed_revocations)
+
     entries_raw = payload["entries"]
     if not isinstance(entries_raw, list):
         raise SkillCatalogValidationError(
@@ -440,6 +570,8 @@ def validate_catalog(payload: Any) -> SkillCatalog:
         generated_at=generated_at,
         entries=tuple(entries),
         signer_pubkey=signer_pubkey,
+        transparency=transparency,
+        revocations=revocations,
     )
 
 
@@ -447,6 +579,8 @@ __all__ = [
     "SkillCatalog",
     "SkillCatalogEntry",
     "SkillCatalogValidationError",
+    "SkillSourceRef",
     "SkillSourceSpec",
+    "UnpinnedTransitiveSourceError",
     "validate_catalog",
 ]
