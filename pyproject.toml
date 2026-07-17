@@ -793,6 +793,23 @@ dev = [
     # click>=8.3.3 / opentelemetry-sdk>=1.41.1 floors. Mirror of
     # [project.optional-dependencies].dev.
 ]
+# Documentation toolchain (MkDocs Material site published to Read the Docs).
+# Kept in the uv-managed dependency graph so every docs dependency is pinned
+# with a hash in uv.lock - the same supply-chain floor as the runtime deps -
+# instead of floating in a standalone requirements file. The consumed
+# `docs/requirements.txt` is a hash-pinned export of THIS group; regenerate it
+# after any change here with:
+#   uv lock
+#   uv export --only-group docs --no-emit-project --output-file docs/requirements.txt
+# The `imaging` extra pulls cairosvg/pillow for the `social` card plugin
+# (mkdocs.yml); the matching native libs (libcairo, ...) are installed by
+# `.readthedocs.yaml::build.apt_packages`.
+docs = [
+    "mkdocs>=1.6.1,<2",
+    "mkdocs-material[imaging]>=9.7.6,<10",
+    "mkdocs-minify-plugin>=0.8,<1",
+    "mkdocs-redirects>=1.2,<2",
+]
 
 [tool.mutmut]
 # Lineage v1 mutation testing - see scripts/mutmut_lineage.py for the
