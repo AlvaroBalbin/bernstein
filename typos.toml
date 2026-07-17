@@ -13,6 +13,10 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
+abd = "abd"          # hex/hash fixture fragment (test_computer_use_lineage)
+cose = "cose"        # COSE_Sign1 (RFC 9052) receipt-export term
+COSE = "COSE"        # COSE_Sign1 (RFC 9052) receipt-export term
+intoto = "intoto"    # in-toto attestation format identifier
 # Variable names and abbreviations in code
 ba = "ba"            # ba_table = Budget & Approval table (manifest_cmd.py)
 nd = "nd"            # nd = number of diffs (benchmarks/run_benchmark.py)
