@@ -284,6 +284,8 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "mission",
         "limits",
         "events",
+        # Chain-anchored worker context capsules (issue #2545)
+        "context",
     }
 )
 
