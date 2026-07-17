@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from bernstein import __version__ as _BERNSTEIN_VERSION
@@ -61,6 +61,7 @@ from bernstein.core.security.agent_card_signer import (
     canonicalize_jcs,
     ed25519_public_jwk,
 )
+from bernstein.core.security.tenanting import DEFAULT_TENANT_ID
 
 router = APIRouter()
 
@@ -145,80 +146,134 @@ _SKILLS: tuple[dict[str, object], ...] = (
 
 # Reentrant: ``_get_signing_keypair()`` holds the lock while delegating to
 # ``_get_keystore()``, which on the cold path needs to take the same lock to
-# bind ``_KEYSTORE`` -- a plain ``threading.Lock`` self-deadlocks on the very
+# bind the keystore -- a plain ``threading.Lock`` self-deadlocks on the very
 # first JWKS call. ``rotate_agent_card_keys()`` has the same nesting shape.
+#
+# Per-tenant identities (#2525): a host serving several tenants must not
+# advertise one shared identity for all of them. Key material for a tenant
+# lives under ``<key_dir>/tenants/<tenant-id>/``; the default (single-tenant)
+# identity keeps living at ``<key_dir>`` for backward compatibility. The caches
+# below are keyed by normalised tenant id so each tenant resolves its own
+# keystore, keypair, and ``kid``.
 _KEY_LOCK = threading.RLock()
-_KEYSTORE: AgentCardKeystore | None = None
-_PRIVATE_PEM: bytes | None = None
-_PUBLIC_PEM: bytes | None = None
+_KEYSTORES: dict[str, AgentCardKeystore] = {}
+_KEYPAIRS: dict[str, tuple[bytes, bytes]] = {}
+#: Test-only override for the base key directory (set by
+#: ``_reset_signing_keypair_for_tests``). ``None`` means "use the resolved
+#: production directory".
+_KEY_DIR_OVERRIDE: Path | None = None
 
 
 def _resolve_key_dir() -> Path:
-    """Return the directory backing the persistent keystore.
+    """Return the base directory backing the persistent keystore.
 
     Honours ``BERNSTEIN_AGENT_CARD_KEY_DIR`` so production deployments can
     point at a mounted secret volume; falls back to ``.bernstein/keys`` in
-    the working directory.
+    the working directory. A test override (set via
+    ``_reset_signing_keypair_for_tests``) takes precedence.
     """
+    if _KEY_DIR_OVERRIDE is not None:
+        return _KEY_DIR_OVERRIDE
     override = os.environ.get("BERNSTEIN_AGENT_CARD_KEY_DIR", "").strip()
     if override:
         return Path(override)
     return DEFAULT_KEY_DIR
 
 
-def _get_keystore() -> AgentCardKeystore:
-    """Return the process-wide :class:`AgentCardKeystore`, creating it lazily."""
-    global _KEYSTORE
-    if _KEYSTORE is not None:
-        return _KEYSTORE
-    with _KEY_LOCK:
-        if _KEYSTORE is None:
-            _KEYSTORE = AgentCardKeystore(_resolve_key_dir())
-    return _KEYSTORE
+def _normalize_tenant(tenant_id: str | None) -> str:
+    """Return the normalised tenant id (empty / whitespace -> ``default``)."""
+    from bernstein.core.security.tenanting import normalize_tenant_id
+
+    return normalize_tenant_id(tenant_id)
 
 
-def _get_signing_keypair() -> tuple[bytes, bytes]:
-    """Return the cached signing keypair, loading from disk on first use."""
-    global _PRIVATE_PEM, _PUBLIC_PEM
-    if _PRIVATE_PEM is not None and _PUBLIC_PEM is not None:
-        return _PRIVATE_PEM, _PUBLIC_PEM
+def _tenant_key_dir(tenant_id: str) -> Path:
+    """Return the key directory for ``tenant_id``.
+
+    The default tenant keeps the historical top-level directory so existing
+    single-tenant deployments and their cached JWKs are untouched; every other
+    tenant gets an isolated ``tenants/<tenant-id>/`` subtree so one tenant's key
+    exposure never implicates another.
+    """
+    base = _resolve_key_dir()
+    if tenant_id == DEFAULT_TENANT_ID:
+        return base
+    return base / "tenants" / tenant_id
+
+
+def _tenant_kid(tenant_id: str) -> str:
+    """Return the stable ``kid`` advertised for ``tenant_id``.
+
+    The default tenant keeps ``agent-bernstein-orchestrator`` so verifiers that
+    cached the single-tenant key still route by it; other tenants append their
+    id so a card and its JWKS resolve within the tenant only.
+    """
+    if tenant_id == DEFAULT_TENANT_ID:
+        return _DEFAULT_KID
+    return f"{_DEFAULT_KID}-{tenant_id}"
+
+
+def _get_keystore(tenant_id: str = DEFAULT_TENANT_ID) -> AgentCardKeystore:
+    """Return the per-tenant :class:`AgentCardKeystore`, creating it lazily."""
+    tenant_id = _normalize_tenant(tenant_id)
+    cached = _KEYSTORES.get(tenant_id)
+    if cached is not None:
+        return cached
     with _KEY_LOCK:
-        if _PRIVATE_PEM is None or _PUBLIC_PEM is None:
-            _PRIVATE_PEM, _PUBLIC_PEM = _get_keystore().load_or_generate()
-    return _PRIVATE_PEM, _PUBLIC_PEM
+        cached = _KEYSTORES.get(tenant_id)
+        if cached is None:
+            cached = AgentCardKeystore(_tenant_key_dir(tenant_id))
+            _KEYSTORES[tenant_id] = cached
+    return cached
+
+
+def _get_signing_keypair(tenant_id: str = DEFAULT_TENANT_ID) -> tuple[bytes, bytes]:
+    """Return the cached per-tenant signing keypair, loading from disk on first use."""
+    tenant_id = _normalize_tenant(tenant_id)
+    cached = _KEYPAIRS.get(tenant_id)
+    if cached is not None:
+        return cached
+    with _KEY_LOCK:
+        cached = _KEYPAIRS.get(tenant_id)
+        if cached is None:
+            cached = _get_keystore(tenant_id).load_or_generate()
+            _KEYPAIRS[tenant_id] = cached
+    return cached
 
 
 def _reset_signing_keypair_for_tests(key_dir: Path | None = None) -> None:
-    """Reset both the keystore binding and the cached PEM bytes.
+    """Reset every tenant keystore binding and cached keypair.
 
-    Tests pass ``key_dir=tmp_path / "keys"`` so each case gets a fresh
-    directory; production callers leave ``key_dir=None`` (the default
-    persistent directory will be re-bound on next request).
+    Tests pass ``key_dir=tmp_path / "keys"`` so each case gets a fresh base
+    directory (tenant subtrees derive from it); production callers leave
+    ``key_dir=None`` (the resolved persistent directory is re-bound on next
+    request).
     """
-    global _KEYSTORE, _PRIVATE_PEM, _PUBLIC_PEM
+    global _KEY_DIR_OVERRIDE
     with _KEY_LOCK:
-        _KEYSTORE = AgentCardKeystore(key_dir) if key_dir is not None else None
-        _PRIVATE_PEM = None
-        _PUBLIC_PEM = None
+        _KEY_DIR_OVERRIDE = key_dir
+        _KEYSTORES.clear()
+        _KEYPAIRS.clear()
 
 
-def rotate_agent_card_keys() -> tuple[bytes, bytes]:
-    """Rotate the persistent agent-card keypair.
+def rotate_agent_card_keys(tenant_id: str = DEFAULT_TENANT_ID) -> tuple[bytes, bytes]:
+    """Rotate the persistent agent-card keypair for ``tenant_id``.
 
     Archives the current keypair under ``<key_dir>/archive/<isoformat>/`` and
     mints a fresh one with ``O_EXCL`` + ``0o600`` semantics. The JWKS
     endpoint will continue to publish the rotated-out public key for the
     keystore's grace window (24h by default) so verifiers cached on the
-    old ``kid`` keep validating until their HTTP cache ages out.
+    old ``kid`` keep validating until their HTTP cache ages out. Rotation is
+    scoped to the tenant, so one tenant rotating never disturbs another.
 
     Returns:
         The freshly-generated ``(private_pem, public_pem)`` so callers can
         log the new ``kid`` or trigger downstream secret-store sync.
     """
-    global _PRIVATE_PEM, _PUBLIC_PEM
+    tenant_id = _normalize_tenant(tenant_id)
     with _KEY_LOCK:
-        priv, pub = _get_keystore().rotate()
-        _PRIVATE_PEM, _PUBLIC_PEM = priv, pub
+        priv, pub = _get_keystore(tenant_id).rotate()
+        _KEYPAIRS[tenant_id] = (priv, pub)
         return priv, pub
 
 
@@ -254,7 +309,7 @@ def _security_schemes() -> list[dict[str, Any]]:
     ]
 
 
-def _agent_card_body(base_url: str = _DEFAULT_BASE_URL) -> dict[str, Any]:
+def _agent_card_body(base_url: str = _DEFAULT_BASE_URL, *, tenant_id: str = DEFAULT_TENANT_ID) -> dict[str, Any]:
     """Build the A2A v1.0 card body - the bytes the JWS attests to.
 
     The result excludes the ``signatures`` array; ``_agent_card_payload``
@@ -262,11 +317,15 @@ def _agent_card_body(base_url: str = _DEFAULT_BASE_URL) -> dict[str, Any]:
 
     Args:
         base_url: Public base URL of the task server.
+        tenant_id: Tenant the card is served for. The default tenant's body is
+            byte-identical to the historical single-tenant card; a named tenant
+            adds a ``tenantId`` field so the served card is attributable to the
+            tenant that requested it.
 
     Returns:
         JSON-serialisable dict with the v1.0-mandated fields.
     """
-    return {
+    body: dict[str, Any] = {
         "name": _AGENT_NAME,
         "description": _AGENT_DESCRIPTION,
         "version": _BERNSTEIN_VERSION,
@@ -298,6 +357,9 @@ def _agent_card_body(base_url: str = _DEFAULT_BASE_URL) -> dict[str, Any]:
         },
         "endpoints": [{"method": e.method, "path": e.path, "summary": e.summary} for e in _ENDPOINTS],
     }
+    if tenant_id != DEFAULT_TENANT_ID:
+        body["tenantId"] = tenant_id
+    return body
 
 
 def _sign_canonical_body(canonical_body: bytes, private_pem: bytes, *, kid: str) -> str:
@@ -343,7 +405,7 @@ def _resolve_base_url() -> str:
     return os.environ.get("BERNSTEIN_PUBLIC_BASE_URL", _DEFAULT_BASE_URL)
 
 
-def _agent_card_payload(base_url: str = _DEFAULT_BASE_URL) -> dict[str, Any]:
+def _agent_card_payload(base_url: str = _DEFAULT_BASE_URL, *, tenant_id: str = DEFAULT_TENANT_ID) -> dict[str, Any]:
     """Build the full A2A v1.0 card payload - body plus signatures.
 
     Verifiers strip ``signatures`` from this payload, JCS-canonicalise the
@@ -352,23 +414,45 @@ def _agent_card_payload(base_url: str = _DEFAULT_BASE_URL) -> dict[str, Any]:
 
     Args:
         base_url: Public base URL of the task server.
+        tenant_id: Tenant the card is served for. The card is signed with the
+            tenant's own keypair and carries the tenant's ``kid`` so it resolves
+            only against that tenant's JWKS.
 
     Returns:
         Full v1.0 payload dict ready to JSON-serialise.
     """
-    body = _agent_card_body(base_url)
+    tenant_id = _normalize_tenant(tenant_id)
+    body = _agent_card_body(base_url, tenant_id=tenant_id)
     canonical = canonicalize_jcs(body)
-    private_pem, _public_pem = _get_signing_keypair()
-    jws = _sign_canonical_body(canonical, private_pem, kid=_DEFAULT_KID)
+    private_pem, _public_pem = _get_signing_keypair(tenant_id)
+    kid = _tenant_kid(tenant_id)
+    jws = _sign_canonical_body(canonical, private_pem, kid=kid)
     body["signatures"] = [
         {
-            "kid": _DEFAULT_KID,
+            "kid": kid,
             "alg": "EdDSA",
             "typ": "agent-card+jws",
             "jws": jws,
         }
     ]
     return body
+
+
+def _resolve_tenant(request: Request | None) -> str:
+    """Return the tenant a well-known request is scoped to.
+
+    Resolution order: an explicit ``?tenant=`` query parameter, then the
+    ``x-tenant-id`` request header, then the default tenant. Keeping the query
+    parameter first makes the tenant card deterministically addressable without
+    provisioning auth, which is what an external verifier needs. A direct call
+    with ``None`` (in-process, no HTTP request) resolves to the default tenant.
+    """
+    if request is None:
+        return DEFAULT_TENANT_ID
+    query_tenant = request.query_params.get("tenant")
+    if query_tenant and query_tenant.strip():
+        return _normalize_tenant(query_tenant)
+    return _normalize_tenant(request.headers.get("x-tenant-id"))
 
 
 def _render_llms_txt() -> str:
@@ -404,25 +488,32 @@ def _render_llms_txt() -> str:
 
 
 @router.get("/.well-known/agent.json", include_in_schema=False)
-def agent_json() -> Response:
+def agent_json(request: Request) -> Response:
     """Return the A2A v1.0 signed agent card for this task server.
 
     Body bytes are JCS-canonical (RFC 8785) so verifiers can recompute the
     JWS signing input bit-perfect after stripping the ``signatures`` array.
     Cache for an hour - the card body changes only when the server config
-    or the orchestrator's signing key rotates.
+    or the orchestrator's signing key rotates. A ``?tenant=`` query parameter
+    (or ``x-tenant-id`` header) selects a tenant-scoped identity; a
+    multi-tenant host serves a distinct signed card per tenant.
     """
-    payload = _agent_card_payload(_resolve_base_url())
+    tenant_id = _resolve_tenant(request)
+    payload = _agent_card_payload(_resolve_base_url(), tenant_id=tenant_id)
     body = canonicalize_jcs(payload)
+    headers = {"Cache-Control": "public, max-age=3600"}
+    if tenant_id != DEFAULT_TENANT_ID:
+        # Cards vary by tenant selector, so caches must key on it.
+        headers["Vary"] = "x-tenant-id"
     return Response(
         content=body,
         media_type="application/json",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers=headers,
     )
 
 
 @router.get("/.well-known/agent.json/keys", include_in_schema=False)
-def agent_json_keys() -> dict[str, Any]:
+def agent_json_keys(request: Request) -> dict[str, Any]:
     """Return the JWKS for verifying ``/.well-known/agent.json`` signatures.
 
     JWKS shape per RFC 7517 - ``{"keys": [<jwk>, ...]}``. The current
@@ -430,14 +521,16 @@ def agent_json_keys() -> dict[str, Any]:
     (24h by default) any archived public keys still inside the window are
     appended so verifiers cached on the old ``kid`` keep validating until
     their HTTP cache (``Cache-Control: public, max-age=3600`` on the agent
-    card route) ages out and they refetch the fresh JWKS.
+    card route) ages out and they refetch the fresh JWKS. The JWKS is
+    tenant-scoped: tenant A's card never verifies against tenant B's keys.
     """
+    tenant_id = _resolve_tenant(request)
     # Ensure both the cached PEM and the keystore binding exist before we
     # query the archive - the side-effect of ``_get_signing_keypair`` is
     # what materialises the on-disk directory on first run.
-    _private_pem, public_pem = _get_signing_keypair()
-    jwks: list[dict[str, str]] = [ed25519_public_jwk(public_pem, kid=_DEFAULT_KID)]
-    for archived in _get_keystore().list_archived():
+    _private_pem, public_pem = _get_signing_keypair(tenant_id)
+    jwks: list[dict[str, str]] = [ed25519_public_jwk(public_pem, kid=_tenant_kid(tenant_id))]
+    for archived in _get_keystore(tenant_id).list_archived():
         jwks.append(ed25519_public_jwk(archived.public_pem, kid=archived.kid))
     return {"keys": jwks}
 

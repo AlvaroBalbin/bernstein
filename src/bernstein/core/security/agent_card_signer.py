@@ -35,13 +35,21 @@ if TYPE_CHECKING:
     from .agent_identity import AgentIdentityCard
 
 __all__ = [
+    "AGENT_CARD_V1_TYP",
     "AgentCardSignature",
     "canonicalize_jcs",
+    "ed25519_pem_from_jwk",
     "ed25519_public_jwk",
     "generate_ed25519_keypair",
     "sign_agent_card",
     "verify_agent_card",
+    "verify_detached_jws_over_canonical",
 ]
+
+#: JWS ``typ`` header the A2A v1.0 agent-card profile requires (RFC 7515 §4).
+#: The ``/.well-known/agent.json`` emitter stamps this on every ``signatures[]``
+#: entry, and the v1.0 conformance suite rejects any other value.
+AGENT_CARD_V1_TYP: str = "agent-card+jws"
 
 
 # ---------------------------------------------------------------------------
@@ -299,3 +307,117 @@ def _card_to_dict(card: AgentIdentityCard) -> dict[str, Any]:
     from dataclasses import asdict
 
     return asdict(card)
+
+
+# ---------------------------------------------------------------------------
+# A2A v1.0 inbound verification helpers
+# ---------------------------------------------------------------------------
+
+
+def ed25519_pem_from_jwk(jwk: dict[str, Any]) -> bytes:
+    """Return the SPKI PEM bytes for an OKP Ed25519 JWK (inverse of the emit path).
+
+    The v1.0 conformance suite resolves a ``signatures[].kid`` to a JWK served
+    at ``/.well-known/agent.json/keys`` and needs the raw public key to check
+    the detached JWS. This is the exact inverse of :func:`ed25519_public_jwk`:
+    it reads the base64url ``x`` coordinate, rebuilds the 32-byte Ed25519 public
+    key, and re-encodes it as the SPKI PEM the ``cryptography`` verifier expects.
+
+    Args:
+        jwk: A JWK dict with ``kty == "OKP"``, ``crv == "Ed25519"`` and a
+            base64url (unpadded) ``x`` coordinate.
+
+    Returns:
+        SPKI PEM bytes for the public key.
+
+    Raises:
+        ValueError: If the JWK is not a well-formed OKP/Ed25519 key.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    if not isinstance(jwk, dict):
+        raise ValueError("JWK must be an object")
+    if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
+        raise ValueError("JWK is not an OKP/Ed25519 key")
+    x = jwk.get("x")
+    if not isinstance(x, str) or not x:
+        raise ValueError("JWK missing base64url 'x' coordinate")
+    try:
+        raw = _b64url_decode(x)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"JWK 'x' is not valid base64url: {exc}") from exc
+    if len(raw) != 32:
+        raise ValueError(f"JWK 'x' must decode to 32 bytes, got {len(raw)}")
+    return Ed25519PublicKey.from_public_bytes(raw).public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def verify_detached_jws_over_canonical(
+    canonical_body: bytes,
+    detached_jws: str,
+    public_key_pem: bytes,
+    *,
+    expected_typ: str,
+) -> bool:
+    """Verify a detached JWS (RFC 7515 §A.5) over pre-canonicalised body bytes.
+
+    Mirrors the emit path in ``well_known._sign_canonical_body``: the signing
+    input is ``base64url(header).base64url(canonical_body)`` and the payload
+    segment of the compact JWS is empty. The header must be an ``EdDSA``
+    signature carrying ``expected_typ``. Never raises on malformed network
+    input - a bad token, header, or signature returns ``False``.
+
+    Args:
+        canonical_body: The JCS-canonical body bytes the JWS attests to (the
+            v1.0 agent card body with ``signatures`` already stripped).
+        detached_jws: Compact detached JWS string ``header..signature``.
+        public_key_pem: SPKI PEM of the Ed25519 public key resolved from the
+            JWKS by ``kid``.
+        expected_typ: Required ``typ`` header value (``agent-card+jws`` for the
+            v1.0 profile).
+
+    Returns:
+        ``True`` iff the JWS is a well-formed EdDSA detached signature with the
+        expected ``typ`` that verifies against ``public_key_pem``.
+    """
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    parts = detached_jws.split(".")
+    if len(parts) != 3:
+        return False
+    header_b64, payload_b64, sig_b64 = parts
+    if payload_b64:
+        # Not a detached signature - refuse rather than silently accept.
+        return False
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+    except (ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(header, dict):
+        return False
+    if header.get("alg") != "EdDSA" or header.get("typ") != expected_typ:
+        return False
+
+    try:
+        public_key = serialization.load_pem_public_key(public_key_pem)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(public_key, Ed25519PublicKey):
+        return False
+
+    body_b64 = _b64url(canonical_body)
+    signing_input = f"{header_b64}.{body_b64}".encode("ascii")
+    try:
+        sig = _b64url_decode(sig_b64)
+    except (ValueError, TypeError):
+        return False
+    try:
+        public_key.verify(sig, signing_input)
+    except InvalidSignature:
+        return False
+    return True

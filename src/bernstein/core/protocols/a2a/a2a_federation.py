@@ -50,6 +50,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from bernstein.core.protocols.a2a.a2a import AgentCard
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,31 @@ class A2ATaskRejectedError(RuntimeError):
         super().__init__(f"Peer '{peer_name}' rejected task (HTTP {status_code}): {detail}")
         self.peer_name = peer_name
         self.status_code = status_code
+        self.detail = detail
+
+
+class A2ACardRejectedError(RuntimeError):
+    """Raised when a peer's A2A v1.0 agent card fails verification before delegation.
+
+    Card verification is the trust root for federation: delegating work to a
+    remote agent whose card was never proven means sending it work on unproven
+    identity. When card verification is requested (a peer card + JWKS are
+    supplied) and the card is rejected, ``delegate_task_http`` refuses to POST
+    and raises this error. No ledger entry is created and, when a receipt
+    context is supplied, the refusal is anchored as a signed verdict receipt.
+
+    Attributes:
+        peer_name: Peer whose card was rejected.
+        reason: Machine-readable fail-closed reason code (``unknown_alg``,
+            ``missing_kid``, ``unresolvable_jwks``, ``untrusted_issuer``,
+            ``signature``, ``expired``, ``malformed``, ``required_fields``).
+        detail: Human-readable explanation.
+    """
+
+    def __init__(self, peer_name: str, reason: str, detail: str) -> None:
+        super().__init__(f"peer '{peer_name}' card rejected ({reason}): {detail}")
+        self.peer_name = peer_name
+        self.reason = reason
         self.detail = detail
 
 
@@ -311,6 +338,76 @@ class A2AFederation:
         logger.info("Delegated task '%s' to peer '%s'", task.id, peer_name)
         return task
 
+    def _gate_peer_card(
+        self,
+        *,
+        peer_name: str,
+        peer_agent_card: dict[str, Any],
+        peer_jwks: dict[str, Any],
+        trusted_issuer_fingerprints: Iterable[str],
+        now: float | None,
+        verdict_receipt_ctx: dict[str, Any] | None,
+    ) -> None:
+        """Verify a peer's v1.0 agent card and refuse delegation if it fails.
+
+        Runs the inbound v1.0 conformance + trust gate. On rejection this
+        anchors a signed refusal receipt (when a receipt context is supplied)
+        and raises :class:`A2ACardRejectedError` so no task is POSTed. On accept
+        it anchors an accept verdict too, so both decisions are recorded on the
+        same chain that carries the message receipts for the exchanges that
+        follow.
+
+        Args:
+            peer_name: Peer whose card is being verified.
+            peer_agent_card: The peer's parsed v1.0 agent-card payload.
+            peer_jwks: The peer's parsed JWKS.
+            trusted_issuer_fingerprints: Fingerprints the operator trusts.
+            now: Optional current-time override for deterministic replay.
+            verdict_receipt_ctx: Optional dict with ``workdir``,
+                ``lineage_root``, ``hmac_key``, ``identity_dir`` (and optional
+                ``task_ref`` / ``timestamp``) to anchor the verdict as a signed
+                receipt.
+
+        Raises:
+            A2ACardRejectedError: When the card fails verification.
+        """
+        from bernstein.core.interop.a2a_consume import verify_inbound_agent_card_v1
+
+        verdict = verify_inbound_agent_card_v1(
+            peer_agent_card,
+            jwks=peer_jwks,
+            trusted_issuer_fingerprints=list(trusted_issuer_fingerprints),
+            now=now,
+        )
+        if verdict_receipt_ctx is not None:
+            self._anchor_card_verdict(peer_name, verdict, verdict_receipt_ctx)
+        if not verdict.accepted:
+            raise A2ACardRejectedError(peer_name, verdict.reason_code, verdict.detail)
+
+    @staticmethod
+    def _anchor_card_verdict(
+        peer_name: str,
+        verdict: Any,
+        ctx: dict[str, Any],
+    ) -> None:
+        """Anchor an accept/reject card verdict as a signed receipt."""
+        from bernstein.core.interop.a2a_lineage import record_card_verdict
+
+        record_card_verdict(
+            workdir=ctx["workdir"],
+            lineage_root=ctx["lineage_root"],
+            hmac_key=ctx["hmac_key"],
+            identity_dir=ctx["identity_dir"],
+            task_ref=str(ctx.get("task_ref") or f"delegate-{peer_name}"),
+            decision="accept" if verdict.accepted else "reject",
+            issuer=verdict.issuer,
+            peer_card_fingerprint=verdict.fingerprint,
+            reason_code=verdict.reason_code,
+            report_hash=verdict.report_hash,
+            timestamp=int(ctx.get("timestamp") or time.time()),
+            seq=int(ctx.get("seq") or 0),
+        )
+
     async def delegate_task_http(
         self,
         peer_name: str,
@@ -318,6 +415,11 @@ class A2AFederation:
         role: str = "backend",
         *,
         sender_card: AgentCard | dict[str, Any] | None = None,
+        peer_agent_card: dict[str, Any] | None = None,
+        peer_jwks: dict[str, Any] | None = None,
+        trusted_issuer_fingerprints: Iterable[str] | None = None,
+        verdict_receipt_ctx: dict[str, Any] | None = None,
+        now: float | None = None,
         client: httpx.AsyncClient | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         backoff_base: float = DEFAULT_BACKOFF_BASE,
@@ -358,11 +460,32 @@ class A2AFederation:
         Raises:
             A2ADelegationError: All retries exhausted; peer marked UNREACHABLE.
             A2ATaskRejectedError: Peer responded with a non-retriable 4xx.
+            A2ACardRejectedError: ``peer_agent_card`` was supplied and failed
+                verification; nothing is POSTed and the refusal is a signed
+                receipt when ``verdict_receipt_ctx`` is given.
             ValueError: Peer is unknown or has been deregistered.
+
+        Card verification (optional): when ``peer_agent_card`` (and
+        ``peer_jwks``) are supplied, the peer's A2A v1.0 card is verified and
+        trust-gated *before* any network I/O. A card that fails verification
+        refuses the delegation outright - the trust root is checked before work
+        is sent, not after.
         """
         peer = self._peers.get(peer_name)
         if peer is None or peer.state == PeerState.DEREGISTERED:
             raise ValueError(f"Cannot delegate to peer '{peer_name}': not registered or deregistered")
+
+        # Gate on the peer's card before allocating a ledger entry or touching
+        # the network, so a rejected card never pollutes the ledger.
+        if peer_agent_card is not None:
+            self._gate_peer_card(
+                peer_name=peer_name,
+                peer_agent_card=peer_agent_card,
+                peer_jwks=peer_jwks or {},
+                trusted_issuer_fingerprints=trusted_issuer_fingerprints or (),
+                now=now,
+                verdict_receipt_ctx=verdict_receipt_ctx,
+            )
 
         task = self.delegate_task(peer_name, message, role)
         if task is None:  # pragma: no cover - guarded above
