@@ -15,94 +15,28 @@ copyright: >-
   Copyright &copy; 2025–2026 <a href="https://alexchernysh.com">Alex Chernysh</a>
 
 theme:
-  name: material
+  name: shadcn
+  # docs/overrides/templates/extra_head.html injects social-preview meta tags
+  # (Open Graph image, Twitter card) that the theme's own seo.html does not emit.
   custom_dir: docs/overrides
-  palette:
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: deep purple
-      accent: amber
-      toggle:
-        icon: material/brightness-7
-        name: Switch to light mode
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: deep purple
-      accent: amber
-      toggle:
-        icon: material/brightness-4
-        name: Switch to dark mode
-  font:
-    text: Inter
-    code: JetBrains Mono
-  features:
-    - navigation.instant
-    - navigation.instant.progress
-    - navigation.tracking
-    - navigation.sections
-    - navigation.tabs
-    - navigation.tabs.sticky
-    - navigation.top
-    - navigation.indexes
-    - navigation.footer
-    - navigation.prune
-    - search.suggest
-    - search.highlight
-    - search.share
-    - content.code.copy
-    - content.code.annotate
-    - content.action.edit
-    - content.tabs.link
-    - toc.follow
-    - announce.dismiss
-  icon:
-    repo: fontawesome/brands/github
-    logo: material/music-note-eighth
-
-extra:
-  social:
-    - icon: fontawesome/brands/github
-      link: https://github.com/sipyourdrink-ltd/bernstein
-      name: Bernstein on GitHub
-    - icon: fontawesome/brands/python
-      link: https://pypi.org/project/bernstein/
-      name: Bernstein on PyPI
-    - icon: fontawesome/brands/x-twitter
-      link: https://x.com/alex_chernysh
-      name: Alex Chernysh on X
-    - icon: fontawesome/solid/globe
-      link: https://alexchernysh.com
-      name: Alex Chernysh
-  analytics:
-    provider: google
-    property: G-PLACEHOLDER
-    feedback:
-      title: Was this page helpful?
-      ratings:
-        - icon: material/thumb-up-outline
-          name: This page was helpful
-          data: 1
-          note: Thanks for your feedback!
-        - icon: material/thumb-down-outline
-          name: This page could be improved
-          data: 0
-          note: Thanks, we'll improve this page.
-  generator: false
-  consent:
-    title: Cookie consent
-    description: >-
-      We use cookies to recognize your repeated visits and preferences,
-      as well as to measure the effectiveness of our documentation and
-      whether users find what they're searching for. With your consent,
-      you're helping us to make our documentation better.
+  # Brand mark shown in the top bar and browser tab. Single asset that reads on
+  # both the light and dark surfaces the theme renders automatically.
+  icon: assets/logo_square_200.png
+  favicon: assets/logo_square_200.png
+  show_title: true
+  show_stargazers: true
+  # Render the top-level nav sections as a top bar, mirroring the previous
+  # multi-tab layout.
+  topbar_sections: true
+  # Deep-purple brand accent for links and highlights (light and dark).
+  accent: "oklch(60.6% 0.25 292)"
+  pygments_style:
+    light: shadcn-light
+    dark: github-dark
 
 plugins:
   - search:
       separator: '[\s\-\.]+'
-  - social:
-      cards_layout_options:
-        background_color: "#4a148c"
-        color: "#ffffff"
   - redirects:
       redirect_maps:
         'operations/DEPLOYMENT.md': 'operations/deployment-guide.md'
@@ -113,32 +47,26 @@ plugins:
       minify_html: true
 
 markdown_extensions:
+  # codehilite must be listed: the shadcn theme gates its Pygments stylesheet
+  # on this extension being present. It also provides the syntax highlighter
+  # that superfences delegates to.
+  - codehilite:
+      guess_lang: false
   - admonition
-  - pymdownx.details
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
-  - pymdownx.highlight:
-      anchor_linenums: true
-      line_spans: __span
-      pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
   - pymdownx.tabbed:
-      alternate_style: true
       slugify: !!python/object/apply:pymdownx.slugs.slugify
         kwds:
           case: lower
-  - pymdownx.tasklist:
-      custom_checkbox: true
+  - pymdownx.tasklist
   - pymdownx.emoji:
-      emoji_index: !!python/name:material.extensions.emoji.twemoji
-      emoji_generator: !!python/name:material.extensions.emoji.to_svg
-  - pymdownx.keys
-  - pymdownx.mark
-  - pymdownx.critic
+      emoji_index: !!python/name:pymdownx.emoji.gemoji
+      emoji_generator: !!python/name:pymdownx.emoji.to_alt
   - toc:
       permalink: true
       toc_depth: 3
@@ -148,6 +76,12 @@ markdown_extensions:
   - tables
   - footnotes
   - abbr
+
+# The shadcn theme has no built-in Mermaid renderer, so load one for the
+# `mermaid` superfences blocks. Served as an ES module (the theme renders
+# `.mjs` entries with type="module").
+extra_javascript:
+  - assets/js/mermaid-init.mjs
 
 nav:
   - Home:

@@ -9,46 +9,9 @@ search:
 
 Pick the path that matches what you're trying to do right now.
 
-<div class="grid cards" markdown>
-
-- :material-magnify:{ .lg .middle } **Evaluate Bernstein**
-
-    ---
-
-    See it work before you commit to it: install, run the demo, read
-    the tutorial.
-
-    [:octicons-arrow-right-24: Install](install.md)
-    &middot;
-    [First run](first-run.md)
-    &middot;
-    [Tutorial](quickstart-tutorial.md)
-
-- :material-server-network:{ .lg .middle } **Operate Bernstein**
-
-    ---
-
-    Running it day to day: configuration, deployment, and the
-    operator surfaces.
-
-    [:octicons-arrow-right-24: Operations hub](../operations/index.md)
-    &middot;
-    [Configuration](../operations/CONFIG.md)
-    &middot;
-    [CLI reference](../reference/cli-reference.md)
-
-- :material-source-pull:{ .lg .middle } **Contribute to Bernstein**
-
-    ---
-
-    Sending a PR: adapter contracts, testing conventions, and the
-    release process.
-
-    [:octicons-arrow-right-24: Contribute hub](../contributing/index.md)
-    &middot;
-    [Writing adapters](../adapters/ADAPTER_GUIDE.md)
-
-</div>
+- **Evaluate Bernstein** - See it work before you commit to it: install, run the demo, read the tutorial. Start with [Install](install.md), [First run](first-run.md), or the [Tutorial](quickstart-tutorial.md).
+- **Operate Bernstein** - Running it day to day: configuration, deployment, and the operator surfaces. See the [Operations hub](../operations/index.md), [Configuration](../operations/CONFIG.md), and [CLI reference](../reference/cli-reference.md).
+- **Contribute to Bernstein** - Sending a PR: adapter contracts, testing conventions, and the release process. See the [Contribute hub](../contributing/index.md) and [Writing adapters](../adapters/ADAPTER_GUIDE.md).
 
 ## Everyone starts here
 

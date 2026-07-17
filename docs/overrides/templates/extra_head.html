@@ -1,0 +1,12 @@
+{#
+  Injected into <head> by the shadcn theme through its extra_head include.
+  The theme's own seo.html already emits title, description, canonical,
+  og:title/description/url and twitter:title/description. Here we add the
+  site-wide social-preview image and card type, plus the author link, which
+  seo.html does not cover.
+#}
+<meta property="og:type" content="website" />
+<meta property="og:image" content="https://bernstein.readthedocs.io/assets/banner_one_command_1536x1024.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://bernstein.readthedocs.io/assets/banner_one_command_1536x1024.png" />
+<link rel="author" href="https://alexchernysh.com" />

@@ -63,37 +63,10 @@ bernstein -g "Add JWT auth with refresh tokens, tests, and API docs"
 
 ## Why Bernstein?
 
-<div class="grid cards" markdown>
-
-- :material-speedometer:{ .lg .middle } **Deterministic scheduling**
-
-    ---
-
-    Pure Python orchestration - zero LLM tokens on coordination.
-    Every decision is auditable code, not a model response.
-
-- :material-swap-horizontal:{ .lg .middle } **Any agent, any model**
-
-    ---
-
-    40+ CLI adapters: Claude Code, Codex, OpenAI Agents SDK v2, Gemini, Cursor, Aider, Cloudflare Agents, GitHub Copilot, Devin Terminal, CLM gateway, AWS Q Developer, and more.
-    Mix cheap local models with cloud models in the same run.
-
-- :material-source-branch:{ .lg .middle } **Git worktree isolation**
-
-    ---
-
-    Each agent works in its own git worktree.
-    No merge conflicts. Clean history. Parallel by default.
-
-- :material-shield-check:{ .lg .middle } **Built-in verification**
-
-    ---
-
-    Janitor system checks tests, lint, types, and PII
-    before any agent output lands in your codebase.
-
-</div>
+- **Deterministic scheduling** - Pure Python orchestration with zero LLM tokens on coordination. Every decision is auditable code, not a model response.
+- **Any agent, any model** - 40+ CLI adapters: Claude Code, Codex, OpenAI Agents SDK v2, Gemini, Cursor, Aider, Cloudflare Agents, GitHub Copilot, Devin Terminal, CLM gateway, AWS Q Developer, and more. Mix cheap local models with cloud models in the same run.
+- **Git worktree isolation** - Each agent works in its own git worktree. No merge conflicts. Clean history. Parallel by default.
+- **Built-in verification** - Janitor system checks tests, lint, types, and PII before any agent output lands in your codebase.
 
 ## Why as a forward-deployed-engineering tool
 
@@ -108,18 +81,18 @@ for client compliance review.
 
 ## Quick links
 
-| | |
+| Link | What it covers |
 |---|---|
-| :material-rocket-launch: [Install](getting-started/install.md) | Get Bernstein installed and verify it runs |
-| :material-play-circle: [First run](getting-started/first-run.md) | Take Bernstein from "installed" to "first orchestrated task complete" |
-| :material-wrench: [Configuration](operations/CONFIG.md) | bernstein.yaml reference |
-| :material-puzzle: [Adapter Guide](adapters/ADAPTER_GUIDE.md) | Supported agents and how to add your own |
-| :material-api: [API Reference](reference/openapi-reference.md) | Task server REST API |
-| :material-sitemap: [Architecture](architecture/ARCHITECTURE.md) | How Bernstein works under the hood |
-| :material-state-machine: [Lifecycle FSM](architecture/LIFECYCLE.md) | Task and agent state machines with transition tables |
-| :material-text-box-check: [What's New](whats-new.md) | Historical 1.9.x feature summary; see the [Changelog](CHANGELOG.md) for later releases |
-| :material-history: [Changelog](CHANGELOG.md) | Full release history |
-| :material-shield-lock: [Air-gap installation](installation/air-gap.md) | Wheelhouse build, signed verification, `--profile airgap`, deny-all egress |
+| [Install](getting-started/install.md) | Get Bernstein installed and verify it runs |
+| [First run](getting-started/first-run.md) | Take Bernstein from "installed" to "first orchestrated task complete" |
+| [Configuration](operations/CONFIG.md) | bernstein.yaml reference |
+| [Adapter Guide](adapters/ADAPTER_GUIDE.md) | Supported agents and how to add your own |
+| [API Reference](reference/openapi-reference.md) | Task server REST API |
+| [Architecture](architecture/ARCHITECTURE.md) | How Bernstein works under the hood |
+| [Lifecycle FSM](architecture/LIFECYCLE.md) | Task and agent state machines with transition tables |
+| [What's New](whats-new.md) | Historical 1.9.x feature summary; see the [Changelog](CHANGELOG.md) for later releases |
+| [Changelog](CHANGELOG.md) | Full release history |
+| [Air-gap installation](installation/air-gap.md) | Wheelhouse build, signed verification, `--profile airgap`, deny-all egress |
 
 ## Links
 
