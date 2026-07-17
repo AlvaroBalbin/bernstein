@@ -38,11 +38,14 @@ if TYPE_CHECKING:
 __all__ = [
     "REDACTION_TIER_ORDER",
     "SANDBOX_PROFILE_ORDER",
+    "InboundCardVerdict",
     "PolicyRequirements",
     "PolicyVerdict",
     "consume_peer_card",
     "fetch_peer_card_http",
     "policies_meet_requirements",
+    "require_inbound_agent_card_v1",
+    "verify_inbound_agent_card_v1",
 ]
 
 #: Ordering of redaction tiers from weakest to strongest. A peer satisfies a
@@ -210,6 +213,199 @@ def consume_peer_card(
     verdict = policies_meet_requirements(signed.card.policies, requirements)
     if not verdict.ok:
         raise PeerCardRejected("policy", "; ".join(verdict.failures))
+    return verdict
+
+
+# ---------------------------------------------------------------------------
+# Inbound A2A v1.0 agent-card verification (#2525)
+# ---------------------------------------------------------------------------
+#
+# The capability-card path above verifies Bernstein's own ``a2a-capability+jws``
+# artefact. Federation also needs to trust *inbound* v1.0 agent cards produced
+# by other implementations before ``delegate_task_http`` sends them work. This
+# path runs the full v1.0 conformance profile, fails closed on an unknown alg,
+# a missing kid, or an unresolvable JWKS, and gates on the operator's
+# trusted-issuer set. Each verdict is returned so the caller can anchor it as a
+# signed receipt (:func:`bernstein.core.interop.a2a_lineage.record_card_verdict`).
+
+
+@dataclass(frozen=True)
+class InboundCardVerdict:
+    """Outcome of verifying an inbound A2A v1.0 agent card.
+
+    Attributes:
+        accepted: ``True`` only when the card passes every v1.0 profile check
+            and its signing key is in the trusted-issuer set.
+        reason_code: ``""`` when accepted, else a machine-readable fail-closed
+            reason (``unknown_alg``, ``missing_kid``, ``unresolvable_jwks``,
+            ``malformed``, ``required_fields``, ``signature``, ``expired``,
+            ``untrusted_issuer``).
+        detail: Human-readable explanation of the verdict.
+        issuer: The card's declared issuer (its ``name``).
+        fingerprint: ``sha256:`` fingerprint of the resolved signing key
+            (``""`` when no key could be resolved).
+        report_hash: ``sha256:`` digest of the deterministic conformance report
+            evaluated for this verdict.
+    """
+
+    accepted: bool
+    reason_code: str
+    detail: str
+    issuer: str = ""
+    fingerprint: str = ""
+    report_hash: str = ""
+
+
+#: Maps a failed conformance check name to a fail-closed inbound reason code.
+_CONFORMANCE_REASON: dict[str, str] = {
+    "required_v1_fields": "required_fields",
+    "signatures_present": "malformed",
+    "jcs_canonical": "malformed",
+    "jws_header": "malformed",
+    "kid_resolves": "unresolvable_jwks",
+    "signature": "signature",
+    "expiry": "expired",
+}
+
+
+def _fail_closed_precheck(payload: dict[str, Any], jwks: dict[str, Any]) -> tuple[str, str] | None:
+    """Return ``(reason_code, detail)`` for an explicit fail-closed rejection.
+
+    These are the hard fail-closed gates the acceptance criteria name directly:
+    an unknown signature alg (object *or* JWS header), a missing kid, or a kid
+    that does not resolve in the JWKS. Returns ``None`` when the prechecks pass;
+    the caller then runs the full conformance profile.
+    """
+    from bernstein.core.interop.a2a_conformance import _parse_jws_header, resolve_jwk
+
+    signatures = payload.get("signatures") if isinstance(payload, dict) else None
+    if not isinstance(signatures, list) or not signatures:
+        return ("malformed", "card carries no signatures")
+    for idx, sig in enumerate(signatures):
+        if not isinstance(sig, dict):
+            return ("malformed", f"signatures[{idx}] is not an object")
+        if sig.get("alg") != "EdDSA":
+            return ("unknown_alg", f"signatures[{idx}] alg {sig.get('alg')!r} is not EdDSA")
+        kid = str(sig.get("kid", ""))
+        if not kid:
+            return ("missing_kid", f"signatures[{idx}] is missing kid")
+        header = _parse_jws_header(str(sig.get("jws", "")))
+        if header is None:
+            return ("malformed", f"signatures[{idx}] JWS is malformed or not detached")
+        if header.get("alg") != "EdDSA":
+            return ("unknown_alg", f"signatures[{idx}] JWS header alg {header.get('alg')!r} is not EdDSA")
+        if not str(header.get("kid", "")):
+            return ("missing_kid", f"signatures[{idx}] JWS header is missing kid")
+        if resolve_jwk(jwks, kid) is None:
+            return ("unresolvable_jwks", f"signatures[{idx}] kid {kid!r} does not resolve in the JWKS")
+    return None
+
+
+def verify_inbound_agent_card_v1(
+    payload: dict[str, Any],
+    *,
+    jwks: dict[str, Any],
+    trusted_issuer_fingerprints: Iterable[str],
+    now: float | None = None,
+) -> InboundCardVerdict:
+    """Verify an inbound v1.0 agent card and gate it on the trusted-issuer set.
+
+    Fail-closed: an unknown alg, a missing kid, or an unresolvable JWKS is
+    rejected before the full profile even runs. Otherwise the complete v1.0
+    conformance suite decides, and finally the resolved signing key's
+    fingerprint must be in ``trusted_issuer_fingerprints``. Never raises on
+    malformed input; a parse failure becomes a rejected verdict.
+
+    Args:
+        payload: The parsed inbound agent-card JSON.
+        jwks: The parsed JWKS the peer publishes for its signing keys.
+        trusted_issuer_fingerprints: ``sha256:`` fingerprints the operator
+            trusts (see
+            :func:`bernstein.core.interop.a2a_card.card_public_key_fingerprint`).
+        now: Optional current-time override for deterministic replay.
+
+    Returns:
+        An :class:`InboundCardVerdict`. The ``report_hash`` is stable for
+        identical ``(payload, jwks, now)`` so the verdict can be anchored as a
+        signed receipt and recomputed offline.
+    """
+    from bernstein.core.interop.a2a_conformance import check_agent_card_v1_conformance, report_hash
+
+    report = check_agent_card_v1_conformance(payload, jwks=jwks, now=now)
+    r_hash = report_hash(report)
+    issuer = report.issuer
+    fingerprint = report.fingerprint
+
+    precheck = _fail_closed_precheck(payload if isinstance(payload, dict) else {}, jwks)
+    if precheck is not None:
+        reason_code, detail = precheck
+        return InboundCardVerdict(
+            accepted=False,
+            reason_code=reason_code,
+            detail=detail,
+            issuer=issuer,
+            fingerprint=fingerprint,
+            report_hash=r_hash,
+        )
+
+    if not report.ok:
+        reason_code = "malformed"
+        detail = "card failed v1.0 conformance"
+        for check in report.checks:
+            if not check.passed:
+                reason_code = _CONFORMANCE_REASON.get(check.name, "malformed")
+                detail = f"{check.name}: {check.detail}"
+                break
+        return InboundCardVerdict(
+            accepted=False,
+            reason_code=reason_code,
+            detail=detail,
+            issuer=issuer,
+            fingerprint=fingerprint,
+            report_hash=r_hash,
+        )
+
+    if fingerprint not in set(trusted_issuer_fingerprints):
+        return InboundCardVerdict(
+            accepted=False,
+            reason_code="untrusted_issuer",
+            detail=f"resolved key fingerprint {fingerprint} is not in the trusted-issuer set",
+            issuer=issuer,
+            fingerprint=fingerprint,
+            report_hash=r_hash,
+        )
+
+    return InboundCardVerdict(
+        accepted=True,
+        reason_code="",
+        detail="card verified under the v1.0 profile and its issuer is trusted",
+        issuer=issuer,
+        fingerprint=fingerprint,
+        report_hash=r_hash,
+    )
+
+
+def require_inbound_agent_card_v1(
+    payload: dict[str, Any],
+    *,
+    jwks: dict[str, Any],
+    trusted_issuer_fingerprints: Iterable[str],
+    now: float | None = None,
+) -> InboundCardVerdict:
+    """Like :func:`verify_inbound_agent_card_v1` but raise when not accepted.
+
+    Raises:
+        PeerCardRejected: When the card is rejected; the exception's ``reason``
+            carries the fail-closed reason code.
+    """
+    verdict = verify_inbound_agent_card_v1(
+        payload,
+        jwks=jwks,
+        trusted_issuer_fingerprints=trusted_issuer_fingerprints,
+        now=now,
+    )
+    if not verdict.accepted:
+        raise PeerCardRejected(verdict.reason_code, verdict.detail)
     return verdict
 
 

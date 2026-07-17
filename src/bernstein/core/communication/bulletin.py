@@ -498,7 +498,7 @@ class BulletinBoard:
         prefix a blocker projection is computed against (#2556).
         """
         with self._lock:
-            return self._messages.copy()
+            return list(self._messages)
 
     def read_since(self, ts: float) -> list[BulletinMessage]:
         """Return all messages with timestamp strictly greater than *ts*.

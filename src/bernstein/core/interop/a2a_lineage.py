@@ -60,28 +60,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "A2A_CARD_VERDICT_RUN_ID",
+    "A2A_CARD_VERDICT_SCHEMA_VERSION",
     "A2A_MESSAGE_RECEIPT_RUN_ID",
     "A2A_MESSAGE_RECEIPT_SCHEMA_VERSION",
     "A2A_TASK_STATES",
+    "CARD_VERDICT_DECISIONS",
     "CROSS_ORG_BOUNDARY_MARKER",
     "JOURNAL_TERMINAL_STATES",
     "LINEAGE_ENVELOPE_FIELD",
     "LINEAGE_ENVELOPE_SCHEMA_VERSION",
     "A2AMessageReceipt",
     "A2AThreadVerifyResult",
+    "CardVerdictReceipt",
+    "CardVerdictVerifyResult",
     "InboundTaskIsolation",
     "InboundTaskRejected",
     "LineageEnvelope",
     "TaskStateMapping",
     "accept_inbound_task",
     "append_cross_org_segment",
+    "card_verdict_path",
     "chain_digest",
     "compute_message_hash",
     "isolate_inbound_task",
     "map_task_state",
     "message_receipt_path",
+    "read_card_verdict",
     "read_message_receipt",
     "record_a2a_message",
+    "record_card_verdict",
+    "verify_card_verdict",
     "verify_thread",
     "wrap_lineage_chain",
 ]
@@ -988,3 +997,335 @@ def _write_message_receipt(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
         encoding="utf-8",
     )
+
+
+# ===========================================================================
+# Chain-anchored card-verdict receipts (#2525)
+# ---------------------------------------------------------------------------
+# Card-level identity alone proves a peer's card is well-signed; it does not
+# prove *why an operator decided to trust (or refuse) that peer*, nor tie the
+# decision to the exchanges that followed. Here every accept/reject verdict on
+# an inbound A2A v1.0 agent card becomes a signed receipt binding
+# ``{decision, issuer, peer_card_fingerprint, reason_code, report_hash}`` and
+# anchored to a dedicated verdict spine that shares the same HMAC audit key and
+# install identity as the message receipts above. A third party recomputes the
+# deterministic conformance report, confirms its hash matches the receipt, and
+# checks the receipt against the same chain that carries the message receipts
+# for the exchanges that followed - the trust decision and the traffic it
+# authorised verify together, offline.
+#
+# The receipt is the artefact: strip the spine and the Ed25519 signature and it
+# is a bare JSON line - card-level identity with a log. Anchored and signed, it
+# is a chain-verifiable attestation of the decision itself.
+# ===========================================================================
+
+#: Dedicated spine run id for card-verdict receipts. Kept separate from the
+#: message-receipt run so verdicts and per-message receipts do not interleave,
+#: while both anchor under the same lineage root and HMAC key.
+A2A_CARD_VERDICT_RUN_ID: str = "a2a-card-verdicts"
+
+#: Version stamped into every verdict-receipt binding preimage.
+A2A_CARD_VERDICT_SCHEMA_VERSION: int = 1
+
+#: The two verdict decisions a receipt can record.
+CARD_VERDICT_DECISIONS: frozenset[str] = frozenset({"accept", "reject"})
+
+_VERDICT_SUBPATH = (".sdd", "a2a-card-verdicts")
+_VERDICT_ACTOR = "bernstein.a2a_card_verdict"
+_VERDICT_MODEL = "none"
+
+
+@dataclass(frozen=True)
+class CardVerdictReceipt:
+    """Signed receipt for one inbound-card accept/reject verdict.
+
+    The binding ``{decision, issuer, peer_card_fingerprint, reason_code,
+    report_hash, task_ref, seq, timestamp}`` is what the install signs and the
+    spine anchors. A holder of the receipt, the deterministic conformance
+    report, and the spine can prove the operator reached ``decision`` over that
+    exact report, without trusting the operator's logs.
+
+    Attributes:
+        task_ref: The delegation / thread reference the verdict belongs to.
+        decision: ``accept`` or ``reject``.
+        issuer: The card's declared issuer (``name`` for a v1.0 agent card).
+        peer_card_fingerprint: ``sha256:`` fingerprint of the peer's signing
+            key (``""`` when the card was too malformed to resolve a key).
+        reason_code: Machine-readable verdict reason (``""`` on accept, else the
+            named failure, e.g. ``unknown_alg`` / ``untrusted_issuer``).
+        report_hash: ``sha256:`` digest of the deterministic conformance report.
+        seq: Verdict index within the ``task_ref`` thread (0-based).
+        timestamp: Integer timestamp; caller-chosen but stable.
+        signer_public_key_pem: The install's Ed25519 public key.
+        signature: Ed25519 detached signature over the canonical binding.
+        journal_entry_hash: The verdict-spine entry hash anchoring the receipt.
+    """
+
+    task_ref: str
+    decision: str
+    issuer: str
+    peer_card_fingerprint: str
+    reason_code: str
+    report_hash: str
+    seq: int = 0
+    timestamp: int = 0
+    signer_public_key_pem: str = ""
+    signature: str = ""
+    journal_entry_hash: str = ""
+
+    def _binding(self) -> dict[str, Any]:
+        return {
+            "v": A2A_CARD_VERDICT_SCHEMA_VERSION,
+            "task_ref": self.task_ref,
+            "decision": self.decision,
+            "issuer": self.issuer,
+            "peer_card_fingerprint": self.peer_card_fingerprint,
+            "reason_code": self.reason_code,
+            "report_hash": self.report_hash,
+            "seq": self.seq,
+            "timestamp": self.timestamp,
+        }
+
+    def to_canonical_bytes(self) -> bytes:
+        """Serialise the binding to canonical JSON bytes (signed + anchored)."""
+        return _canonical_bytes(self._binding())
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._binding() | {
+            "signer_public_key_pem": self.signer_public_key_pem,
+            "signature": self.signature,
+            "journal_entry_hash": self.journal_entry_hash,
+        }
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> CardVerdictReceipt:
+        row = json.loads(raw)
+        return cls(
+            task_ref=str(row["task_ref"]),
+            decision=str(row["decision"]),
+            issuer=str(row["issuer"]),
+            peer_card_fingerprint=str(row["peer_card_fingerprint"]),
+            reason_code=str(row["reason_code"]),
+            report_hash=str(row["report_hash"]),
+            seq=int(row.get("seq", 0)),
+            timestamp=int(row["timestamp"]),
+            signer_public_key_pem=str(row.get("signer_public_key_pem", "")),
+            signature=str(row.get("signature", "")),
+            journal_entry_hash=str(row.get("journal_entry_hash", "")),
+        )
+
+
+def card_verdict_path(workdir: Path, *, task_ref: str, seq: int) -> Path:
+    """Return the on-disk verdict-receipt path for ``seq`` of ``task_ref``."""
+    return workdir.joinpath(*_VERDICT_SUBPATH, _slug(task_ref), f"{seq:04d}.json")
+
+
+def read_card_verdict(workdir: Path, *, task_ref: str, seq: int) -> CardVerdictReceipt | None:
+    """Return the verdict receipt for ``seq`` of ``task_ref`` or ``None``."""
+    path = card_verdict_path(workdir, task_ref=task_ref, seq=seq)
+    if not path.is_file():
+        return None
+    try:
+        return CardVerdictReceipt.from_bytes(path.read_bytes())
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.warning("a2a_card_verdict: malformed receipt at %s", sanitize_log(str(path)))
+        return None
+
+
+def record_card_verdict(
+    *,
+    workdir: Path,
+    lineage_root: Path,
+    hmac_key: bytes,
+    identity_dir: Path,
+    task_ref: str,
+    decision: str,
+    issuer: str,
+    peer_card_fingerprint: str,
+    reason_code: str,
+    report_hash: str,
+    timestamp: int,
+    seq: int = 0,
+) -> CardVerdictReceipt:
+    """Write a signed, spine-anchored receipt for one inbound-card verdict.
+
+    Every accept/reject decision on an inbound v1.0 agent card is anchored to
+    the dedicated verdict spine and signed with the install's Ed25519 identity,
+    so an operator can prove offline *why* a remote agent was accepted or
+    refused, cross-checkable against the message receipts that followed.
+
+    Args:
+        workdir: Project root; receipts land under ``.sdd/a2a-card-verdicts/``.
+        lineage_root: Spine root (``.sdd/lineage``).
+        hmac_key: The audit-chain HMAC key that tags the spine entries.
+        identity_dir: Directory holding the install's Ed25519 identity (the
+            same one that signs message receipts, so both chains share a signer).
+        task_ref: The delegation / thread reference the verdict belongs to.
+        decision: ``accept`` or ``reject``.
+        issuer: The card's declared issuer.
+        peer_card_fingerprint: ``sha256:`` fingerprint of the peer's card key.
+        reason_code: Machine-readable verdict reason (``""`` on accept).
+        report_hash: ``sha256:`` digest of the deterministic conformance report.
+        timestamp: Integer timestamp for the receipt.
+        seq: The 0-based verdict index within the ``task_ref`` thread.
+
+    Returns:
+        The signed, anchored :class:`CardVerdictReceipt`.
+
+    Raises:
+        ValueError: When ``decision`` is not ``accept`` or ``reject``.
+    """
+    if decision not in CARD_VERDICT_DECISIONS:
+        raise ValueError(f"unknown verdict decision: {decision!r} (expected one of {sorted(CARD_VERDICT_DECISIONS)})")
+
+    private_pem, public_pem = _load_or_create_message_identity(identity_dir)
+    payload = CardVerdictReceipt(
+        task_ref=task_ref,
+        decision=decision,
+        issuer=issuer,
+        peer_card_fingerprint=peer_card_fingerprint,
+        reason_code=reason_code,
+        report_hash=report_hash,
+        seq=seq,
+        timestamp=timestamp,
+    ).to_canonical_bytes()
+    signature = sign_payload(payload, private_pem)
+
+    spine = LineageSpine(lineage_root, run_id=A2A_CARD_VERDICT_RUN_ID, hmac_key=hmac_key)
+    artifact_path = "/".join((*_VERDICT_SUBPATH, _slug(task_ref), f"{seq:04d}.json"))
+    anchor = spine.record(
+        artifact_path=artifact_path,
+        content=payload,
+        actor=_VERDICT_ACTOR,
+        step_id=report_hash,
+        model=_VERDICT_MODEL,
+        timestamp=timestamp,
+    )
+    anchored = CardVerdictReceipt(
+        task_ref=task_ref,
+        decision=decision,
+        issuer=issuer,
+        peer_card_fingerprint=peer_card_fingerprint,
+        reason_code=reason_code,
+        report_hash=report_hash,
+        seq=seq,
+        timestamp=timestamp,
+        signer_public_key_pem=public_pem,
+        signature=signature,
+        journal_entry_hash=anchor,
+    )
+    _write_message_receipt(card_verdict_path(workdir, task_ref=task_ref, seq=seq), anchored.to_dict())
+    return anchored
+
+
+@dataclass(frozen=True)
+class CardVerdictVerifyResult:
+    """Outcome of :func:`verify_card_verdict`.
+
+    Attributes:
+        ok: ``True`` only when every verdict receipt in the thread verifies
+            against the spine and its Ed25519 signature, offline.
+        reason: Human-readable failure reason; empty when ``ok``.
+        verdict_count: The number of verdict receipts checked.
+        task_ref: The thread reference the receipts belong to.
+    """
+
+    ok: bool
+    reason: str
+    verdict_count: int = 0
+    task_ref: str = ""
+
+
+def _iter_verdict_receipts(workdir: Path, task_ref: str) -> list[CardVerdictReceipt]:
+    """Return the verdict receipts for a thread in ``seq`` order."""
+    thread_dir = workdir.joinpath(*_VERDICT_SUBPATH, _slug(task_ref))
+    if not thread_dir.is_dir():
+        return []
+    receipts: list[CardVerdictReceipt] = []
+    for path in sorted(thread_dir.glob("*.json")):
+        try:
+            receipts.append(CardVerdictReceipt.from_bytes(path.read_bytes()))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.warning("a2a_card_verdict: malformed receipt at %s", sanitize_log(str(path)))
+            continue
+    receipts.sort(key=lambda r: r.seq)
+    return receipts
+
+
+def verify_card_verdict(
+    *,
+    workdir: Path,
+    lineage_root: Path,
+    hmac_key: bytes,
+    task_ref: str,
+) -> CardVerdictVerifyResult:
+    """Prove an inbound-card verdict thread verifies offline (#2525).
+
+    For every verdict receipt under ``task_ref`` this re-checks the Ed25519
+    signature offline, verifies the verdict spine, and re-anchors the receipt
+    against it. A single-byte edit to any receipt or spine entry fails the
+    check. An empty thread is *not* ``ok``.
+    """
+    receipts = _iter_verdict_receipts(workdir, task_ref)
+    if not receipts:
+        return CardVerdictVerifyResult(
+            ok=False,
+            reason=f"no verdict receipts found for {task_ref!r}",
+            task_ref=task_ref,
+        )
+
+    spine = LineageSpine(lineage_root, run_id=A2A_CARD_VERDICT_RUN_ID, hmac_key=hmac_key)
+    spine_result = spine.verify()
+    if not spine_result.ok:
+        return CardVerdictVerifyResult(
+            ok=False,
+            reason=f"verdict spine failed verification ({spine_result.status.value})",
+            verdict_count=len(receipts),
+            task_ref=task_ref,
+        )
+
+    for receipt in receipts:
+        if receipt.decision not in CARD_VERDICT_DECISIONS:
+            return CardVerdictVerifyResult(
+                ok=False,
+                reason=f"verdict {receipt.seq}: unknown decision {receipt.decision!r}",
+                verdict_count=len(receipts),
+                task_ref=task_ref,
+            )
+        if not receipt.signature or not receipt.signer_public_key_pem:
+            return CardVerdictVerifyResult(
+                ok=False,
+                reason=f"verdict {receipt.seq}: receipt is unsigned",
+                verdict_count=len(receipts),
+                task_ref=task_ref,
+            )
+        outcome = verify_payload(
+            receipt.to_canonical_bytes(),
+            receipt.signature,
+            receipt.signer_public_key_pem,
+            allow_unverified=True,
+        )
+        if not outcome.verified:
+            return CardVerdictVerifyResult(
+                ok=False,
+                reason=f"verdict {receipt.seq}: signature does not verify ({outcome.reason})",
+                verdict_count=len(receipts),
+                task_ref=task_ref,
+            )
+        anchor = _anchor_for(spine, receipt.to_canonical_bytes())
+        if anchor is None:
+            return CardVerdictVerifyResult(
+                ok=False,
+                reason=f"verdict {receipt.seq}: receipt is not anchored in the verdict spine",
+                verdict_count=len(receipts),
+                task_ref=task_ref,
+            )
+        if anchor != receipt.journal_entry_hash:
+            return CardVerdictVerifyResult(
+                ok=False,
+                reason=f"verdict {receipt.seq}: anchor does not match the spine entry over the receipt bytes",
+                verdict_count=len(receipts),
+                task_ref=task_ref,
+            )
+
+    return CardVerdictVerifyResult(ok=True, reason="", verdict_count=len(receipts), task_ref=task_ref)

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import operator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -81,7 +80,7 @@ def latest_two_snapshots(
         except ValueError:
             continue
         dated.append((day, path))
-    dated.sort(key=operator.itemgetter(0))
+    dated.sort(key=lambda item: item[0])
     if not dated:
         return (None, None)
     curr = _load(dated[-1][1])

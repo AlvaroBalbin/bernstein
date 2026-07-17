@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import operator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -131,7 +130,7 @@ class FloorMapDiff:
         return {
             "added": sorted(self.added),
             "removed": sorted(self.removed),
-            "changed": sorted(self.changed, key=operator.itemgetter("adapter", "field")),
+            "changed": sorted(self.changed, key=lambda c: (c["adapter"], c["field"])),
         }
 
 
@@ -165,16 +164,12 @@ def render_advisory_block(mapping: dict[str, AdapterAdvisory]) -> str:
     lines = ["ADAPTER_MIN_SAFE_VERSIONS: dict[str, AdapterAdvisory] = {"]
     for name in sorted(mapping):
         adv = mapping[name]
-        lines.extend(
-            (
-                f'    "{name}": AdapterAdvisory(',
-                f'        adapter="{adv.adapter}",',
-                f'        min_safe_version="{adv.min_safe_version}",',
-                f'        advisory_id="{adv.advisory_id}",',
-                f'        note="{adv.note}",',
-                "    ),",
-            )
-        )
+        lines.append(f'    "{name}": AdapterAdvisory(')
+        lines.append(f'        adapter="{adv.adapter}",')
+        lines.append(f'        min_safe_version="{adv.min_safe_version}",')
+        lines.append(f'        advisory_id="{adv.advisory_id}",')
+        lines.append(f'        note="{adv.note}",')
+        lines.append("    ),")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
