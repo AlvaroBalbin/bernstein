@@ -91,11 +91,6 @@ from bernstein.core.models import (
 )
 from bernstein.core.notifications import NotificationManager, NotificationPayload, NotificationTarget
 from bernstein.core.orchestration.adaptive_parallelism import AdaptiveParallelism
-from bernstein.core.orchestration.event_channel_router import (
-    agent_uses_acp_channel,
-    iter_journal_frames,
-    route_agent_lifecycle,
-)
 from bernstein.core.orchestration.evolution import EvolutionCoordinator
 from bernstein.core.orchestration.tick_pipeline import (
     CompletionData,
@@ -607,12 +602,6 @@ class Orchestrator:
         # absence of mutation entries distinguishable from an inability to
         # observe them.
         self._mutation_capability_recorded: set[str] = set()
-
-        # Sessions whose ACP event channel has already been driven into the run
-        # journal (#2522 follow-up). The monitoring loop drives an ACP-declared
-        # adapter's structured lifecycle once, after its process exits; this set
-        # keeps that pass idempotent across ticks.
-        self._acp_driven: set[str] = set()
 
         # Replay gateway: captures LLM + tool dispatch responses into
         # .sdd/runs/{run_id}/events.jsonl so a run can be re-executed
@@ -1510,12 +1499,6 @@ class Orchestrator:
 
         # Sync failure timestamps to spawner for cooldown enforcement
         self._spawner._agent_failure_timestamps = self._agent_failure_timestamps
-
-        # Route finished ACP-declared adapters (goose/kilo) through the ACP event
-        # channel before dead-agent finalization purges them: their structured
-        # JSON-RPC lifecycle is chained into the run journal content-addressed
-        # instead of falling through the text-signal path (#2522 follow-up).
-        self._drive_finished_acp_channels()
 
         refresh_agent_states(self, tasks_by_status)
         alive_count = sum(1 for a in self._agents.values() if a.status != "dead")
@@ -4901,62 +4884,6 @@ class Orchestrator:
                 agent_id,
                 type(exc).__name__,
             )
-
-    def _resolve_acp_log_path(self, session: AgentSession) -> Path:
-        """Resolve the file capturing a session's upstream JSON-RPC frame stream.
-
-        Prefers the session's recorded ``log_path`` when it exists, else the
-        canonical per-session runtime log. Mirrors the primary branches of
-        :func:`bernstein.core.agents.agent_lifecycle._resolve_agent_log_path`
-        without importing a private symbol across modules.
-        """
-        from pathlib import Path
-
-        recorded = getattr(session, "log_path", "")
-        if recorded and Path(recorded).exists():
-            return Path(recorded)
-        return self._workdir / ".sdd" / "runtime" / f"{session.id}.log"
-
-    def _drive_finished_acp_channels(self) -> None:
-        """Route finished ACP-declared agents through the ACP event channel.
-
-        Follow-up to the ACP transport (#2522): the monitoring loop reads the run
-        adapter's declared ``EventChannel``. When it is
-        :attr:`~bernstein.adapters._contract.EventChannel.ACP` (``goose`` /
-        ``kilo``), each tracked agent whose process has exited has its captured
-        JSON-RPC frame stream validated and chained into the run journal
-        content-addressed via the structured ACP lifecycle - not the
-        ``BERNSTEIN:`` text grammar. Text-signal adapters are left entirely on
-        their existing path (the method returns immediately for a non-ACP run).
-
-        The frame stream is only complete once the process has exited, so a
-        still-alive agent is skipped and revisited on a later tick. The pass is
-        idempotent - each session is driven at most once via ``_acp_driven`` -
-        and every failure is logged and swallowed so channel routing can never
-        break a tick.
-        """
-        adapter_name = getattr(self._spawner, "default_adapter_name", "") or ""
-        if not agent_uses_acp_channel(adapter_name):
-            return
-        for session in list(self._agents.values()):
-            if session.id in self._acp_driven:
-                continue
-            if session.status != "dead" and self._spawner.check_alive(session):
-                continue
-            self._acp_driven.add(session.id)
-            try:
-                route_agent_lifecycle(
-                    adapter_name,
-                    iter_journal_frames(self._resolve_acp_log_path(session)),
-                    journal=self._recorder,
-                    session_id=session.id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "acp-channel: routing failed for agent %s: %s",
-                    session.id,
-                    type(exc).__name__,
-                )
 
     def _log_summary(self, result: TickResult) -> None:
         """Write a one-line summary and agent state snapshot each tick."""
