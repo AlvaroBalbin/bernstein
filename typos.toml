@@ -13,6 +13,9 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
+cose = "cose"        # COSE_Sign1 signing envelope (RFC 9052, audit receipts)
+COSE = "COSE"        # COSE_Sign1 signing envelope (RFC 9052, acronym)
+intoto = "intoto"    # in-toto attestation format (audit receipts)
 # Variable names and abbreviations in code
 ba = "ba"            # ba_table = Budget & Approval table (manifest_cmd.py)
 nd = "nd"            # nd = number of diffs (benchmarks/run_benchmark.py)
