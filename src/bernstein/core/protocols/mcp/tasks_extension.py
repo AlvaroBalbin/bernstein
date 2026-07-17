@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from pathlib import Path
 
+    from bernstein.core.replay.progress import ProgressVector
     from bernstein.core.security.audit_chain import AuditChainStore
 
 __all__ = [
@@ -202,13 +203,16 @@ def _receipt_hash(
     chain_head: str,
     spec_revision: str,
     trace_id: str,
+    progress_hash: str,
 ) -> str:
     """Return the content-addressed digest that identifies a run handle.
 
     The pre-image is a canonical field tuple, so two handles projecting the
     same run state hash identically and any tampered field surfaces as a
-    different receipt hash. Wall-clock is deliberately excluded: the receipt
-    is a deterministic projection, not a timestamped record.
+    different receipt hash. The progress vector's hash is included so a client
+    cannot swap the carried progress without invalidating the receipt. Wall
+    clock is deliberately excluded: the receipt is a deterministic projection,
+    not a timestamped record.
     """
     preimage = json.dumps(
         {
@@ -219,6 +223,7 @@ def _receipt_hash(
             "chain_head": chain_head,
             "spec_revision": spec_revision,
             "trace_id": trace_id,
+            "progress_hash": progress_hash,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -252,6 +257,16 @@ class RunHandle:
     chain_head: str
     spec_revision: str = SPEC_REVISION
     trace_id: str = ""
+    #: The task's chain-computed progress vector (#2553), when the caller has
+    #: projected one. Carried on the handle so a poller sees how far along the
+    #: task is, not just its lifecycle status. It is a projection of journaled
+    #: work, never self-reported: a worker moves it only by doing real work.
+    progress: ProgressVector | None = None
+
+    @property
+    def progress_hash(self) -> str:
+        """Stable hash of the carried progress vector, or ``""`` when absent."""
+        return self.progress.vector_hash() if self.progress is not None else ""
 
     @property
     def receipt_hash(self) -> str:
@@ -264,6 +279,7 @@ class RunHandle:
             chain_head=self.chain_head,
             spec_revision=self.spec_revision,
             trace_id=self.trace_id,
+            progress_hash=self.progress_hash,
         )
 
     @property
@@ -299,6 +315,8 @@ class RunHandle:
             "traceId": self.trace_id,
             "receiptHash": self.receipt_hash,
             "pollToken": self.poll_token,
+            "progress": self.progress.to_wire() if self.progress is not None else None,
+            "progressHash": self.progress_hash,
         }
 
     @staticmethod
@@ -309,6 +327,7 @@ class RunHandle:
         events: Iterable[Mapping[str, Any]],
         chain_head: str,
         trace_id: str = "",
+        progress: ProgressVector | None = None,
     ) -> RunHandle:
         """Project a handle from a run journal and the current chain head.
 
@@ -331,6 +350,7 @@ class RunHandle:
             journal_head=_journal_head(rows),
             chain_head=chain_head,
             trace_id=trace_id,
+            progress=progress,
         )
 
 
@@ -344,7 +364,12 @@ def decode_poll_token(token: str) -> dict[str, Any]:
     return decode_request_state(token)
 
 
-def verify_handle(handle: RunHandle, events: Iterable[Mapping[str, Any]]) -> tuple[bool, str | None]:
+def verify_handle(
+    handle: RunHandle,
+    events: Iterable[Mapping[str, Any]],
+    *,
+    progress: ProgressVector | None = None,
+) -> tuple[bool, str | None]:
     """Confirm a handle is a faithful projection of a run journal.
 
     Reprojects the status and journal head from ``events`` and recomputes the
@@ -352,9 +377,19 @@ def verify_handle(handle: RunHandle, events: Iterable[Mapping[str, Any]]) -> tup
     claiming ``completed`` while the journal shows only ``working``) fails,
     because the projected receipt hash will not match.
 
+    When a handle carries a progress vector, the vector is **not** trusted from
+    the handle: the caller must supply the authoritative ``progress`` (projected
+    from the journal, ledger, and evidence via
+    :func:`bernstein.core.replay.progress.project_task_progress`), and the
+    presented vector must match it. Because ``progress_hash`` is part of the
+    receipt pre-image, a client cannot swap the vector without also failing the
+    receipt-hash check.
+
     Args:
         handle: The handle presented by a client.
         events: The authoritative ordered journal rows for the run.
+        progress: The authoritative progress vector, required when the handle
+            carries one; ignored when the handle has no progress.
 
     Returns:
         ``(True, None)`` when the handle matches the journal projection, or
@@ -367,6 +402,11 @@ def verify_handle(handle: RunHandle, events: Iterable[Mapping[str, Any]]) -> tup
     expected_head = _journal_head(rows)
     if handle.journal_head != expected_head:
         return False, "journal_head does not match the run journal"
+    if handle.progress is not None:
+        if progress is None:
+            return False, "handle carries progress but no authoritative progress vector was supplied"
+        if handle.progress.vector_hash() != progress.vector_hash():
+            return False, "progress vector does not match the authoritative projection"
     expected = RunHandle(
         task_id=handle.task_id,
         run_id=handle.run_id,
@@ -375,6 +415,7 @@ def verify_handle(handle: RunHandle, events: Iterable[Mapping[str, Any]]) -> tup
         chain_head=handle.chain_head,
         spec_revision=handle.spec_revision,
         trace_id=handle.trace_id,
+        progress=progress if handle.progress is not None else None,
     )
     if expected.receipt_hash != handle.receipt_hash:
         return False, "receipt_hash does not match the projected handle"
