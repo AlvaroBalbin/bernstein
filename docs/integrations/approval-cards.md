@@ -35,6 +35,14 @@ guarantee.
    envelope from what they read and confirm it hashes to the displayed
    `card_hash`.
 
+   Field values have their line separators escaped. One row per line is what
+   makes the projection readable, and that is exactly what an agent-supplied
+   value containing a newline would exploit: unescaped, `reasoning` can render
+   a structurally complete, benign-looking card ending in a forged
+   `Card hash:` row *above* the true fields, so an operator approving from the
+   rendered text approves the forgery. The escape is injective, so the display
+   stays lossless, and it happens at render time only, so no `card_hash` moves.
+
    The rendered body is bounded and does not grow with argument length, because
    no chat driver chunks: Discord rejects a body over 2000 characters and Slack
    caps a section at 3000, and an oversized card is not truncated, it fails to
@@ -62,14 +70,33 @@ guarantee.
 3. **Verify offline.** `bernstein audit verify` walks the chain in order and,
    for every resolved card, confirms the stored envelope still hashes to its
    recorded `card_hash`, that the decision echoed an envelope issued *earlier
-   in the chain*, that no card is settled twice, and that the decision timestamp
-   is finite, positive, and inside the envelope's window
-   (`created_at <= resolved_at < not_after`).
+   in the chain*, that no card is settled twice, that the decision is one the
+   gate would accept, that it was settled from the origin the card was issued
+   into, and that the decision timestamp is finite, positive, and inside the
+   envelope's window (`created_at <= resolved_at < not_after`).
 
-The gate and the verifier enforce the same window. The gate refuses
-`before_issue` rather than appending a settlement its own verifier would
-reject: the audit log is append-only, so such a record would make
-`bernstein audit verify` fail permanently with no remediation.
+   The verifier **reports, it never raises.** Every event is processed under a
+   guard that turns any fault into a recorded failure. This matters because the
+   approval-card pillar runs before three others in `bernstein audit verify`:
+   an escaping exception would abort the run, so one malformed record could
+   suppress detection of unrelated tampering elsewhere. A verifier that its own
+   input can crash is a denial-of-audit primitive, not a check.
+
+   The pinned origin is read from the **issue** event, not from the
+   `issued_*` keys on the settlement being checked, so a forger cannot clear
+   the origin check by rewriting both halves of the pair to agree.
+
+The gate and the verifier enforce the same window, in full: a settlement
+timestamp must be finite, strictly positive, and at or after `created_at`. The
+gate refuses `before_issue` rather than appending a settlement its own verifier
+would reject, because the audit log is append-only and such a record would make
+`bernstein audit verify` fail permanently with no remediation. Checking only
+one half of the window would still let a card issued at `created_at = 0`
+settle at `now = 0.0` and write exactly that record.
+
+Everything the gate enforces, the verifier reconstructs. The gate is the live
+control and the chain is the proof, so an invariant that held only at the gate
+would be unauditable on a chain written by an older build or a second writer.
 
 ## Settling exactly once
 

@@ -391,13 +391,18 @@ def test_build_card_rejects_non_finite_created_at(bad: float) -> None:
         )
 
 
-def test_integer_timestamps_widen_so_the_hash_stays_stable() -> None:
-    """An int timestamp must not produce different canonical bytes than a float.
+def test_require_finite_widens_int_timestamps_to_float() -> None:
+    """Revert-checked: fails if ``_require_finite`` stops widening to ``float``.
 
-    ``json.dumps`` emits ``1000`` for an int and ``1000.0`` for a float, so
-    without widening, the same instant would hash to two different cards.
+    Previously this asserted equal canonical bytes, which ``to_dict``'s own
+    coercion guarantees whether or not ``_require_finite`` widens -- so it
+    passed with the line it named reverted and proved nothing. The widening's
+    observable effect is the *type* the envelope carries, which downstream
+    float comparisons and ``repr`` rendering depend on, so that is what is
+    asserted here. Canonical-byte stability is covered by
+    ``test_to_dict_is_a_fixed_point_of_the_round_trip``.
     """
-    as_int = build_card(
+    card = build_card(
         approval_id="ap-1",
         tool_name="Edit",
         tool_args={"file_path": "a.py"},
@@ -405,16 +410,12 @@ def test_integer_timestamps_widen_so_the_hash_stays_stable() -> None:
         created_at=1_000,
         ttl_seconds=600,
     )
-    as_float = build_card(
-        approval_id="ap-1",
-        tool_name="Edit",
-        tool_args={"file_path": "a.py"},
-        reasoning="r",
-        created_at=1_000.0,
-        ttl_seconds=600.0,
-    )
-    assert canonical_card_bytes(as_int) == canonical_card_bytes(as_float)
-    assert card_hash(as_int) == card_hash(as_float)
+    assert isinstance(card.created_at, float)
+    assert isinstance(card.not_after, float)
+    rebuilt = ApprovalCardV2.from_dict({**card.to_dict(), "created_at": 1_000, "not_after": 1_600})
+    assert isinstance(rebuilt.created_at, float)
+    assert isinstance(rebuilt.not_after, float)
+    assert isinstance(ImpactEstimate.from_dict({"score": 1}).score, float)
 
 
 @pytest.mark.parametrize("bad", ["1000.0", None, True, {"v": 1}, []])
@@ -807,3 +808,433 @@ def test_verifier_accepts_a_well_formed_pair(tmp_path: Path) -> None:
     result = verify_approval_cards(tmp_path / "audit", key=_KEY)
     assert result.ok, result.errors
     assert result.reconstructed_count == 1
+
+
+# ---------------------------------------------------------------------------
+# A verifier must report, never raise: an escaping exception is a
+# denial-of-audit primitive, not a detection
+# ---------------------------------------------------------------------------
+
+
+def _poison_score(audit_dir: Path, *, line_index: int = 0, prepend: bool = False) -> None:
+    """Rewrite a stored issue event so its envelope carries a non-finite score.
+
+    ``AuditLog.query`` does not check the HMAC, so a plain file write is enough;
+    no key is required. This models a tamperer with write access to the log.
+    """
+    path = sorted(audit_dir.glob("*.jsonl"))[0]
+    lines = path.read_text().splitlines()
+    poisoned = json.loads(lines[line_index])
+    poisoned["details"]["envelope"]["impact"]["score"] = float("nan")
+    rendered = json.dumps(poisoned)
+    if prepend:
+        path.write_text(rendered + "\n" + "\n".join(lines) + "\n")
+        return
+    lines[line_index] = rendered
+    path.write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_impact_score_must_be_finite(bad: float) -> None:
+    """Revert-checked: fails if ``impact.score`` loses its finite guard.
+
+    Only ``created_at`` / ``not_after`` were guarded originally, so a stored
+    ``NaN`` score reached :func:`card_hash`, which raises because canonical
+    JSON refuses non-finite values.
+    """
+    with pytest.raises(ValueError, match="finite number"):
+        ImpactEstimate.from_dict({"score": bad})
+
+
+def test_verifier_reports_a_non_finite_envelope_instead_of_raising(tmp_path: Path) -> None:
+    """Revert-checked: fails if ``card_hash`` moves back outside the try.
+
+    ``bernstein audit verify`` calls this pillar with no try/except of its own,
+    and three unrelated pillars run after it. An escaping exception therefore
+    lets one planted NaN suppress detection of tampering everywhere else, which
+    is strictly worse than the mutation it fails to report. On main the same
+    input is correctly reported as a mutated envelope.
+    """
+    chain = _chain(tmp_path)
+    _issue_via_gate(chain, _card())
+    _poison_score(tmp_path / "audit")
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+
+    assert not result.ok
+    assert result.errors
+
+
+def test_verifier_reports_rather_than_raises_on_any_event_fault(tmp_path: Path) -> None:
+    """Revert-checked: fails without the per-event guard in the verify loop.
+
+    Uses a fault the inner handlers deliberately do not cover -- ``details``
+    that is not a mapping at all, so the very first ``details.get`` raises
+    ``AttributeError`` before any inner ``try`` is entered. The point of the
+    outer guard is exactly this class: a fault nobody anticipated must still be
+    reported rather than abort the run and suppress the pillars that follow.
+    """
+    chain = _chain(tmp_path)
+    _issue_via_gate(chain, _card())
+    path = sorted((tmp_path / "audit").glob("*.jsonl"))[0]
+    lines = path.read_text().splitlines()
+    broken = json.loads(lines[0])
+    broken["details"] = "not-a-mapping"
+    lines[0] = json.dumps(broken)
+    path.write_text("\n".join(lines) + "\n")
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("could not be verified" in e for e in result.errors)
+
+
+def test_a_poisoned_sibling_event_does_not_brick_a_legitimate_card(tmp_path: Path) -> None:
+    """Revert-checked: fails if ``card_hash`` moves back outside the try in _rehydrate.
+
+    An attacker who can write the log can prepend one crafted issue event
+    claiming a victim card's ``card_hash``. If rehydration raises on it, the
+    legitimate, unexpired, correctly-pinned card becomes unresolvable forever
+    on an append-only log, and because the raise escapes before any guard runs,
+    nothing is chain-recorded either: the denial of service is itself unaudited.
+    """
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(), worktree_id="wt-a", thread_id="C42")
+    _poison_score(tmp_path / "audit", prepend=True)
+
+    restarted = ApprovalCardGate(_chain(tmp_path))
+    settled = restarted.resolve(
+        card_hash=issued.card_hash,
+        decision="approve",
+        worktree_id="wt-a",
+        thread_id="C42",
+        now=1_100.0,
+    )
+    assert settled.card_hash == issued.card_hash
+    assert len(_chain(tmp_path).query(event_type=EVENT_APPROVAL_CARD_RESOLVED)) == 1
+
+
+def test_an_unknown_poisoned_card_is_refused_on_the_chain(tmp_path: Path) -> None:
+    """A card that only exists as a poisoned envelope is refused, and audited."""
+    chain = _chain(tmp_path)
+    issued = ApprovalCardGate(chain).issue(_card())
+    _poison_score(tmp_path / "audit")
+
+    restarted_chain = _chain(tmp_path)
+    with pytest.raises(ApprovalCardHashMismatch):
+        ApprovalCardGate(restarted_chain).resolve(card_hash=issued.card_hash, decision="approve", now=1_100.0)
+    # The refusal reaches the chain rather than escaping as an exception.
+    assert _reasons(restarted_chain) == [REFUSAL_REASON_HASH_MISMATCH]
+
+
+# ---------------------------------------------------------------------------
+# The verifier must reconstruct everything the gate enforces
+# ---------------------------------------------------------------------------
+
+
+def _raw_settlement(chain: AuditChainStore, digest: str, **details: Any) -> None:
+    payload: dict[str, Any] = {"card_hash": digest, "decision": "approve", "resolved_at": 1_100.0}
+    payload.update(details)
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_RESOLVED,
+        actor="attacker",
+        resource_type="approval_card",
+        resource_id=digest,
+        details=payload,
+    )
+
+
+def test_verifier_rejects_a_settlement_with_an_invalid_decision(tmp_path: Path) -> None:
+    """Revert-checked: fails without ``_check_decision``.
+
+    The gate refuses this live. The same argument that makes double-settlement
+    worth reconstructing applies: a chain written by an unpatched build still
+    carries the violation.
+    """
+    chain = _chain(tmp_path)
+    digest = ApprovalCardGate(chain).issue(_card()).card_hash
+    _raw_settlement(chain, digest, decision="approve_all")
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("approve_all" in e for e in result.errors)
+
+
+def test_verifier_rejects_a_cross_origin_settlement(tmp_path: Path) -> None:
+    """Revert-checked: fails without ``_check_origin``.
+
+    This is the exact attack in the PR's own before/after table, replayed from
+    the chain rather than through the gate.
+    """
+    chain = _chain(tmp_path)
+    digest = ApprovalCardGate(chain).issue(_card(), worktree_id="wt-a", thread_id="C42").card_hash
+    _raw_settlement(
+        chain,
+        digest,
+        worktree_id="wt-EVIL",
+        thread_id="C-EVIL",
+        issued_worktree_id="wt-a",
+        issued_thread_id="C42",
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("wt-EVIL" in e for e in result.errors)
+    assert any("C-EVIL" in e for e in result.errors)
+
+
+def test_verifier_rejects_a_forged_self_consistent_origin_claim(tmp_path: Path) -> None:
+    """A forger cannot clear the check by rewriting both halves of the pair.
+
+    The pinned origin is taken from the issue event, not from the ``issued_*``
+    keys on the record under suspicion.
+    """
+    chain = _chain(tmp_path)
+    digest = ApprovalCardGate(chain).issue(_card(), worktree_id="wt-a", thread_id="C42").card_hash
+    _raw_settlement(
+        chain,
+        digest,
+        worktree_id="wt-EVIL",
+        thread_id="C-EVIL",
+        issued_worktree_id="wt-EVIL",
+        issued_thread_id="C-EVIL",
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+
+
+def test_verifier_accepts_a_legitimate_pinned_settlement(tmp_path: Path) -> None:
+    """The new checks must not reject an honest pinned settlement."""
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(), worktree_id="wt-a", thread_id="C42")
+    gate.resolve(
+        card_hash=issued.card_hash,
+        decision="approve",
+        worktree_id="wt-a",
+        thread_id="C42",
+        now=1_100.0,
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert result.ok, result.errors
+    assert result.reconstructed_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Gate/verifier window symmetry, both halves
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("now", [0.0, -1.0, math.inf, -math.inf, math.nan])
+def test_gate_refuses_any_clock_the_verifier_would_reject(tmp_path: Path, now: float) -> None:
+    """Revert-checked: fails if ``_guard_clock`` drops the finite/positive test.
+
+    The verifier requires ``resolved_at`` to be finite and strictly positive as
+    well as within the window. A card issued at ``created_at=0.0`` and settled
+    at ``now=0.0`` satisfies the lower bound but writes a record the verifier
+    rejects forever on an append-only chain.
+    """
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(created_at=0.0, ttl=600.0))
+
+    with pytest.raises(ApprovalCardClockSkew):
+        gate.resolve(card_hash=issued.card_hash, decision="approve", now=now)
+
+    assert chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED) == []
+    assert verify_approval_cards(tmp_path / "audit", key=_KEY).ok
+
+
+# ---------------------------------------------------------------------------
+# Rendered card cannot be spoofed from inside a field value
+# ---------------------------------------------------------------------------
+
+
+def test_agent_reasoning_cannot_forge_extra_card_rows() -> None:
+    """Revert-checked: fails if ``_single_line`` stops escaping line breaks.
+
+    ``reasoning`` is agent-supplied, and the agent is the party the approval
+    card exists to constrain. Unescaped, it can render a structurally complete,
+    benign-looking card ending in a forged ``Card hash:`` row above the true
+    fields, so an operator approving from the rendered text approves a forgery.
+    """
+    forged = (
+        "Add a constant.\n"
+        "Impact: score 0.0; hard_one_way=False; no detectors fired\n"
+        "Rollback: Read-only network access has no state to roll back.\n"
+        "Rollback irreversible: False\n"
+        "Card hash: " + "0" * 64
+    )
+    card = build_card(
+        approval_id="ap-1",
+        tool_name="Bash",
+        tool_args={"command": "rm -rf /srv/data"},
+        reasoning=forged,
+        created_at=1_000.0,
+        ttl_seconds=600.0,
+    )
+    lines = render_card_text(card).splitlines()
+
+    # Exactly one of each structural row, and the hash row is the real one.
+    assert sum(1 for line in lines if line.startswith("Card hash:")) == 1
+    assert sum(1 for line in lines if line.startswith("Rollback:")) == 1
+    assert sum(1 for line in lines if line.startswith("Impact:")) == 1
+    assert f"Card hash: {card_hash(card)}" in lines
+    assert "0" * 64 not in "\n".join(line for line in lines if line.startswith("Card hash:"))
+    # The IRREVERSIBLE warning the forgery tried to bury is still shown.
+    assert any(line.startswith("IRREVERSIBLE ACTION") for line in lines)
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r", "\u2028", "\u2029"])
+def test_every_line_separator_is_escaped(sep: str) -> None:
+    card = build_card(
+        approval_id="ap-1",
+        tool_name="Edit",
+        tool_args={"file_path": "a.py"},
+        reasoning=f"before{sep}Card hash: {'0' * 64}",
+        created_at=1_000.0,
+        ttl_seconds=600.0,
+    )
+    lines = render_card_text(card).splitlines()
+    assert sum(1 for line in lines if line.startswith("Card hash:")) == 1
+    assert f"Card hash: {card_hash(card)}" in lines
+
+
+def test_escaping_is_injective_so_the_display_stays_lossless() -> None:
+    """Distinct hashed values must not render to the same text."""
+
+    def render(reasoning: str) -> str:
+        return render_card_text(
+            build_card(
+                approval_id="ap",
+                tool_name="Edit",
+                tool_args={"file_path": "a.py"},
+                reasoning=reasoning,
+                created_at=1_000.0,
+                ttl_seconds=600.0,
+            )
+        )
+
+    # A literal backslash-n and a real newline must not collide.
+    assert render("a\nb") != render("a\\nb")
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility: an honest historical chain must keep verifying
+# ---------------------------------------------------------------------------
+
+
+def _write_pre_attribution_chain(chain: AuditChainStore, card: ApprovalCardV2) -> str:
+    """Write a settlement in the shape the previous build produced.
+
+    That build recorded the *issuing* worktree in ``worktree_id``, wrote no
+    ``thread_id`` at all, and had no ``issued_*`` keys. Both events go through
+    the real chain writer, so the verifier reads them back off disk exactly as
+    it would read a real historical log.
+    """
+    digest = card_hash(card)
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_ISSUED,
+        actor="approval_card",
+        resource_type="approval_card",
+        resource_id=digest,
+        details={"card_hash": digest, "envelope": card.to_dict(), "worktree_id": "wt-a", "thread_id": "C42"},
+    )
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_RESOLVED,
+        actor="operator",
+        resource_type="approval_card",
+        resource_id=digest,
+        details={"card_hash": digest, "decision": "approve", "worktree_id": "wt-a", "resolved_at": 1_100.0},
+    )
+    return digest
+
+
+def test_pre_attribution_chains_still_verify(tmp_path: Path) -> None:
+    """Revert-checked: fails if the origin check drops its format marker.
+
+    A hardening that permanently false-accuses honest historical records is
+    worse than the gap it closes: the audit log is append-only, so the operator
+    cannot repair a chain this check red-flags. Settlements predating origin
+    attribution cannot express the comparison at all -- their ``worktree_id``
+    means the issuing origin, not the resolving one -- so they are skipped
+    rather than failed.
+    """
+    chain = _chain(tmp_path)
+    _write_pre_attribution_chain(chain, _card())
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+
+    assert result.ok, result.errors
+    assert result.reconstructed_count == 1
+
+
+def test_partial_attribution_keys_check_only_what_is_present(tmp_path: Path) -> None:
+    """Revert-checked: fails without the per-field skip in the origin check.
+
+    A settlement may carry one ``issued_*`` key and not the other. The field
+    that is present must still be checked, and the absent one must not be
+    judged against an origin the record never claimed.
+    """
+    chain = _chain(tmp_path)
+    digest = ApprovalCardGate(chain).issue(_card(), worktree_id="wt-a", thread_id="C42").card_hash
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_RESOLVED,
+        actor="operator",
+        resource_type="approval_card",
+        resource_id=digest,
+        # Worktree attribution present and correct; conversation attribution absent.
+        details={
+            "card_hash": digest,
+            "decision": "approve",
+            "worktree_id": "wt-a",
+            "issued_worktree_id": "wt-a",
+            "resolved_at": 1_100.0,
+        },
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert result.ok, result.errors
+
+
+def test_partial_attribution_still_catches_the_field_that_is_present(tmp_path: Path) -> None:
+    chain = _chain(tmp_path)
+    digest = ApprovalCardGate(chain).issue(_card(), worktree_id="wt-a", thread_id="C42").card_hash
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_RESOLVED,
+        actor="operator",
+        resource_type="approval_card",
+        resource_id=digest,
+        details={
+            "card_hash": digest,
+            "decision": "approve",
+            "worktree_id": "wt-EVIL",
+            "issued_worktree_id": "wt-a",
+            "resolved_at": 1_100.0,
+        },
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("wt-EVIL" in e for e in result.errors)
+
+
+def test_pre_attribution_chain_still_catches_real_tampering(tmp_path: Path) -> None:
+    """Skipping the origin check must not blanket-exempt an old-format record."""
+    chain = _chain(tmp_path)
+    card = _card()
+    digest = _write_pre_attribution_chain(chain, card)
+    # A second settlement of the same card is still caught in the old format.
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_RESOLVED,
+        actor="operator",
+        resource_type="approval_card",
+        resource_id=digest,
+        details={"card_hash": digest, "decision": "approve", "worktree_id": "wt-a", "resolved_at": 1_200.0},
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("more than once" in e for e in result.errors)

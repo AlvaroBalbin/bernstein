@@ -42,6 +42,7 @@ makes the card a decision record instead of a message with a log.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -446,9 +447,16 @@ class ApprovalCardGate:
         happily append a settlement that its own verifier then rejects, and
         because the audit log is append-only and HMAC-chained, that record would
         make ``bernstein audit verify`` fail permanently with no remediation.
-        The gate must never be able to write a chain it cannot verify.
+        The gate must never be able to write a chain it cannot verify, so this
+        mirrors the verifier's rule in full. The verifier requires
+        ``resolved_at`` to be finite and strictly positive as well as at or
+        after ``created_at``; checking only the lower bound would still let a
+        card with ``created_at <= 0`` settle at ``now=0.0`` and write a
+        permanently unverifiable record, which is the exact outcome this guard
+        exists to prevent. Reachable from any caller passing ``now`` explicitly
+        and from a clock at or near the epoch.
         """
-        if current >= issued.card.created_at:
+        if math.isfinite(current) and current > 0.0 and current >= issued.card.created_at:
             return
         self._refuse(
             card_hash=echoed,
@@ -458,9 +466,10 @@ class ApprovalCardGate:
             expected_card_hash=issued.card_hash,
         )
         raise ApprovalCardClockSkew(
-            f"approval card {echoed!r} was issued at created_at={issued.card.created_at:.0f} "
-            f"but the decision clock reads {current:.0f}; refusing to record a settlement "
-            f"that the offline verifier would reject",
+            f"approval card {echoed!r} was issued at created_at={issued.card.created_at!r} "
+            f"but the decision clock reads {current!r}; a settlement timestamp must be finite, "
+            f"strictly positive, and at or after created_at, so recording this one would "
+            f"produce a chain the offline verifier permanently rejects",
         )
 
     def _guard_expiry(
@@ -544,14 +553,25 @@ class ApprovalCardGate:
             return None
         try:
             card = ApprovalCardV2.from_dict(cast("dict[str, Any]", envelope_any))
+            # The recompute is inside the guard, not after it. ``card_hash``
+            # raises on a non-finite value because canonical JSON refuses
+            # ``NaN``, and an escaping exception here is worse than a rejected
+            # envelope: because ``query`` does not check HMAC, anyone who can
+            # write the log could prepend one crafted issue event claiming a
+            # victim's ``card_hash`` and make that legitimate card raise on
+            # every resolve, forever, on an append-only log -- with nothing
+            # recorded, so the denial of service would itself be unaudited.
+            # Returning None instead leaves the scan free to find the real
+            # issue event, and an unmatched digest is refused on the chain.
+            recomputed = card_hash(card)
         except (TypeError, ValueError):
-            # A stored envelope carrying a non-finite or non-numeric timestamp
-            # is treated as unknown rather than rehydrated: a NaN not_after
-            # would produce a card that never expires.
+            # A stored envelope carrying a non-finite or non-numeric value is
+            # treated as unknown rather than rehydrated: a NaN not_after would
+            # produce a card that never expires.
             return None
         # Only trust a reconstructed envelope whose stored hash still matches
         # its bytes; a mutated envelope is rejected as unknown.
-        if card_hash(card) != digest:
+        if recomputed != digest:
             return None
         return IssuedCard(
             card=card,

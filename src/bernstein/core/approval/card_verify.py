@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from bernstein.core.approval.card import ApprovalCardV2, card_hash
+from bernstein.core.approval.card_gate import ALLOWED_DECISIONS
 from bernstein.core.security.audit import AuditLog
 from bernstein.core.security.audit_chain import (
     EVENT_APPROVAL_CARD_ISSUED,
@@ -57,7 +58,12 @@ class ApprovalCardVerifyResult:
     reconstructed_count: int = 0
 
 
-def _admit_issue(event: AuditEvent, issued: dict[str, ApprovalCardV2], errors: list[str]) -> None:
+def _admit_issue(
+    event: AuditEvent,
+    issued: dict[str, ApprovalCardV2],
+    origins: dict[str, tuple[str, str]],
+    errors: list[str],
+) -> None:
     """Admit one issue event into *issued*, flagging mutation or a bad envelope."""
     details: dict[str, Any] = event.details
     stored_hash = str(details.get("card_hash", ""))
@@ -65,12 +71,17 @@ def _admit_issue(event: AuditEvent, issued: dict[str, ApprovalCardV2], errors: l
     if not stored_hash or not isinstance(envelope_any, dict):
         errors.append(f"approval card issue event {event.resource_id!r} is missing card_hash or envelope")
         return
+    # Both the rebuild and the recompute run inside the guard. ``card_hash``
+    # raises on a non-finite value because canonical JSON refuses ``NaN``, so
+    # leaving it outside would turn a detection into an escaping exception: a
+    # tamperer could plant one ``NaN`` and abort the whole `audit verify` run,
+    # suppressing the unrelated pillars that execute after this one.
     try:
         card = ApprovalCardV2.from_dict(cast("dict[str, Any]", envelope_any))
+        recomputed = card_hash(card)
     except (TypeError, ValueError) as exc:
         errors.append(f"approval card {stored_hash!r} issue envelope is not a valid card ({exc})")
         return
-    recomputed = card_hash(card)
     if recomputed != stored_hash:
         errors.append(
             f"approval card {stored_hash!r} envelope was mutated after issue "
@@ -78,6 +89,10 @@ def _admit_issue(event: AuditEvent, issued: dict[str, ApprovalCardV2], errors: l
         )
         return
     issued[stored_hash] = card
+    origins[stored_hash] = (
+        str(details.get("worktree_id", "")),
+        str(details.get("thread_id", "")),
+    )
 
 
 def _resolved_at(details: dict[str, Any]) -> float | None:
@@ -100,9 +115,87 @@ def _resolved_at(details: dict[str, Any]) -> float | None:
     return value
 
 
+def _check_decision(echoed: str, details: dict[str, Any], errors: list[str]) -> bool:
+    """Reject a settlement whose decision is not one the gate would accept."""
+    decision = details.get("decision")
+    if decision in ALLOWED_DECISIONS:
+        return True
+    errors.append(
+        f"resolved approval card {echoed!r} carries decision {decision!r}, "
+        f"which is not one of {sorted(ALLOWED_DECISIONS)}",
+    )
+    return False
+
+
+def _check_origin(
+    echoed: str,
+    details: dict[str, Any],
+    issue_origin: tuple[str, str] | None,
+    errors: list[str],
+) -> bool:
+    """Reject a settlement that came from an origin the card was not pinned to.
+
+    The gate refuses this live, but the same argument that makes
+    double-settlement worth reconstructing applies here: a chain written by an
+    unpatched build or a second writer still carries the violation, and the
+    settlement event records both origins, so it is recoverable.
+
+    The pinned origin is taken from the *issue* event when it is available,
+    rather than from the ``issued_*`` keys on the settlement, because those keys
+    sit on the record under suspicion: a forger who set both halves to the same
+    value would otherwise clear its own check.
+
+    The ``issued_*`` keys are also the format marker. Settlements written before
+    this attribution existed recorded the *issuing* origin in ``worktree_id``
+    and no conversation at all, so their ``worktree_id`` does not mean "where
+    the decision came from" and there is nothing to compare it against. Those
+    records are skipped rather than failed: the audit log is append-only, so
+    reporting a violation the record's own format cannot express would
+    permanently red-flag chains that are in fact intact.
+    """
+    claimed: dict[str, Any] = {
+        "worktree": details.get("issued_worktree_id"),
+        "conversation": details.get("issued_thread_id"),
+    }
+    if all(claim is None for claim in claimed.values()):
+        return True
+
+    resolving = {
+        "worktree": str(details.get("worktree_id", "")),
+        "conversation": str(details.get("thread_id", "")),
+    }
+    pinned = (
+        {"worktree": issue_origin[0], "conversation": issue_origin[1]}
+        if issue_origin is not None
+        else {label: str(claim or "") for label, claim in claimed.items()}
+    )
+
+    ok = True
+    for label, claim in claimed.items():
+        if claim is None:
+            continue
+        expected = pinned[label]
+        if not expected:
+            continue
+        if resolving[label] != expected:
+            errors.append(
+                f"resolved approval card {echoed!r} was settled from {label} {resolving[label]!r} "
+                f"but was issued into {label} {expected!r}",
+            )
+            ok = False
+        elif str(claim) != expected:
+            errors.append(
+                f"resolved approval card {echoed!r} claims issuing {label} {str(claim)!r} "
+                f"but the issue event recorded {expected!r}",
+            )
+            ok = False
+    return ok
+
+
 def _check_resolution(
     event: AuditEvent,
     issued: dict[str, ApprovalCardV2],
+    origins: dict[str, tuple[str, str]],
     settled: set[str],
     errors: list[str],
 ) -> bool:
@@ -152,7 +245,11 @@ def _check_resolution(
             f"at or after its not_after {card.not_after:.0f}",
         )
         return False
-    return True
+    # Both are evaluated (not short-circuited) so one settlement reports every
+    # way in which it is invalid rather than only the first.
+    decision_ok = _check_decision(echoed, details, errors)
+    origin_ok = _check_origin(echoed, details, origins.get(echoed), errors)
+    return decision_ok and origin_ok
 
 
 def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> ApprovalCardVerifyResult:
@@ -180,20 +277,33 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
 
     errors: list[str] = []
     issued: dict[str, ApprovalCardV2] = {}
+    origins: dict[str, tuple[str, str]] = {}
     settled: set[str] = set()
     issued_count = 0
     resolved_count = 0
     reconstructed = 0
 
     for event in events:
-        if event.event_type == EVENT_APPROVAL_CARD_ISSUED:
-            issued_count += 1
-            _admit_issue(event, issued, errors)
-            continue
-        resolved_count += 1
-        if _check_resolution(event, issued, settled, errors):
-            reconstructed += 1
-        settled.add(str(event.details.get("card_hash", "")))
+        # A verifier that its own input can crash is a denial-of-audit
+        # primitive: `bernstein audit verify` runs this pillar before three
+        # others, with no try/except of its own, so an escaping exception
+        # suppresses detection of unrelated tampering. Every event is therefore
+        # processed under a guard that turns any residual fault into a reported
+        # failure. The specific faults are handled above; this exists so a
+        # future lossy path cannot silently reopen that hole.
+        try:
+            if event.event_type == EVENT_APPROVAL_CARD_ISSUED:
+                issued_count += 1
+                _admit_issue(event, issued, origins, errors)
+                continue
+            resolved_count += 1
+            if _check_resolution(event, issued, origins, settled, errors):
+                reconstructed += 1
+            settled.add(str(event.details.get("card_hash", "")))
+        except Exception as exc:
+            errors.append(
+                f"approval card event {event.resource_id!r} could not be verified ({type(exc).__name__}: {exc})",
+            )
 
     return ApprovalCardVerifyResult(
         ok=not errors,

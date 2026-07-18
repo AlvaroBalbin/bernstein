@@ -91,6 +91,39 @@ def _canonical_dumps(payload: dict[str, Any]) -> str:
     )
 
 
+#: Characters that would end a rendered line and let an interpolated value
+#: forge additional ``Label: value`` rows. U+2028 and U+2029 are included
+#: because several chat and web renderers break lines on them even though
+#: ``str.splitlines`` is not what does the breaking.
+_LINE_BREAKS = {
+    "\\": "\\\\",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+}
+
+
+def _single_line(text: str) -> str:
+    """Return *text* with line separators escaped, so it cannot forge a card row.
+
+    :func:`render_card_text` emits one ``Label: value`` row per line, so any
+    interpolated value containing a line break can synthesise rows of its own.
+    ``reasoning`` is supplied by the agent -- exactly the party the approval
+    card exists to constrain -- so an unescaped newline lets it render a
+    complete, benign-looking card, ending in a forged ``Card hash:`` line,
+    above the true fields.
+
+    The escape is injective (the backslash is escaped first), so the displayed
+    form still determines the hashed value exactly and an operator can recover
+    it. Escaping happens at render time only: the envelope keeps the raw value,
+    so no ``card_hash`` moves.
+    """
+    for raw, escaped in _LINE_BREAKS.items():
+        text = text.replace(raw, escaped)
+    return text
+
+
 def _require_finite(value: object, *, field: str) -> float:
     """Return *value* as a finite ``float``, rejecting anything else.
 
@@ -190,8 +223,15 @@ class ImpactEstimate:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ImpactEstimate:
+        """Rebuild an impact estimate, rejecting a non-finite score.
+
+        ``score`` is validated for the same reason the timestamps are: a
+        non-finite value reaching the envelope makes :func:`card_hash` raise
+        (canonical JSON refuses ``NaN``), and a raise escaping a verifier is a
+        denial-of-audit primitive rather than a detection.
+        """
         return cls(
-            score=float(data.get("score", 0.0)),
+            score=_require_finite(data.get("score", 0.0), field="impact.score"),
             hard_one_way=bool(data.get("hard_one_way", False)),
             rationale=str(data.get("rationale", "")),
             fired_detectors=tuple(str(d) for d in data.get("fired_detectors", [])),
@@ -538,6 +578,13 @@ def render_card_text(card: ApprovalCardV2) -> str:
     reproduce every hashed field losslessly, an operator can rebuild the
     envelope from what they read and confirm it hashes to that value.
 
+    Field values have their line separators escaped (see :func:`_single_line`).
+    One row per line is what makes the projection readable, and that is exactly
+    what an agent-supplied value containing a newline would exploit: it could
+    otherwise render a complete forged card, ending in a fake ``Card hash:``
+    row, above the true fields. The escape is injective, so losslessness is
+    preserved.
+
     The canonical JSON envelope is deliberately *not* inlined here. Duplicating
     every field a second time as JSON more than doubled the body and pushed
     large cards past the Discord (2000) and Slack (3000) character caps, and no
@@ -547,23 +594,23 @@ def render_card_text(card: ApprovalCardV2) -> str:
     """
     impact = card.impact
     if impact.fired_detectors:
-        detector_note = f"fired detectors: {', '.join(impact.fired_detectors)}"
+        detector_note = f"fired detectors: {', '.join(_single_line(d) for d in impact.fired_detectors)}"
     else:
         detector_note = "no detectors fired"
     lines = [
-        f"Card version: {card.card_version}",
-        f"Approval id: {card.approval_id}",
-        f"Action: {card.action.tool_name}",
-        f"Args digest: {card.action.args_digest}",
-        f"Intent: {card.reasoning}",
+        f"Card version: {_single_line(card.card_version)}",
+        f"Approval id: {_single_line(card.approval_id)}",
+        f"Action: {_single_line(card.action.tool_name)}",
+        f"Args digest: {_single_line(card.action.args_digest)}",
+        f"Intent: {_single_line(card.reasoning)}",
         f"Impact: score {impact.score!r}; hard_one_way={impact.hard_one_way}; {detector_note}",
-        f"Impact rationale: {impact.rationale}",
+        f"Impact rationale: {_single_line(impact.rationale)}",
     ]
     if impact.hard_one_way or card.rollback.irreversible:
         lines.append("IRREVERSIBLE ACTION: change tripped a one-way-door blast-radius detector.")
     lines.extend(
         (
-            f"Rollback: {card.rollback.procedure}",
+            f"Rollback: {_single_line(card.rollback.procedure)}",
             f"Rollback irreversible: {card.rollback.irreversible}",
             f"Created at: {card.created_at!r}",
             f"Expires at: {card.not_after!r} (enforced by the audit chain, not this chat client)",
