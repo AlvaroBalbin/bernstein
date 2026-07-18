@@ -1182,11 +1182,9 @@ class TaskStore:
                 # buffer is written by a single fsynced write, so the journal
                 # never records a gate without its edges: replaying a crashed
                 # materialization restores the whole gate or none of it.
-                for task in (gate, *edged):
-                    record = self._task_to_record(task)
-                    line = json.dumps(record, default=str) + "\n"
-                    self._write_buffer.append(line)
-                    await self._append_tenant_backlog_record(record, line)
+                rows = [self._task_to_record(task) for task in (gate, *edged)]
+                lines = [json.dumps(record, default=str) + "\n" for record in rows]
+                self._write_buffer.extend(lines)
                 await self._flush_buffer_unlocked()
             except BaseException:
                 # Roll back every in-memory mutation so a partial failure leaves
@@ -1200,6 +1198,12 @@ class TaskStore:
                     self._parent_index_remove(gate)
                     self._tasks.pop(gate.id, None)
                 raise
+
+            # Mirror into the tenant backlog only after the primary journal
+            # write committed, so a rolled-back gate never appears in the
+            # tenant view.
+            for record, line in zip(rows, lines, strict=True):
+                await self._append_tenant_backlog_record(record, line)
 
         return gate, targets
 

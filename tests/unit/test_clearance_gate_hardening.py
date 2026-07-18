@@ -226,16 +226,18 @@ def test_interrupted_gate_creation_leaves_no_orphan_edge(tmp_path: Path) -> None
         gate_absent = "clearance-abc123" not in store._tasks
         no_edge = store._tasks[dep.id].depends_on == []
         claimable = await store.claim_next("backend") is not None
-        # The journal must not carry the gate either: a replay of the crashed
-        # materialization must not resurrect a half-applied gate.
-        journal_clean = "clearance-abc123" not in jsonl.read_text()
+        # Nothing on disk may carry the gate either: a replay of the crashed
+        # materialization must not resurrect a half-applied gate, and the
+        # tenant backlog mirror must not diverge from the primary journal.
+        written = "".join(p.read_text() for p in tmp_path.rglob("*.jsonl") if p.is_file())
+        journal_clean = "clearance-abc123" not in written
         return gate_absent, no_edge, claimable, journal_clean
 
     gate_absent, no_edge, claimable, journal_clean = asyncio.run(scenario())
     assert gate_absent, "a rolled-back gate task is still present in the store"
     assert no_edge, "a rolled-back gate left an orphan depends_on edge on the dependent"
     assert claimable, "the dependent stayed blocked by a gate that was never created"
-    assert journal_clean, "a rolled-back gate was still written to the task journal"
+    assert journal_clean, "a rolled-back gate was still written to a journal on disk"
 
 
 # ---------------------------------------------------------------------------
