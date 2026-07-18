@@ -2089,6 +2089,42 @@ def record_schedule_fire_projection(
     )
 
 
+class ClearanceResolutionRefusal(ValueError):
+    """Typed refusal for a clearance resolution outside the allowed vocabulary.
+
+    Raised at every mutation boundary that would otherwise persist or sign an
+    unrecognised resolution string. Subclasses :class:`ValueError` so existing
+    callers that already guard on ``ValueError`` keep working (#2648).
+    """
+
+
+#: Terminal resolutions a clearance gate may reach.
+GATE_TERMINAL_RESOLUTIONS: frozenset[str] = frozenset({"cleared", "expired"})
+#: Every resolution the ``signal.gate_projection`` chain vocabulary admits.
+GATE_RESOLUTIONS: frozenset[str] = GATE_TERMINAL_RESOLUTIONS | {"pending"}
+
+
+def validate_gate_resolution(resolution: str, *, allowed: frozenset[str] = GATE_RESOLUTIONS) -> str:
+    """Return *resolution* when it is in *allowed*, else refuse.
+
+    The check runs before any state mutation or signing so a rejected value
+    never reaches the store or the HMAC chain.
+
+    Args:
+        resolution: The candidate resolution string.
+        allowed: The admissible vocabulary for this boundary.
+
+    Returns:
+        The validated resolution.
+
+    Raises:
+        ClearanceResolutionRefusal: If *resolution* is outside *allowed*.
+    """
+    if resolution not in allowed:
+        raise ClearanceResolutionRefusal(f"resolution must be one of {sorted(allowed)}, got {resolution!r}")
+    return resolution
+
+
 @dataclass(frozen=True)
 class SignalGateProjectionDetails:
     """Structured payload for the ``signal.gate_projection`` event (#2556)."""
@@ -2176,7 +2212,14 @@ def record_signal_gate_projection(
     Returns:
         The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded in
         its details payload.
+
+    Raises:
+        ClearanceResolutionRefusal: If ``resolution`` is outside
+            ``{pending, cleared, expired}``. The refusal happens before the
+            payload is built, so an unrecognised resolution is never signed
+            into the chain (#2648).
     """
+    validate_gate_resolution(resolution)
     payload = SignalGateProjectionDetails(
         blocker_content_hash=blocker_content_hash,
         clearance_task_id=clearance_task_id,
@@ -6589,7 +6632,10 @@ __all__ = [
     "EVENT_WEBHOOK_NODE_RECEIPT",
     "EVENT_WEBHOOK_PAYLOAD_ANCHOR",
     "EVENT_WORK_LEDGER_ANCHOR",
+    "GATE_RESOLUTIONS",
+    "GATE_TERMINAL_RESOLUTIONS",
     "AuditChainStore",
+    "ClearanceResolutionRefusal",
     "ComputerUseActionDetails",
     "CostProfileReportDetails",
     "EvalAbComparisonDetails",
@@ -6701,4 +6747,5 @@ __all__ = [
     "record_webhook_node_receipt",
     "record_webhook_payload_anchor",
     "record_work_ledger_anchor",
+    "validate_gate_resolution",
 ]

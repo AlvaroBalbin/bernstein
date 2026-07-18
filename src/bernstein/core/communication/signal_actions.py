@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
@@ -45,11 +46,13 @@ from typing import TYPE_CHECKING, Protocol
 from bernstein.core.security.audit_chain import (
     EVENT_SIGNAL_GATE_PROJECTION,
     EVENT_TASK_CLAIM_RECEIPT,
+    GATE_TERMINAL_RESOLUTIONS,
     record_signal_gate_projection,
+    validate_gate_resolution,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from bernstein.core.communication.bulletin import BulletinBoard, BulletinMessage
     from bernstein.core.security.audit import AuditEvent
@@ -200,6 +203,40 @@ class ClearanceGateSpec:
         }
 
 
+def clearance_task_id_for(*, blocker: BulletinMessage, journal_prefix_hash: str) -> str:
+    """Return the deterministic clearance-task id for *blocker*.
+
+    The id is a pure function of the blocker's content hash, the ordered
+    journal prefix, and the blocker's scope. It deliberately excludes the
+    injected edge set, so the identity of a gate is stable even as the open
+    dependent set moves; that is what lets a replay recognise an already-sealed
+    gate from the chain without re-reading the task graph (#2648).
+    """
+    scope = blocker.cell_id or ""
+    content_hash = blocker_content_hash(agent_id=blocker.agent_id, content=blocker.content, cell_id=blocker.cell_id)
+    seed = _canonical({"content_hash": content_hash, "journal_prefix_hash": journal_prefix_hash, "scope": scope})
+    return "clearance-" + _sha256_hex(seed)[:16]
+
+
+def spec_from_receipt(details: Mapping[str, object], *, journal_prefix_hash: str = "") -> ClearanceGateSpec:
+    """Rebuild a :class:`ClearanceGateSpec` from a recorded gate receipt.
+
+    The ``signal.gate_projection`` row is the source of truth for a
+    materialized gate, so a replay (or a restart) reconstructs the spec from
+    the chain rather than from process-local state. ``journal_prefix_hash`` is
+    not part of the receipt; callers that recomputed it pass it back in.
+    """
+    return ClearanceGateSpec(
+        blocker_content_hash=str(details.get("blocker_content_hash", "")),
+        clearance_task_id=str(details.get("clearance_task_id", "")),
+        injected_edges=tuple(str(edge) for edge in details.get("injected_edges", []) or []),
+        scope_cell_id=str(details.get("scope_cell_id", "")),
+        journal_prefix_hash=journal_prefix_hash,
+        graph_delta_hash=str(details.get("graph_delta_hash", "")),
+        deadline=int(details.get("deadline", 0) or 0),
+    )
+
+
 def project_clearance_gate(
     *,
     blocker: BulletinMessage,
@@ -227,8 +264,7 @@ def project_clearance_gate(
     """
     scope = blocker.cell_id or ""
     content_hash = blocker_content_hash(agent_id=blocker.agent_id, content=blocker.content, cell_id=blocker.cell_id)
-    seed = _canonical({"content_hash": content_hash, "journal_prefix_hash": journal_prefix_hash, "scope": scope})
-    clearance_task_id = "clearance-" + _sha256_hex(seed)[:16]
+    clearance_task_id = clearance_task_id_for(blocker=blocker, journal_prefix_hash=journal_prefix_hash)
     injected = tuple(sorted(set(scope_task_ids)))
     deadline = int(blocker.timestamp) + ttl_seconds if ttl_seconds and ttl_seconds > 0 else 0
     graph_delta_hash = compute_graph_delta_hash(
@@ -279,18 +315,35 @@ class ClearanceGateInjector(Protocol):
         ...
 
 
+class AtomicClearanceGateInjector(ClearanceGateInjector, Protocol):
+    """A :class:`ClearanceGateInjector` that applies a gate in one atomic step.
+
+    Creating the clearance task and injecting its ``depends_on`` edges as two
+    separate store mutations leaves a claim race window in which the gate
+    exists but its dependents are not yet gated. An injector implementing this
+    protocol collapses both into a single atomic mutation; the coordinator
+    prefers it whenever the wired injector provides it (#2648).
+    """
+
+    def apply_gate(self, spec: ClearanceGateSpec, blocker: BulletinMessage) -> None:
+        """Create the clearance task and inject every edge atomically."""
+        ...
+
+
 @dataclass
 class InMemoryClearanceInjector:
     """In-memory :class:`ClearanceGateInjector` for tests and dry runs.
 
     Records every mutation so a caller can assert on the projected graph
-    without a live task store.
+    without a live task store. ``apply_gate`` holds an internal lock so the
+    recorded mutations mirror the atomicity of the real store path.
     """
 
     open_by_cell: dict[str, list[str]] = field(default_factory=dict)
     created: list[ClearanceGateSpec] = field(default_factory=list)
     edges: list[tuple[str, str]] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def open_dependent_task_ids(self, scope_cell_id: str) -> list[str]:
         return list(self.open_by_cell.get(scope_cell_id, []))
@@ -303,6 +356,13 @@ class InMemoryClearanceInjector:
 
     def release_clearance_task(self, clearance_task_id: str) -> None:
         self.released.append(clearance_task_id)
+
+    def apply_gate(self, spec: ClearanceGateSpec, blocker: BulletinMessage) -> None:
+        """Record the gate task and all its edges under one lock acquisition."""
+        with self._lock:
+            self.create_clearance_task(spec, blocker)
+            for dependent_id in spec.injected_edges:
+                self.add_dependency_edge(dependent_id, spec.clearance_task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +377,14 @@ class ClearanceGateCoordinator:
     each deterministically, applies the projection through an injector, and
     seals a ``signal.gate_projection`` receipt on the HMAC chain. Resolving a
     clearance emits a signed release entry that references the materialization
-    entry hash. Materialization is idempotent per clearance-task id, so
-    reprocessing the same journal never double-injects.
+    entry hash.
+
+    Idempotency is keyed on the ``clearance_task_id`` **as recorded on the
+    chain**, not on process-local state, so a restart or a second coordinator
+    replaying the same journal recognises the already-sealed gate and never
+    double-injects. Both ``materialize`` and ``resolve`` run under a coordinator
+    lock, so the check-then-act is atomic and a concurrent caller cannot slip
+    between the idempotency probe and the mutation (#2648).
     """
 
     def __init__(
@@ -339,7 +405,41 @@ class ClearanceGateCoordinator:
         self._lineage_seal = lineage_seal
         self._materialized: dict[str, ClearanceGateSpec] = {}
         self._entry_hmac: dict[str, str] = {}
+        self._terminal: dict[str, AuditEvent] = {}
         self._last_bulletin_ts: float = 0.0
+        self._lock = threading.RLock()
+        self._chain_loaded = False
+
+    # -- durable gate index -------------------------------------------------
+
+    def _load_chain_state(self, *, force: bool = False) -> None:
+        """Hydrate the gate index from the chain.
+
+        The chain is the durable record of which gates were materialized and
+        which reached a terminal resolution, so idempotency survives a restart
+        and is shared by any coordinator reading the same chain. Loaded once
+        per coordinator; pass ``force`` to re-read before a mutation, which is
+        how a cache miss stays correct when another writer materialized or
+        resolved the same gate since this coordinator started.
+
+        Entries already known to this process are never overwritten: the
+        in-process spec carries the journal prefix hash, which the receipt does
+        not record.
+        """
+        if self._chain_loaded and not force:
+            return
+        for event in self._chain.query(event_type=EVENT_SIGNAL_GATE_PROJECTION):
+            details = event.details
+            clearance_task_id = str(details.get("clearance_task_id", ""))
+            if not clearance_task_id:
+                continue
+            if str(details.get("resolution", "pending")) == "pending":
+                if clearance_task_id not in self._materialized:
+                    self._materialized[clearance_task_id] = spec_from_receipt(details)
+                    self._entry_hmac[clearance_task_id] = event.hmac
+            elif clearance_task_id not in self._terminal:
+                self._terminal[clearance_task_id] = event
+        self._chain_loaded = True
 
     # -- read side ----------------------------------------------------------
 
@@ -353,55 +453,98 @@ class ClearanceGateCoordinator:
             return msgs[: msgs.index(blocker) + 1]
         return [*msgs, blocker]
 
+    def _apply(self, spec: ClearanceGateSpec, blocker: BulletinMessage) -> None:
+        """Apply *spec* to the task graph, atomically when the injector can.
+
+        An injector exposing :class:`AtomicClearanceGateInjector` creates the
+        gate task and injects every edge in one step, closing the claim race
+        window. Injectors that predate that protocol fall back to the two-step
+        path, which the coordinator lock still serialises.
+        """
+        apply_gate = getattr(self._injector, "apply_gate", None)
+        if callable(apply_gate):
+            apply_gate(spec, blocker)
+            return
+        self._injector.create_clearance_task(spec, blocker)
+        for dependent_id in spec.injected_edges:
+            self._injector.add_dependency_edge(dependent_id, spec.clearance_task_id)
+
     # -- materialization ----------------------------------------------------
 
     def materialize(self, blocker: BulletinMessage) -> ClearanceGateSpec | None:
         """Project *blocker* into a clearance gate and seal the receipt.
 
         Returns the :class:`ClearanceGateSpec`, or ``None`` when the signal type
-        is observe-only. Idempotent: a blocker already materialized returns its
-        existing spec without re-injecting or re-recording.
+        is observe-only. Durably idempotent: a blocker whose gate is already on
+        the chain returns the recorded spec without re-injecting or
+        re-recording, even in a fresh process.
+
+        The graph mutation and the receipt are applied as one saga under the
+        coordinator lock. If sealing the receipt fails after the graph was
+        mutated, the gate is compensated (released) and the failure propagates,
+        so no un-attested gate is left withholding work.
         """
         if action_for(blocker.type) != ACTION_MATERIALIZE_CLEARANCE_GATE:
             return None
 
         scope = blocker.cell_id or ""
         jph = journal_prefix_hash(self._prefix_for(blocker))
-        # A prior gate's clearance task is itself an open task in the cell; never
-        # gate a gate on another gate.
-        open_deps = [dep for dep in self._injector.open_dependent_task_ids(scope) if not dep.startswith("clearance-")]
-        spec = project_clearance_gate(
-            blocker=blocker,
-            scope_task_ids=open_deps,
-            journal_prefix_hash=jph,
-            ttl_seconds=self._ttl_seconds,
-        )
-        if spec.clearance_task_id in self._materialized:
+        clearance_task_id = clearance_task_id_for(blocker=blocker, journal_prefix_hash=jph)
+
+        with self._lock:
+            self._load_chain_state()
+            if clearance_task_id not in self._materialized and clearance_task_id not in self._terminal:
+                # About to mutate: re-read the chain so a gate sealed by another
+                # writer since this coordinator started is still recognised.
+                self._load_chain_state(force=True)
+            recorded = self._materialized.get(clearance_task_id)
+            if recorded is not None:
+                # The receipt on the chain is the source of truth for an
+                # already-materialized gate; return it rather than a fresh
+                # projection over a since-moved open-task set.
+                return spec_from_receipt(recorded.to_dict(), journal_prefix_hash=jph)
+            terminal = self._terminal.get(clearance_task_id)
+            if terminal is not None:
+                return spec_from_receipt(terminal.details, journal_prefix_hash=jph)
+
+            # A prior gate's clearance task is itself an open task in the cell;
+            # never gate a gate on another gate.
+            open_deps = [
+                dep for dep in self._injector.open_dependent_task_ids(scope) if not dep.startswith("clearance-")
+            ]
+            spec = project_clearance_gate(
+                blocker=blocker,
+                scope_task_ids=open_deps,
+                journal_prefix_hash=jph,
+                ttl_seconds=self._ttl_seconds,
+            )
+
+            self._apply(spec, blocker)
+            journal_entry_hash = self._lineage_seal(spec, "pending") if self._lineage_seal is not None else ""
+            try:
+                event = record_signal_gate_projection(
+                    chain=self._chain,
+                    blocker_content_hash=spec.blocker_content_hash,
+                    clearance_task_id=spec.clearance_task_id,
+                    injected_edges=list(spec.injected_edges),
+                    graph_delta_hash=spec.graph_delta_hash,
+                    scope_cell_id=spec.scope_cell_id,
+                    deadline=spec.deadline,
+                    resolution="pending",
+                    resolver="",
+                    last_state_hash="genesis",
+                    journal_entry_hash=journal_entry_hash,
+                    blocker_entry_hash="",
+                    actor=self._actor,
+                )
+            except BaseException:
+                # Compensate the graph mutation: an unsealed gate would withhold
+                # dependent work with no attestation explaining why.
+                self._injector.release_clearance_task(spec.clearance_task_id)
+                raise
+            self._materialized[spec.clearance_task_id] = spec
+            self._entry_hmac[spec.clearance_task_id] = event.hmac
             return spec
-
-        self._injector.create_clearance_task(spec, blocker)
-        for dependent_id in spec.injected_edges:
-            self._injector.add_dependency_edge(dependent_id, spec.clearance_task_id)
-
-        journal_entry_hash = self._lineage_seal(spec, "pending") if self._lineage_seal is not None else ""
-        event = record_signal_gate_projection(
-            chain=self._chain,
-            blocker_content_hash=spec.blocker_content_hash,
-            clearance_task_id=spec.clearance_task_id,
-            injected_edges=list(spec.injected_edges),
-            graph_delta_hash=spec.graph_delta_hash,
-            scope_cell_id=spec.scope_cell_id,
-            deadline=spec.deadline,
-            resolution="pending",
-            resolver="",
-            last_state_hash="genesis",
-            journal_entry_hash=journal_entry_hash,
-            blocker_entry_hash="",
-            actor=self._actor,
-        )
-        self._materialized[spec.clearance_task_id] = spec
-        self._entry_hmac[spec.clearance_task_id] = event.hmac
-        return spec
 
     def process_new_blockers(self) -> list[ClearanceGateSpec]:
         """Materialize gates for every blocker posted since the last call."""
@@ -436,33 +579,56 @@ class ClearanceGateCoordinator:
 
         Returns:
             The recorded release :class:`AuditEvent`; its ``blocker_entry_hash``
-            references the materialization entry.
+            references the materialization entry. When the gate already reached
+            a terminal receipt, that first receipt is returned unchanged and no
+            new entry is written.
+
+        Raises:
+            ClearanceResolutionRefusal: If ``resolution`` is outside
+                ``{cleared, expired}``.
+            KeyError: If no materialization receipt exists for the gate.
         """
-        if resolution not in ("cleared", "expired"):
-            raise ValueError(f"resolution must be 'cleared' or 'expired', got {resolution!r}")
-        spec = self._materialized.get(clearance_task_id)
-        if spec is None:
-            raise KeyError(clearance_task_id)
+        validate_gate_resolution(resolution, allowed=GATE_TERMINAL_RESOLUTIONS)
+        with self._lock:
+            self._load_chain_state()
+            # A gate resolves exactly once. A second call is a no-op that
+            # replays the first terminal receipt, so a retry (or a concurrent
+            # resolver) can never append a second terminal row or re-release
+            # the clearance task.
+            already = self._terminal.get(clearance_task_id)
+            if already is None:
+                # About to append a terminal receipt: re-read the chain so a
+                # resolution sealed by another writer is not duplicated.
+                self._load_chain_state(force=True)
+                already = self._terminal.get(clearance_task_id)
+            if already is not None:
+                return already
 
-        blocker_entry_hash = self._entry_hmac.get(clearance_task_id, "")
-        self._injector.release_clearance_task(clearance_task_id)
+            spec = self._materialized.get(clearance_task_id)
+            if spec is None:
+                raise KeyError(clearance_task_id)
 
-        journal_entry_hash = self._lineage_seal(spec, resolution) if self._lineage_seal is not None else ""
-        return record_signal_gate_projection(
-            chain=self._chain,
-            blocker_content_hash=spec.blocker_content_hash,
-            clearance_task_id=spec.clearance_task_id,
-            injected_edges=list(spec.injected_edges),
-            graph_delta_hash=spec.graph_delta_hash,
-            scope_cell_id=spec.scope_cell_id,
-            deadline=spec.deadline,
-            resolution=resolution,
-            resolver=resolver,
-            last_state_hash=blocker_entry_hash or "genesis",
-            journal_entry_hash=journal_entry_hash,
-            blocker_entry_hash=blocker_entry_hash,
-            actor=resolver or self._actor,
-        )
+            blocker_entry_hash = self._entry_hmac.get(clearance_task_id, "")
+            self._injector.release_clearance_task(clearance_task_id)
+
+            journal_entry_hash = self._lineage_seal(spec, resolution) if self._lineage_seal is not None else ""
+            event = record_signal_gate_projection(
+                chain=self._chain,
+                blocker_content_hash=spec.blocker_content_hash,
+                clearance_task_id=spec.clearance_task_id,
+                injected_edges=list(spec.injected_edges),
+                graph_delta_hash=spec.graph_delta_hash,
+                scope_cell_id=spec.scope_cell_id,
+                deadline=spec.deadline,
+                resolution=resolution,
+                resolver=resolver,
+                last_state_hash=blocker_entry_hash or "genesis",
+                journal_entry_hash=journal_entry_hash,
+                blocker_entry_hash=blocker_entry_hash,
+                actor=resolver or self._actor,
+            )
+            self._terminal[clearance_task_id] = event
+            return event
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +710,60 @@ class GateVerifyResult:
     violations: list[tuple[str, int]] = field(default_factory=list)
 
 
+def _validate_gate_resolution_row(
+    *,
+    clearance_task_id: str,
+    resolution: str,
+    details: Mapping[str, object],
+    anchor: Mapping[str, object] | None,
+    index: int,
+) -> list[str]:
+    """Return the reasons a resolution row must not close its gate.
+
+    A gate closes only on a resolution that is in the terminal vocabulary, that
+    references a prior materialization by its entry HMAC, and whose recorded
+    fields still match that materialization. Anything else (an unknown
+    resolution string, an orphan resolution, a widened edge set, a forged
+    back-reference) leaves the gate open (#2648).
+
+    Returns:
+        An empty list when the row is a valid closure, else one error per
+        failed check.
+    """
+    errors: list[str] = []
+    if resolution not in GATE_TERMINAL_RESOLUTIONS:
+        errors.append(
+            f"gate {clearance_task_id}: resolution {resolution!r} at chain index {index} is outside "
+            f"the terminal vocabulary {sorted(GATE_TERMINAL_RESOLUTIONS)}"
+        )
+    if anchor is None:
+        errors.append(
+            f"gate {clearance_task_id}: resolution '{resolution}' at chain index {index} has no prior projection"
+        )
+        return errors
+
+    recorded_back_ref = str(details.get("blocker_entry_hash", ""))
+    if recorded_back_ref != str(anchor.get("hmac", "")):
+        errors.append(
+            f"gate {clearance_task_id}: resolution at chain index {index} does not reference its "
+            f"materialization entry (blocker_entry_hash mismatch)"
+        )
+
+    field_checks: tuple[tuple[str, object, object], ...] = (
+        ("blocker_content_hash", str(details.get("blocker_content_hash", "")), anchor.get("blocker_content_hash")),
+        ("graph_delta_hash", str(details.get("graph_delta_hash", "")), anchor.get("graph_delta_hash")),
+        ("scope_cell_id", str(details.get("scope_cell_id", "")), anchor.get("scope_cell_id")),
+        ("deadline", int(details.get("deadline", 0) or 0), anchor.get("deadline")),
+        ("injected_edges", {str(e) for e in details.get("injected_edges", []) or []}, anchor.get("edges")),
+    )
+    for name, actual, expected in field_checks:
+        if actual != expected:
+            errors.append(
+                f"gate {clearance_task_id}: resolution at chain index {index} diverges from the open gate on {name}"
+            )
+    return errors
+
+
 def verify_clearance_gates(
     events: Sequence[AuditEvent],
     *,
@@ -571,6 +791,7 @@ def verify_clearance_gates(
     errors: list[str] = []
     violations: list[tuple[str, int]] = []
     open_gates: dict[str, dict[str, object]] = {}
+    materialized: dict[str, dict[str, object]] = {}
     seen: set[str] = set()
 
     for idx, event in enumerate(events):
@@ -578,6 +799,10 @@ def verify_clearance_gates(
             details = event.details
             clearance_task_id = str(details.get("clearance_task_id", ""))
             resolution = str(details.get("resolution", "pending"))
+            # Every gate row counts, including an orphan resolution: a chain
+            # made only of forged resolutions must never report "no gates" and
+            # pass silently.
+            seen.add(clearance_task_id)
             recomputed = compute_graph_delta_hash(
                 clearance_task_id=clearance_task_id,
                 injected_edges=[str(e) for e in details.get("injected_edges", [])],
@@ -592,18 +817,32 @@ def verify_clearance_gates(
                     f"(recomputed {recomputed[:12]}.. != stored {stored[:12]}..)"
                 )
             if resolution == "pending":
-                seen.add(clearance_task_id)
-                open_gates[clearance_task_id] = {
+                anchor = {
                     "edges": {str(e) for e in details.get("injected_edges", [])},
                     "index": idx,
+                    "blocker_content_hash": str(details.get("blocker_content_hash", "")),
+                    "graph_delta_hash": stored,
+                    "scope_cell_id": str(details.get("scope_cell_id", "")),
+                    "deadline": int(details.get("deadline", 0) or 0),
+                    "hmac": event.hmac,
                 }
+                materialized[clearance_task_id] = anchor
+                open_gates[clearance_task_id] = anchor
             else:
-                if clearance_task_id not in seen:
-                    errors.append(
-                        f"gate {clearance_task_id}: resolution '{resolution}' at chain index {idx} "
-                        "has no prior projection"
-                    )
-                open_gates.pop(clearance_task_id, None)
+                closing_errors = _validate_gate_resolution_row(
+                    clearance_task_id=clearance_task_id,
+                    resolution=resolution,
+                    details=details,
+                    anchor=materialized.get(clearance_task_id),
+                    index=idx,
+                )
+                errors.extend(closing_errors)
+                # A gate closes only on a resolution whose vocabulary, recorded
+                # fields, and back-reference all check out. An unvalidated row
+                # leaves the gate open, so a later claim of a scoped dependent
+                # is still reported as a violation.
+                if not closing_errors:
+                    open_gates.pop(clearance_task_id, None)
         elif event.event_type == EVENT_TASK_CLAIM_RECEIPT:
             claimed = str(event.details.get("task_id", "") or event.resource_id)
             for clearance_task_id, gate in open_gates.items():
@@ -623,6 +862,7 @@ __all__ = [
     "ACTION_MATERIALIZE_CLEARANCE_GATE",
     "ACTION_OBSERVE",
     "SIGNAL_ACTIONS",
+    "AtomicClearanceGateInjector",
     "ClearanceGateCoordinator",
     "ClearanceGateInjector",
     "ClearanceGateSpec",
@@ -632,9 +872,11 @@ __all__ = [
     "InMemoryClearanceInjector",
     "action_for",
     "blocker_content_hash",
+    "clearance_task_id_for",
     "compute_graph_delta_hash",
     "journal_prefix_hash",
     "project_clearance_gate",
     "project_gate_states",
+    "spec_from_receipt",
     "verify_clearance_gates",
 ]
