@@ -82,6 +82,19 @@ guarantee.
    suppress detection of unrelated tampering elsewhere. A verifier that its own
    input can crash is a denial-of-audit primitive, not a check.
 
+   Failures are reported by **who they accuse**:
+
+   | Channel | Meaning | What to do |
+   |---|---|---|
+   | `errors` | The record was evaluated and failed | Treat as possible tampering |
+   | `verifier_errors` | The record could not be evaluated; this code raised | File a bug, not a security incident |
+
+   Reporting an internal fault through the same channel as "envelope was
+   mutated after issue" would tell an operator their log was tampered with when
+   in fact the verifier is broken. Both channels set `ok = false`: an
+   unevaluable record is not a passing record, and a bug here must never
+   produce a clean bill of health.
+
    The pinned origin is read from the **issue** event, not from the
    `issued_*` keys on the settlement being checked, so a forger cannot clear
    the origin check by rewriting both halves of the pair to agree.

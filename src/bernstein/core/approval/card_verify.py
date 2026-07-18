@@ -28,7 +28,7 @@ context is verifiable after the fact.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from bernstein.core.approval.card import ApprovalCardV2, card_hash
@@ -49,13 +49,37 @@ __all__ = ["ApprovalCardVerifyResult", "verify_approval_cards"]
 
 @dataclass(frozen=True)
 class ApprovalCardVerifyResult:
-    """Outcome of :func:`verify_approval_cards`."""
+    """Outcome of :func:`verify_approval_cards`.
+
+    Failures are split by *who they accuse*, because the two demand opposite
+    responses from an operator:
+
+    * ``errors`` -- the record was evaluated and it failed. This accuses the
+      audit data: something was mutated, replayed, or settled illegitimately.
+      The operator should treat it as a possible breach.
+    * ``verifier_errors`` -- the record could **not** be evaluated because this
+      code raised unexpectedly. This accuses *us*. The operator should file a
+      bug, not a security incident.
+
+    Conflating them is its own defect: reporting an internal fault through the
+    same channel as "envelope was mutated after issue" tells an operator their
+    log was tampered with when in fact our verifier is broken.
+
+    Both keep ``ok`` at ``False``. An unevaluable record is not a passing
+    record, and a bug in the verifier must never produce a clean bill of health.
+
+    Attributes:
+        ok: ``True`` only when neither list has entries.
+        errors: Records that were evaluated and failed. Accuses the data.
+        verifier_errors: Records that could not be evaluated. Accuses this code.
+    """
 
     ok: bool
     errors: list[str]
     issued_count: int = 0
     resolved_count: int = 0
     reconstructed_count: int = 0
+    verifier_errors: list[str] = field(default_factory=lambda: [])
 
 
 def _admit_issue(
@@ -264,6 +288,9 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
         An :class:`ApprovalCardVerifyResult`. ``ok`` is ``True`` when no
         resolved card references a mutated envelope, an unknown ``card_hash``,
         or a decision made after expiry (and when there are no cards at all).
+        Records that failed evaluation land in ``errors``; records this code
+        could not evaluate land in ``verifier_errors``. Either keeps ``ok`` at
+        ``False``.
     """
     log = AuditLog(audit_dir=audit_dir, key=key) if key is not None else AuditLog(audit_dir=audit_dir)
 
@@ -276,6 +303,7 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
     ]
 
     errors: list[str] = []
+    verifier_errors: list[str] = []
     issued: dict[str, ApprovalCardV2] = {}
     origins: dict[str, tuple[str, str]] = {}
     settled: set[str] = set()
@@ -291,6 +319,11 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
         # processed under a guard that turns any residual fault into a reported
         # failure. The specific faults are handled above; this exists so a
         # future lossy path cannot silently reopen that hole.
+        #
+        # The catch is deliberately broad, and the result is reported through
+        # ``verifier_errors`` rather than ``errors``: a bug in this code must
+        # not be presented to an operator as evidence that their audit log was
+        # tampered with.
         try:
             if event.event_type == EVENT_APPROVAL_CARD_ISSUED:
                 issued_count += 1
@@ -301,14 +334,20 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
                 reconstructed += 1
             settled.add(str(event.details.get("card_hash", "")))
         except Exception as exc:
-            errors.append(
-                f"approval card event {event.resource_id!r} could not be verified ({type(exc).__name__}: {exc})",
+            verifier_errors.append(
+                f"internal verifier fault on approval card event {event.resource_id!r}: "
+                f"{type(exc).__name__}: {exc}. This is a bug in bernstein's approval-card "
+                f"verifier, not evidence of audit tampering; the record could not be "
+                f"evaluated either way. Please report it.",
             )
 
     return ApprovalCardVerifyResult(
-        ok=not errors,
+        # An unevaluable record is not a passing record: a fault in this code
+        # must never be able to produce a clean bill of health.
+        ok=not errors and not verifier_errors,
         errors=errors,
         issued_count=issued_count,
         resolved_count=resolved_count,
         reconstructed_count=reconstructed,
+        verifier_errors=verifier_errors,
     )

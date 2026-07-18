@@ -885,7 +885,10 @@ def test_verifier_reports_rather_than_raises_on_any_event_fault(tmp_path: Path) 
 
     result = verify_approval_cards(tmp_path / "audit", key=_KEY)
     assert not result.ok
-    assert any("could not be verified" in e for e in result.errors)
+    # A shape this code failed to anticipate is our fault, not the data's, so it
+    # is reported as a verifier error rather than as audit tampering.
+    assert any("internal verifier fault" in e for e in result.verifier_errors)
+    assert result.errors == []
 
 
 def test_a_poisoned_sibling_event_does_not_brick_a_legitimate_card(tmp_path: Path) -> None:
@@ -1219,6 +1222,91 @@ def test_partial_attribution_still_catches_the_field_that_is_present(tmp_path: P
     result = verify_approval_cards(tmp_path / "audit", key=_KEY)
     assert not result.ok
     assert any("wt-EVIL" in e for e in result.errors)
+
+
+# ---------------------------------------------------------------------------
+# A failure must accuse the right party: the data, or this code
+# ---------------------------------------------------------------------------
+
+
+def test_a_mutated_envelope_is_reported_as_a_record_failure(tmp_path: Path) -> None:
+    """Revert-checked: fails if record failures are routed to ``verifier_errors``.
+
+    This accuses the audit data, so it must land in ``errors`` where an operator
+    reads it as a possible breach.
+    """
+    chain = _chain(tmp_path)
+    card = _card()
+    digest = card_hash(card)
+    mutated = card.to_dict()
+    mutated["reasoning"] = "something else entirely"
+    chain.log_with_prev_digest(
+        event_type=EVENT_APPROVAL_CARD_ISSUED,
+        actor="approval_card",
+        resource_type="approval_card",
+        resource_id=digest,
+        details={"card_hash": digest, "envelope": mutated},
+    )
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+
+    assert not result.ok
+    assert any("mutated after issue" in e for e in result.errors)
+    assert result.verifier_errors == []
+
+
+def test_an_internal_fault_is_reported_as_a_verifier_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Revert-checked: fails if internal faults are routed to ``errors``.
+
+    An operator reading "envelope was mutated after issue" concludes their audit
+    log was tampered with. If a bug in this code surfaces through that same
+    channel, we have manufactured a false breach report. Internal faults must
+    say plainly that they accuse us, and name the exception type, so the
+    operator files a bug instead.
+    """
+    chain = _chain(tmp_path)
+    _issue_via_gate(chain, _card())
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        msg = "simulated internal defect"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("bernstein.core.approval.card_verify._admit_issue", _boom)
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+
+    # Non-fatal: it returns rather than propagating, so later pillars still run.
+    assert not result.ok
+    assert result.errors == []
+    assert len(result.verifier_errors) == 1
+    reported = result.verifier_errors[0]
+    assert "RuntimeError" in reported
+    assert "simulated internal defect" in reported
+    assert "not evidence of audit tampering" in reported
+
+
+def test_an_internal_fault_cannot_yield_a_clean_bill_of_health(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``ok`` must stay False on an unevaluable record.
+
+    The failure mode being excluded is a broad catch that degrades to a warning
+    and lets ``ok`` remain True, which would turn a verifier bug into a silent
+    pass.
+    """
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card())
+    gate.resolve(card_hash=issued.card_hash, decision="approve", now=1_100.0)
+    assert verify_approval_cards(tmp_path / "audit", key=_KEY).ok
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        msg = "simulated internal defect"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("bernstein.core.approval.card_verify._check_resolution", _boom)
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert result.verifier_errors
 
 
 def test_pre_attribution_chain_still_catches_real_tampering(tmp_path: Path) -> None:
