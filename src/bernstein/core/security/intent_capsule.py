@@ -40,7 +40,7 @@ import re
 import types
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -630,8 +630,10 @@ def _event_paths(event: dict[str, Any]) -> list[str]:
             found.append(value)
     for key in _PATH_LIST_FIELDS:
         value = event.get(key)
-        if isinstance(value, list):
-            found.extend(item for item in value if isinstance(item, str) and item)
+        if not isinstance(value, list):
+            continue
+        items = cast("list[Any]", value)
+        found.extend(item for item in items if isinstance(item, str) and item)
     return found
 
 
