@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from bernstein.core.replay.journal import EventJournal, load_events
+from bernstein.core.replay.journal import EventJournal, load_events, verify_journal
 from bernstein.core.security.audit_chain import AuditChainStore
 from bernstein.core.security.intent_capsule import (
     DriftPolicy,
@@ -278,21 +278,81 @@ def test_permitted_adapters_are_enforced(tmp_path: Path) -> None:
     assert verdict.divergences[0].reason == "adapter_not_permitted"
 
 
-def test_expiry_ts_is_enforced(tmp_path: Path) -> None:
-    capsule = _capsule(expiry_ts=1_700_000_000)
-    events = [
-        {"event": "tool.call", "tool": "Read", "ts": 1_699_999_999},
-        {"event": "tool.call", "tool": "Read", "ts": 1_700_000_001},
-    ]
+def test_a_mutating_action_that_names_no_path_fails_closed(tmp_path: Path) -> None:
+    """A declared scope that cannot be checked is not a control."""
+    capsule = _capsule(file_scope_globs=["src/pricing/**"])
 
-    verdict = evaluate_conformance(events, capsule)
+    verdict = evaluate_conformance([{"event": "tool.call", "tool": "Edit"}], capsule)
 
     assert not verdict.conformant
-    assert [d.step_index for d in verdict.divergences] == [1]
-    assert verdict.divergences[0].reason == "capsule_expired"
+    assert verdict.divergences[0].reason == "path_unrecorded"
 
 
-def test_allow_unclassified_false_counts_unclassified_events(tmp_path: Path) -> None:
+def test_a_mutating_action_with_an_unrecognised_path_key_fails_closed(tmp_path: Path) -> None:
+    capsule = _capsule(file_scope_globs=["src/pricing/**"])
+
+    verdict = evaluate_conformance([{"event": "tool.call", "tool": "Edit", "target": "/etc/passwd"}], capsule)
+
+    assert not verdict.conformant
+    assert verdict.divergences[0].reason == "path_unrecorded"
+
+
+def test_no_declared_scope_does_not_require_a_path(tmp_path: Path) -> None:
+    capsule = _capsule(file_scope_globs=[])
+
+    assert evaluate_conformance([{"event": "tool.call", "tool": "Edit"}], capsule).conformant
+
+
+def test_verdict_does_not_depend_on_unauthenticated_journal_timestamps(tmp_path: Path) -> None:
+    """``ts`` is outside the Merkle chain, so it must not decide a signed verdict.
+
+    ``_NON_DETERMINISTIC_FIELDS`` in ``core/replay/journal.py`` strips ``ts``
+    before ``payload_hash``, so a row's timestamp can be rewritten in place with
+    no chain break. Routing it into ``verdict_hash`` would let anyone erase or
+    manufacture a divergence, and would make a faithful replay -- which produces
+    fresh wall-clock values -- disagree with the original run.
+    """
+    capsule = _capsule(expiry_ts=1_700_000_000)
+    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule))
+    before = evaluate_conformance(load_events(journal.path), capsule)
+
+    rows = [json.loads(line) for line in journal.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for row in rows:
+        row["ts"] = 1_600_000_000
+    journal.path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    after = evaluate_conformance(load_events(journal.path), capsule)
+
+    assert verify_journal(journal.path).ok, "editing ts alone does not break the journal chain"
+    assert before.verdict_hash == after.verdict_hash
+    assert [d.to_dict() for d in before.divergences] == [d.to_dict() for d in after.divergences]
+
+
+def test_expiry_is_enforced_against_authenticated_chain_timestamps(tmp_path: Path) -> None:
+    """Expiry uses audit-chain timestamps, which are covered by the entry HMAC."""
+    from bernstein.core.security.audit_chain import EVENT_INTENT_CAPSULE
+    from bernstein.core.security.intent_capsule import chain_expiry_violation
+
+    capsule = _approve(tmp_path, expiry_ts=1_700_000_000)
+    entries = [
+        e for e in _chain(tmp_path).query(event_type=EVENT_INTENT_CAPSULE) if e.details.get("task_id") == _TASK_ID
+    ]
+
+    assert chain_expiry_violation(entries, capsule), "approval recorded after expiry is a violation"
+    assert not chain_expiry_violation(entries, _capsule(expiry_ts=_FUTURE_EXPIRY))
+
+
+def test_verify_rejects_a_capsule_used_past_its_expiry(tmp_path: Path) -> None:
+    capsule = _approve(tmp_path, expiry_ts=1_700_000_000)
+    _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule))
+
+    result = verify_intent_conformance(sdd_dir=_sdd(tmp_path), chain=_chain(tmp_path), task_id=_TASK_ID)
+
+    assert not result.ok
+    assert "expired" in result.reason
+
+
+def test_allow_unclassified_false_counts_unclassified_tool_calls(tmp_path: Path) -> None:
     capsule = _capsule()
     events = [{"event": "tool.call", "tool": "some_unknown_tool"}]
 
@@ -302,14 +362,43 @@ def test_allow_unclassified_false_counts_unclassified_events(tmp_path: Path) -> 
     assert strict.divergences[0].reason == "unclassified_event"
 
 
-def test_allow_unclassified_false_still_ignores_the_binding_anchor(tmp_path: Path) -> None:
-    """The capsule-binding anchor is structural, not a worker action."""
-    from bernstein.core.security.intent_capsule import CAPSULE_BOUND_EVENT
+def test_allow_unclassified_false_ignores_structural_journal_events(tmp_path: Path) -> None:
+    """The strict knob must stay usable on a real journal.
 
+    Every one of these event types is recorded somewhere in the repo. Flagging
+    them as drift would make ``allow_unclassified: false`` unusable, which is
+    the same practical outcome as the no-op it replaced.
+    """
     capsule = _capsule()
-    events = [{"event": CAPSULE_BOUND_EVENT, "task_id": _TASK_ID, "capsule_hash": capsule_hash(capsule)}]
+    strict = DriftPolicy(allow_unclassified=False)
+    structural = [
+        "intent.capsule_bound",
+        "task.tick",
+        "snapshot",
+        "retry.decision",
+        "retry.checkpoint",
+        "context.capsule_recorded",
+        "mcp.stateless_call",
+        "provider_state_capability",
+        "provider_state_mutation",
+        "webhook_node.inbound",
+        "dispatch_knob_selection",
+        "worktree.gc",
+        "worktree.reap",
+        "a2a.message",
+        "artifact_posted",
+        "subagent.delegation",
+        "thread.step",
+        "task.suspend",
+        "task.resume",
+        "fork",
+        "activity.result",
+        "schedule.fire_projection",
+    ]
 
-    assert evaluate_conformance(events, capsule, policy=DriftPolicy(allow_unclassified=False)).conformant
+    flagged = [e for e in structural if not evaluate_conformance([{"event": e}], capsule, policy=strict).conformant]
+
+    assert flagged == []
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +410,22 @@ def test_worker_action_class_cannot_relabel_a_recognized_tool() -> None:
     """A shell call stamped ``git.commit`` still classifies as ``shell.exec``."""
     assert classify_journal_event({"tool": "Bash", "action_class": "git.commit"}) == "shell.exec"
     assert classify_journal_event({"tool": "WebFetch", "action_class": "fs.read"}) == "web.fetch"
+
+
+@pytest.mark.parametrize("tool", ["Bash", "bash", "BASH", "Bash ", " bash", "  BaSh  ", "\tbash\n"])
+def test_tool_name_variants_cannot_dodge_the_reviewed_map(tool: str) -> None:
+    """One stray character must not defeat the guard.
+
+    The lookup is keyed on the tool name, and the tool name arrives in the same
+    worker-controlled event as the stamped label, so an unnormalised key lets a
+    worker escape by mutating the field the guard keys on.
+    """
+    assert classify_journal_event({"tool": tool, "action_class": "fs.read"}) == "shell.exec"
+
+
+@pytest.mark.parametrize("tool", ["sh", "zsh", "pwsh", "powershell", "run_shell_command", "subprocess"])
+def test_common_shell_aliases_resolve_to_shell_exec(tool: str) -> None:
+    assert classify_journal_event({"tool": tool, "action_class": "fs.read"}) == "shell.exec"
 
 
 def test_explicit_action_class_is_the_fallback_for_unknown_tools() -> None:
@@ -338,7 +443,7 @@ def test_relabelled_shell_call_surfaces_as_drift(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The escalation signs a recomputed verdict, never the caller's
+# Escalation: both the capsule and the verdict must come from chained state
 # ---------------------------------------------------------------------------
 
 
@@ -356,6 +461,7 @@ def _escalate(tmp_path: Path, capsule: IntentCapsule, verdict, **overrides):
         "hmac_key": _HMAC_KEY,
         "private_key_pem": private_pem,
         "public_key_pem": public_pem,
+        "chain": _chain(tmp_path),
         "run_id": _RUN_ID,
         "capsule": capsule,
         "verdict": verdict,
@@ -369,11 +475,67 @@ def _escalate(tmp_path: Path, capsule: IntentCapsule, verdict, **overrides):
     return assemble_intent_drift_escalation(**kwargs)
 
 
+def _drifted_run(tmp_path: Path) -> tuple[IntentCapsule, list]:
+    """Approve a capsule on the chain and drift the bound run against it."""
+    capsule = _approve(tmp_path)
+    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=True)
+    return capsule, load_events(journal.path)
+
+
+def test_escalation_refuses_a_capsule_that_was_never_approved(tmp_path: Path) -> None:
+    """The headline case: a fabricated capsule must not reach a signed receipt.
+
+    Recomputing the verdict is not enough, because a verdict only means anything
+    relative to a capsule. A caller who invents a capsule permitting nothing can
+    hand in a self-consistent verdict and have a fully conformant run attested
+    as drift.
+    """
+    approved = _approve(tmp_path)
+    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(approved), drift=False)
+    events = load_events(journal.path)
+    assert evaluate_conformance(events, approved).conformant, "the real run is conformant"
+
+    forged = IntentCapsule(
+        v=approved.v,
+        task_id=approved.task_id,
+        plan_id=approved.plan_id,
+        goal_digest=approved.goal_digest,
+        allowed_action_classes=(),
+        file_scope_globs=(),
+        permitted_adapters=(),
+        egress_classes=(),
+        cost_envelope_ref=approved.cost_envelope_ref,
+        expiry_ts=approved.expiry_ts,
+    )
+    forged_verdict = evaluate_conformance(events, forged)
+    assert not forged_verdict.conformant, "the forged capsule makes the clean run look drifted"
+
+    with pytest.raises(IntentCapsuleError, match="capsule"):
+        _escalate(tmp_path, forged, forged_verdict)
+
+
+def test_escalation_refuses_a_run_id_the_chain_did_not_sign(tmp_path: Path) -> None:
+    capsule, _ = _drifted_run(tmp_path)
+    decoy = _journal(tmp_path, "run-decoy", capsule_h=capsule_hash(capsule), drift=True)
+    verdict = evaluate_conformance(load_events(decoy.path), capsule)
+
+    with pytest.raises(IntentCapsuleError, match="run_id"):
+        _escalate(tmp_path, capsule, verdict, run_id="run-decoy")
+
+
+def test_escalation_refuses_when_the_journal_lacks_the_capsule_anchor(tmp_path: Path) -> None:
+    capsule = _approve(tmp_path)
+    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), bind=False, drift=True)
+    verdict = evaluate_conformance(load_events(journal.path), capsule)
+
+    with pytest.raises(IntentCapsuleError, match="capsule_bound"):
+        _escalate(tmp_path, capsule, verdict)
+
+
 def test_escalation_refuses_a_forged_verdict(tmp_path: Path) -> None:
     """A caller cannot have a verdict signed that the journal does not support."""
-    capsule = _capsule()
-    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=True)
-    real = evaluate_conformance(load_events(journal.path), capsule)
+    capsule, events = _drifted_run(tmp_path)
+    real = evaluate_conformance(events, capsule)
     forged = type(real)(
         conformant=False,
         capsule_hash=real.capsule_hash,
@@ -387,7 +549,7 @@ def test_escalation_refuses_a_forged_verdict(tmp_path: Path) -> None:
 
 
 def test_escalation_refuses_a_conformant_verdict(tmp_path: Path) -> None:
-    capsule = _capsule()
+    capsule = _approve(tmp_path)
     journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=False)
     verdict = evaluate_conformance(load_events(journal.path), capsule)
     assert verdict.conformant
@@ -397,45 +559,50 @@ def test_escalation_refuses_a_conformant_verdict(tmp_path: Path) -> None:
 
 
 def test_escalation_refuses_when_the_journal_is_missing(tmp_path: Path) -> None:
-    capsule = _capsule()
-    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=True)
-    verdict = evaluate_conformance(load_events(journal.path), capsule)
-    journal.path.unlink()
+    capsule, events = _drifted_run(tmp_path)
+    verdict = evaluate_conformance(events, capsule)
+    (_sdd(tmp_path) / "runs" / _RUN_ID / "journal.jsonl").unlink()
 
     with pytest.raises(IntentCapsuleError, match="journal"):
         _escalate(tmp_path, capsule, verdict)
 
 
 def test_escalation_refuses_a_tampered_journal(tmp_path: Path) -> None:
-    capsule = _capsule()
-    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=True)
-    verdict = evaluate_conformance(load_events(journal.path), capsule)
-    lines = journal.path.read_text(encoding="utf-8").splitlines()
+    capsule, events = _drifted_run(tmp_path)
+    verdict = evaluate_conformance(events, capsule)
+    path = _sdd(tmp_path) / "runs" / _RUN_ID / "journal.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
     lines[-1], lines[-2] = lines[-2], lines[-1]
-    journal.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     with pytest.raises(IntentCapsuleError, match="journal"):
         _escalate(tmp_path, capsule, verdict)
 
 
-def test_escalation_signs_the_recomputed_verdict(tmp_path: Path) -> None:
-    capsule = _capsule()
-    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=True)
-    verdict = evaluate_conformance(load_events(journal.path), capsule)
+def test_escalation_happy_path_binds_the_approved_capsule_and_divergences(tmp_path: Path) -> None:
+    """Shape check for a genuine drift on an approved capsule.
+
+    Named for what it asserts: this is the happy path, not proof of the
+    recomputation (the hash-match gate makes caller and recomputed verdict equal
+    by the time the binding is built, so no assertion here can tell them apart).
+    The containment is carried by the refusal tests above.
+    """
+    capsule, events = _drifted_run(tmp_path)
+    verdict = evaluate_conformance(events, capsule)
 
     receipt = _escalate(tmp_path, capsule, verdict)
 
     assert receipt.extra_binding is not None
+    assert receipt.extra_binding["capsule_hash"] == capsule_hash(capsule)
     assert receipt.extra_binding["verdict_hash"] == verdict.verdict_hash
     assert [d["action_class"] for d in receipt.extra_binding["divergent_events"]] == ["web.fetch"]
 
 
 def test_escalation_recomputes_under_the_supplied_policy(tmp_path: Path) -> None:
     """The recomputation must use the same policy the caller's verdict used."""
-    capsule = _capsule()
-    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule), drift=True)
+    capsule, events = _drifted_run(tmp_path)
     policy = DriftPolicy(mode="block")
-    verdict = evaluate_conformance(load_events(journal.path), capsule, policy=policy)
+    verdict = evaluate_conformance(events, capsule, policy=policy)
 
     receipt = _escalate(tmp_path, capsule, verdict, policy=policy)
 

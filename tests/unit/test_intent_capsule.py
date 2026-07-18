@@ -116,7 +116,7 @@ def _journal_events(*, drift: bool):
     events = [
         {"event": "task.tick", "action_class": None, "seq": 0},
         {"event": "tool.call", "tool": "Read", "seq": 1},
-        {"event": "tool.call", "tool": "Edit", "seq": 2},
+        {"event": "tool.call", "tool": "Edit", "path": "src/pricing/rates.py", "seq": 2},
         # A real commit tool, not a shell call labelled as one: the reviewed
         # tool map outranks a worker-stamped action_class (#2649).
         {"event": "tool.call", "tool": "git_commit", "seq": 3},
@@ -133,7 +133,7 @@ def _build_run_journal(tmp_path: Path, *, capsule_h: str, drift: bool):
     journal = EventJournal(_RUN_ID, _sdd(tmp_path))
     bind_capsule_into_journal(journal, task_id=_TASK_ID, capsule_hash=capsule_h)
     journal.record("tool.call", tool="Read", seq=1)
-    journal.record("tool.call", tool="Edit", seq=2)
+    journal.record("tool.call", tool="Edit", path="src/pricing/rates.py", seq=2)
     journal.record("tool.call", tool="git_commit", seq=3)
     if drift:
         journal.record("tool.call", tool="WebFetch", seq=4)
@@ -371,7 +371,21 @@ def test_ac4_drift_emits_signed_escalation_binding_capsule_and_events(tmp_path: 
     )
     from bernstein.core.replay.journal import load_events
 
-    cap = _capsule()
+    # The escalation only signs a capsule the audit chain approved (#2649), so
+    # the capsule is compiled through the approval path rather than standalone.
+    chain = _chain(tmp_path)
+    cap, _ = approve_and_capsule(
+        chain=chain,
+        sdd_dir=_sdd(tmp_path),
+        plan=_plan(),
+        task_id=_TASK_ID,
+        run_id=_RUN_ID,
+        allowed_action_classes=["fs.read", "fs.write", "git.commit"],
+        file_scope_globs=["src/pricing/**", "tests/**"],
+        permitted_adapters=["claude", "codex"],
+        egress_classes=[],
+        expiry_ts=_FUTURE_EXPIRY,
+    )
     ch = capsule_hash(cap)
     journal = _build_run_journal(tmp_path, capsule_h=ch, drift=True)
     verdict = evaluate_conformance(load_events(journal.path), cap)
@@ -384,6 +398,7 @@ def test_ac4_drift_emits_signed_escalation_binding_capsule_and_events(tmp_path: 
         hmac_key=_HMAC_KEY,
         private_key_pem=private_pem,
         public_key_pem=public_pem,
+        chain=chain,
         run_id=_RUN_ID,
         capsule=cap,
         verdict=verdict,

@@ -56,30 +56,48 @@ its step index:
 |---|---|
 | `action_class_not_permitted` | The action class is outside `allowed_action_classes`. |
 | `egress_not_permitted` | An outbound-communication class ran without `external_comm` in `egress_classes`. |
-| `capsule_expired` | The event's journal timestamp is past `expiry_ts`. |
 | `adapter_not_permitted` | The event's adapter is outside `permitted_adapters`. |
 | `file_scope_violation` | A mutating file action touched a path outside `file_scope_globs`. |
+| `path_unrecorded` | A mutating file action named no path while a scope is declared. |
 | `unclassified_event` | The event maps to no action class and the policy sets `allow_unclassified: false`. |
 
 Scope globs are matched segment-wise: `*` and `?` stop at `/` and `**` spans
 directories, so `src/*.py` does not silently admit `src/nested/deep.py`. Paths
 are lexically normalised before matching, so an in-scope prefix cannot be used as
 a free pass (`src/pricing/../../etc/passwd` does not match `src/pricing/**`), and
-a path that still escapes upward after normalisation is never in scope. An empty
-`file_scope_globs` declares no file scope and constrains nothing. Reads are not
-scope-checked: the capsule scopes the worker's mutations.
+a path that still escapes upward after normalisation is never in scope. The check
+fails closed: when a scope is declared, a mutating action that records no
+recognised path is a `path_unrecorded` divergence rather than a silent pass. An
+empty `file_scope_globs` declares no file scope and constrains nothing. Reads are
+not scope-checked: the capsule scopes the worker's mutations.
+
+Tool names are normalised (whitespace stripped, case folded) before the reviewed
+map is consulted, so `"Bash "` cannot dodge the map and pick up a worker-stamped
+label instead. The stamped label remains the fallback for tool names the map does
+not know at all, so a worker that invents an unmapped name can still self-declare
+a class the capsule allows; `allow_unclassified: false` surfaces those calls.
+Extend the reviewed map as tools are adopted.
+
+Only events that claim to be actions (they carry a `tool` or `action_class`, or
+their type is in the action-bearing vocabulary) can become `unclassified_event`.
+Structural journal rows -- ticks, snapshots, retry decisions, worktree reaps, the
+capsule-bound anchor -- are never drift, whatever the policy, so
+`allow_unclassified: false` stays usable on a real run.
 
 The `verdict_hash` is a digest over the capsule hash, the policy mode, and the
 divergence list, so two verifiers on different machines recompute the
 byte-identical verdict offline. Timestamps are read off the journal rows rather
 than a clock, which keeps expiry enforcement deterministic.
 
-One scope note on expiry: a journal row's `ts` sits outside the hashed payload,
-because a faithful replay differs only in timing. Expiry enforcement therefore
-catches a run that honestly overran its capsule; it is not by itself a defence
-against an editor rewriting timestamps in place. The chain-anchored checks below
-(capsule hash, signed `run_id`, capsule-bound anchor) are what make tampering
-evident.
+Expiry is deliberately **not** part of the verdict. A journal row's `ts` sits
+outside the hashed payload (a faithful replay differs only in timing), so feeding
+it into `verdict_hash` would sign a value anyone can edit in place without
+breaking the chain, and would make the same run verdict differently on replay.
+Expiry is instead enforced against audit-chain entry timestamps, which are
+covered by each entry's HMAC. The trade-off is coverage: that detects a capsule
+still being acted on past expiry only as far as the chain records events for it,
+not per journal step. Per-step expiry would need a chained step clock inside the
+hashed payload.
 
 Deterministic replay of a run re-derives the same drift decisions at the same
 step indices. No LLM call exists on the drift-decision path: a static import
@@ -116,11 +134,14 @@ written with.
 ## Drift escalation
 
 On divergence the monitor emits a signed escalation receipt reusing the stall
-escalation shape. The verdict handed to the escalation is treated as a claim: the
-run journal is loaded, its Merkle chain verified, and the verdict recomputed from
-`(journal, capsule, policy)`. Only the recomputed verdict is signed, and a
-conformant or mismatched claim is refused outright, so no caller can mint a
-signed receipt for a drift that never happened.
+escalation shape. Both the capsule and the verdict handed to it are treated as
+claims. Recomputing the verdict alone would not be enough, because a verdict only
+means anything relative to a capsule: a caller who supplies a fabricated capsule
+permitting nothing can hand in a self-consistent verdict and have a conformant
+run attested as drift. The capsule is therefore resolved through the same
+authority `verify` uses -- it must match the `intent.capsule` chain entry, the
+run must be the signed one, and the journal must carry the matching capsule-bound
+anchor. Only then is the verdict recomputed and that recomputed verdict signed.
 
 The receipt binds the trailing journal window by Merkle hash,
 is signed with the install identity, and is anchored in the escalation lineage

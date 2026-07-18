@@ -69,7 +69,7 @@ def _approve(project: Path, *, drift: bool) -> None:
     journal = EventJournal(_RUN_ID, sdd)
     bind_capsule_into_journal(journal, task_id=_TASK_ID, capsule_hash=capsule_hash(cap))
     journal.record("tool.call", tool="Read", seq=1)
-    journal.record("tool.call", tool="Edit", seq=2)
+    journal.record("tool.call", tool="Edit", path="src/pricing/rates.py", seq=2)
     if drift:
         journal.record("tool.call", tool="WebFetch", seq=3)
 
