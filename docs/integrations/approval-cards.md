@@ -126,6 +126,16 @@ instant would otherwise yield two different hashes. Canonical JSON is emitted
 with `allow_nan` disabled, so an envelope can never hash over bytes that no
 conforming JSON parser reads back.
 
+`to_dict` emits the envelope in its **persisted normal form**: every field is
+coerced to exactly the type `from_dict` rebuilds, so the round-trip is a fixed
+point and the hash commits to the bytes that actually get stored rather than to
+the in-memory object. This matters because `card_hash` is recomputed from
+stored JSON on two paths (gate rehydration after a restart, and the offline
+verifier), and JSON does not preserve Python's numeric types: an `int` `0`
+serialises as `0` while the `float` rebuilt on read serialises as `0.0`.
+Without the normal form those two disagree, and an honest card becomes
+unresolvable after a restart and fails `audit verify` permanently.
+
 Two fields are bounded so the envelope cannot be inflated by its inputs: the
 reasoning digest (`REASONING_MAX_CHARS`) and the path embedded in the rollback
 template (`ROLLBACK_PATH_MAX_CHARS`). Both bounds are deterministic, so the same

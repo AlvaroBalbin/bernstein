@@ -152,7 +152,7 @@ class ActionRef:
     args_digest: str
 
     def to_dict(self) -> dict[str, Any]:
-        return {"tool_name": self.tool_name, "args_digest": self.args_digest}
+        return {"tool_name": str(self.tool_name), "args_digest": str(self.args_digest)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ActionRef:
@@ -182,10 +182,10 @@ class ImpactEstimate:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "score": self.score,
-            "hard_one_way": self.hard_one_way,
-            "rationale": self.rationale,
-            "fired_detectors": list(self.fired_detectors),
+            "score": float(self.score),
+            "hard_one_way": bool(self.hard_one_way),
+            "rationale": str(self.rationale),
+            "fired_detectors": [str(d) for d in self.fired_detectors],
         }
 
     @classmethod
@@ -214,7 +214,7 @@ class RollbackPlan:
     irreversible: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return {"procedure": self.procedure, "irreversible": self.irreversible}
+        return {"procedure": str(self.procedure), "irreversible": bool(self.irreversible)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RollbackPlan:
@@ -245,20 +245,37 @@ class ApprovalCardV2:
     card_version: str = CARD_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the canonical envelope dict.
+        """Return the canonical envelope dict, in its persisted normal form.
 
-        Floats are coerced explicitly so a JSON round-trip through the audit
-        chain rehydrates byte-identical values and the hash stays stable.
+        Every field is coerced to exactly the type :meth:`from_dict` produces,
+        which makes ``to_dict`` a fixed point of the storage round-trip:
+        ``to_dict(from_dict(to_dict(x))) == to_dict(x)`` for any constructible
+        card, whatever types the constructor happened to receive.
+
+        This is what the hash is taken over, so the hash commits to the bytes
+        that actually get persisted rather than to the in-memory object. The
+        distinction is not cosmetic. ``card_hash`` is recomputed from stored
+        JSON on two paths (gate rehydration after a restart, and the offline
+        verifier), and JSON does not preserve Python's numeric types: an
+        ``int`` ``0`` serialises as ``0`` while the ``float`` that
+        :meth:`from_dict` rebuilds serialises as ``0.0``. Coercing only on the
+        way in would leave those two disagreeing, and an honest card would
+        become unresolvable after a restart and fail ``audit verify``
+        permanently on an append-only chain.
+
+        Normalising here rather than validating inputs is deliberate: input
+        validation has to be re-tightened every time a new caller or a new
+        field appears, whereas a normal form holds for all of them at once.
         """
         return {
-            "approval_id": self.approval_id,
+            "approval_id": str(self.approval_id),
             "action": self.action.to_dict(),
-            "reasoning": self.reasoning,
+            "reasoning": str(self.reasoning),
             "impact": self.impact.to_dict(),
             "rollback": self.rollback.to_dict(),
-            "created_at": self.created_at,
-            "not_after": self.not_after,
-            "card_version": self.card_version,
+            "created_at": float(self.created_at),
+            "not_after": float(self.not_after),
+            "card_version": str(self.card_version),
         }
 
     @classmethod

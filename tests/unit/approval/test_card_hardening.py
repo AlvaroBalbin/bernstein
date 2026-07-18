@@ -26,7 +26,10 @@ from typing import Any
 import pytest
 
 from bernstein.core.approval.card import (
+    ActionRef,
     ApprovalCardV2,
+    ImpactEstimate,
+    RollbackPlan,
     build_card,
     canonical_card_bytes,
     card_hash,
@@ -49,6 +52,7 @@ from bernstein.core.approval.card_gate import (
 )
 from bernstein.core.approval.card_verify import verify_approval_cards
 from bernstein.core.security.audit_chain import (
+    EVENT_APPROVAL_CARD_ISSUED,
     EVENT_APPROVAL_CARD_REFUSED,
     EVENT_APPROVAL_CARD_RESOLVED,
     AuditChainStore,
@@ -709,6 +713,89 @@ def test_resolve_at_exactly_created_at_is_allowed(tmp_path: Path) -> None:
 
     assert len(chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED)) == 1
     assert verify_approval_cards(tmp_path / "audit", key=_KEY).ok
+
+
+# ---------------------------------------------------------------------------
+# Storage round-trip: the hash must commit to what is persisted
+# ---------------------------------------------------------------------------
+
+
+def _variant(**overrides: Any) -> ApprovalCardV2:
+    """Return a card with one field replaced by an off-normal-form value."""
+    base = _card()
+    fields: dict[str, Any] = {
+        "approval_id": base.approval_id,
+        "action": base.action,
+        "reasoning": base.reasoning,
+        "impact": base.impact,
+        "rollback": base.rollback,
+        "created_at": base.created_at,
+        "not_after": base.not_after,
+    }
+    fields.update(overrides)
+    return ApprovalCardV2(**fields)
+
+
+def _off_normal_cards() -> list[tuple[str, ApprovalCardV2]]:
+    """Cards whose in-memory field types differ from their persisted types.
+
+    Every one of these is constructible today. ``score`` is the live case:
+    :func:`score_change` computes ``min(1.0, soft + files)``, which returns a
+    plain ``int`` when both components are ``0``, and ``round(0, 4)`` keeps it
+    an ``int``.
+    """
+    return [
+        ("int score", _variant(impact=ImpactEstimate(0, False, "r", ()))),
+        ("negative zero score", _variant(impact=ImpactEstimate(-0.0, False, "r", ()))),
+        ("int approval_id", _variant(approval_id=123)),  # type: ignore[arg-type]
+        ("list fired_detectors", _variant(impact=ImpactEstimate(0.5, False, "r", ["a"]))),  # type: ignore[arg-type]
+        ("non-string fired_detectors", _variant(impact=ImpactEstimate(0.5, False, "r", (1, 2)))),  # type: ignore[arg-type]
+        ("int timestamps", _variant(created_at=1_000, not_after=1_600)),  # type: ignore[arg-type]
+        ("non-string rollback fields", _variant(rollback=RollbackPlan(procedure=7, irreversible=1))),  # type: ignore[arg-type]
+        ("non-string action fields", _variant(action=ActionRef(tool_name=5, args_digest=9))),  # type: ignore[arg-type]
+    ]
+
+
+@pytest.mark.parametrize(("label", "card"), _off_normal_cards(), ids=lambda v: v if isinstance(v, str) else "")
+def test_hash_survives_the_real_storage_round_trip(tmp_path: Path, label: str, card: ApprovalCardV2) -> None:
+    """Revert-checked: fails if ``to_dict`` stops emitting the persisted normal form.
+
+    Deliberately drives the production writer and reader rather than hashing an
+    in-memory object, because an in-memory comparison cannot see a lossy step
+    between the object and the stored bytes. JSON does not preserve Python's
+    numeric types, so a hash taken over un-normalised in-memory values does not
+    match one recomputed from storage, and an honest card becomes unresolvable
+    after a restart and fails ``audit verify`` forever on an append-only chain.
+    """
+    del label
+    chain = _chain(tmp_path)
+    issued = ApprovalCardGate(chain).issue(card, worktree_id="wt-a", thread_id="C42")
+
+    # Recompute from the bytes actually on disk, not from the object above.
+    stored = [e.details for e in chain.query(event_type=EVENT_APPROVAL_CARD_ISSUED) if e.details.get("card_hash")][-1]
+    persisted: dict[str, Any] = dict(stored["envelope"])
+    assert card_hash(ApprovalCardV2.from_dict(persisted)) == str(stored["card_hash"])
+
+    # The reader path a restart takes must still rehydrate and settle the card.
+    restarted = ApprovalCardGate(_chain(tmp_path))
+    restarted.resolve(
+        card_hash=issued.card_hash,
+        decision="approve",
+        worktree_id="wt-a",
+        thread_id="C42",
+        now=card.created_at + 1.0,
+    )
+    assert verify_approval_cards(tmp_path / "audit", key=_KEY).ok
+
+
+@pytest.mark.parametrize(("label", "card"), _off_normal_cards(), ids=lambda v: v if isinstance(v, str) else "")
+def test_to_dict_is_a_fixed_point_of_the_round_trip(label: str, card: ApprovalCardV2) -> None:
+    """``to_dict`` must already be in the form ``from_dict`` rebuilds."""
+    del label
+    once = card.to_dict()
+    twice = ApprovalCardV2.from_dict(json.loads(json.dumps(once))).to_dict()
+    assert once == twice
+    assert canonical_card_bytes(card) == canonical_card_bytes(ApprovalCardV2.from_dict(once))
 
 
 def test_verifier_accepts_a_well_formed_pair(tmp_path: Path) -> None:
