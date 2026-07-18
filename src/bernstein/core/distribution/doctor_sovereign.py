@@ -216,12 +216,14 @@ def run_sovereign_checks(workdir: Path | None = None) -> SovereignReport:
 
     cwd = workdir or Path.cwd()
     config_rows: list[Check] = []
+    config_violations: tuple[str, ...] = ()
     try:
         snapshot: dict[str, object] | None = load_config_snapshot(cwd, require=True)
     except SovereignConfigError as exc:
         # Report the fail-closed condition instead of silently reporting on the
         # permissive default posture an unreadable config would project to.
         snapshot = None
+        config_violations = (str(exc),)
         config_rows.append(
             Check(
                 name="source configuration readable",
@@ -231,7 +233,13 @@ def run_sovereign_checks(workdir: Path | None = None) -> SovereignReport:
             )
         )
     policy = resolve_effective_policy(SOVEREIGN_PROFILE, snapshot)
-    evaluation = evaluate_posture_drift(workdir=cwd, config_snapshot=snapshot)
+    # Carry the config failure into the drift evaluation too, or the attestation
+    # row could report the empty-config projection as a clean match.
+    evaluation = evaluate_posture_drift(
+        workdir=cwd,
+        config_snapshot=snapshot,
+        extra_violations=config_violations,
+    )
     rows: list[Check] = [
         *config_rows,
         check_sovereign_profile_active(),

@@ -315,15 +315,45 @@ def _seal(tmp_path: Path) -> PostureAttestation:
     )
 
 
-def _rewrite_attestation(tmp_path: Path, mutate: Any) -> None:
+_SEAL_FIELDS = ("signature", "signer_public_key_pem", "journal_entry_hash")
+
+
+def _resign_body(raw: dict[str, Any], private_pem: str) -> None:
+    """Re-sign *raw* in place so its signature matches its mutated body.
+
+    Without this a test that mutates authenticated content is rejected by the
+    signature check and never reaches the validator it claims to exercise - it
+    would pass even if the required-field, schema, profile, or posture-hash
+    checks were deleted. Re-signing makes the signature valid so the *only*
+    thing left that can reject the record is the contract check under test.
+    """
+    from bernstein.core.security.deployment_profile import _canonical_bytes
+    from bernstein.core.skills.catalog.signature import sign_payload
+
+    body = {k: v for k, v in raw.items() if k not in _SEAL_FIELDS}
+    raw["signature"] = sign_payload(_canonical_bytes(body), private_pem)
+
+
+def _install_private_key(tmp_path: Path) -> str:
+    """Return the install's sovereign private key PEM (created by ``_seal``)."""
+    from bernstein.core.security.deployment_profile import load_or_create_sovereign_identity
+
+    private_pem, _ = load_or_create_sovereign_identity(tmp_path / ".sdd" / "sovereign")
+    return private_pem
+
+
+def _rewrite_attestation(tmp_path: Path, mutate: Any, *, resign: bool = False) -> None:
     raw = json.loads(attestation_path(tmp_path).read_text(encoding="utf-8"))
     mutate(raw)
+    if resign:
+        _resign_body(raw, _install_private_key(tmp_path))
     attestation_path(tmp_path).write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
 
 
 @pytest.mark.parametrize(
     "field",
     [
+        "record_kind",
         "profile",
         "schema_version",
         "posture_hash",
@@ -334,9 +364,14 @@ def _rewrite_attestation(tmp_path: Path, mutate: Any) -> None:
     ],
 )
 def test_incomplete_signed_record_is_rejected(tmp_path: Path, field: str) -> None:
-    """Every field of the signed-record contract is required before we trust it."""
+    """Every field of the signed-record contract is required before we trust it.
+
+    The record is re-signed after the field is dropped, so the signature is
+    valid and only the required-field check can reject it.
+    """
     _seal(tmp_path)
-    _rewrite_attestation(tmp_path, lambda raw: raw.pop(field))
+    resign = field not in _SEAL_FIELDS
+    _rewrite_attestation(tmp_path, lambda raw: raw.pop(field), resign=resign)
     assert read_posture_attestation(tmp_path) is None
 
 
@@ -354,15 +389,60 @@ def test_forged_signed_record_is_rejected(tmp_path: Path) -> None:
     assert read_posture_attestation(tmp_path) is None
 
 
+def test_resigned_forgery_is_rejected_by_the_posture_hash(tmp_path: Path) -> None:
+    """Editing the document and re-signing still fails: the hash no longer matches."""
+    _seal(tmp_path)
+    _rewrite_attestation(
+        tmp_path,
+        lambda raw: raw["effective_policy"].update({"storage_backend": "postgres"}),
+        resign=True,
+    )
+    assert read_posture_attestation(tmp_path) is None
+
+
+def test_record_signed_by_a_foreign_key_is_rejected(tmp_path: Path) -> None:
+    """A fully self-consistent record signed by someone else is not our posture.
+
+    Rewriting the document, generating a fresh keypair, signing with it and
+    embedding its public key produces a record that verifies perfectly against
+    itself. It must still be refused, because the signer is not this install's
+    sovereign identity.
+    """
+    from bernstein.core.security.deployment_profile import _canonical_bytes, _sha256_of
+    from bernstein.core.skills.catalog.signature import generate_signer_keypair, sign_payload, verify_payload
+
+    _seal(tmp_path)
+    foreign_private, foreign_public = generate_signer_keypair()
+    raw = json.loads(attestation_path(tmp_path).read_text(encoding="utf-8"))
+    raw["effective_policy"]["storage_backend"] = "postgres"
+    raw["posture_hash"] = _sha256_of(raw["effective_policy"])
+    body = {k: v for k, v in raw.items() if k not in _SEAL_FIELDS}
+    raw["signature"] = sign_payload(_canonical_bytes(body), foreign_private)
+    raw["signer_public_key_pem"] = foreign_public
+    attestation_path(tmp_path).write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+    # Premise: the forged record really is internally consistent.
+    assert verify_payload(_canonical_bytes(body), raw["signature"], foreign_public, allow_unverified=True).verified
+    # It is still refused, because the key is not the install's identity.
+    assert read_posture_attestation(tmp_path) is None
+
+
 def test_wrong_schema_version_is_rejected(tmp_path: Path) -> None:
     _seal(tmp_path)
-    _rewrite_attestation(tmp_path, lambda raw: raw.update({"schema_version": 99}))
+    _rewrite_attestation(tmp_path, lambda raw: raw.update({"schema_version": 99}), resign=True)
+    assert read_posture_attestation(tmp_path) is None
+
+
+def test_wrong_record_kind_is_rejected(tmp_path: Path) -> None:
+    """A drift record renamed into an attestation must not be reinterpreted."""
+    _seal(tmp_path)
+    _rewrite_attestation(tmp_path, lambda raw: raw.update({"record_kind": "sovereign_drift"}), resign=True)
     assert read_posture_attestation(tmp_path) is None
 
 
 def test_posture_hash_must_match_the_recorded_document(tmp_path: Path) -> None:
     _seal(tmp_path)
-    _rewrite_attestation(tmp_path, lambda raw: raw.update({"posture_hash": "sha256:" + "0" * 64}))
+    _rewrite_attestation(tmp_path, lambda raw: raw.update({"posture_hash": "sha256:" + "0" * 64}), resign=True)
     assert read_posture_attestation(tmp_path) is None
 
 
@@ -378,26 +458,39 @@ def test_untrusted_record_refuses_the_spawn(tmp_path: Path, monkeypatch: pytest.
 
 
 def test_verify_rejects_a_record_with_no_effective_policy(tmp_path: Path) -> None:
-    """``audit verify`` must not skip the hash check when the document is absent."""
-    from bernstein.core.security.deployment_profile import verify_sovereign_attestations
+    """``audit verify`` must not skip the hash check when the document is absent.
+
+    The mutated body is re-signed so its signature is valid; the only thing
+    that can reject it is the required-field check under test.
+    """
+    from bernstein.core.security.deployment_profile import _canonical_bytes, verify_sovereign_attestations
+    from bernstein.core.skills.catalog.signature import sign_payload
 
     _seal(tmp_path)
     audit_dir = tmp_path / ".sdd" / "audit"
     assert verify_sovereign_attestations(audit_dir).ok is True
 
+    private_pem = _install_private_key(tmp_path)
     entries = sorted(audit_dir.glob("*.jsonl"))
     assert entries, "no audit chain file was written"
     target = entries[0]
-    lines = target.read_text(encoding="utf-8").splitlines()
+    mutated = False
     patched: list[str] = []
-    for line in lines:
+    for line in target.read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
-        body = row.get("details", {}).get("signed_body")
+        details = row.get("details", {})
+        body = details.get("signed_body")
         if isinstance(body, dict) and "effective_policy" in body:
             body.pop("effective_policy")
+            details["signature"] = sign_payload(_canonical_bytes(body), private_pem)
+            mutated = True
         patched.append(json.dumps(row))
+    assert mutated, "no sovereign record found to mutate"
     target.write_text("\n".join(patched) + "\n", encoding="utf-8")
-    assert verify_sovereign_attestations(audit_dir).ok is False
+
+    result = verify_sovereign_attestations(audit_dir)
+    assert result.ok is False
+    assert any("effective_policy" in err or "missing required field" in err for err in result.errors), result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +564,52 @@ def test_policy_from_env_fails_closed_under_a_network_locked_marker(monkeypatch:
 @pytest.mark.usefixtures("clean_env")
 def test_policy_from_env_keeps_back_compat_outside_locked_profiles() -> None:
     assert policy_from_env().allow_any is True
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_install_policy_clears_markers_it_does_not_assert() -> None:
+    """A second install must not inherit the first one's markers.
+
+    Leaving a stale sovereign or airgap marker behind is how a later
+    non-sovereign run in the same process ends up in the half-set state.
+    """
+    import os
+
+    from bernstein.core.security.network_policy import install_policy
+
+    install_policy(NetworkPolicy.deny_all(), profile=PROFILE_AIRGAP, sovereign=True)
+    assert is_sovereign_profile() is True
+
+    install_policy(NetworkPolicy.allow_all())
+    assert os.environ.get(ENV_SOVEREIGN_MODE) is None
+    assert os.environ.get(ENV_PROFILE_MODE) is None
+    assert is_sovereign_profile() is False
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_install_policy_refuses_sovereign_without_the_airgap_profile() -> None:
+    from bernstein.core.security.network_policy import install_policy
+
+    with pytest.raises(SovereignMarkerError):
+        install_policy(NetworkPolicy.deny_all(), sovereign=True)
+
+
+def test_attested_workspace_refuses_an_open_runtime_with_markers_stripped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stripping the markers must not skip the egress invariant.
+
+    With no markers the process policy is allow-all, while the workspace still
+    carries a signed deny-all attestation. That is the mismatch the gate exists
+    to catch, so it must refuse rather than pass on an unchanged config hash.
+    """
+    _seal(tmp_path)
+    for var in _SOVEREIGN_ENV:
+        monkeypatch.delenv(var, raising=False)
+    assert policy_from_env().allow_any is True  # premise: runtime is wide open
+    with pytest.raises(PostureDriftRefusal) as excinfo:
+        _preflight(tmp_path)
+    assert any("does not equal the enforced runtime policy" in v for v in excinfo.value.record["violations"])
 
 
 # ---------------------------------------------------------------------------

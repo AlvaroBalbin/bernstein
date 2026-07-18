@@ -78,6 +78,7 @@ __all__ = [
     "endpoint_certification_violations",
     "enforced_egress_posture",
     "evaluate_posture_drift",
+    "installed_sovereign_public_key",
     "is_local_or_eu_host",
     "load_config_snapshot",
     "load_or_create_sovereign_identity",
@@ -129,6 +130,7 @@ _RECORD_KIND_DRIFT = "sovereign_drift"
 #: Every field a persisted attestation must carry before it is trusted at all.
 #: A record missing any of them is not a signed record; it is a JSON file.
 _REQUIRED_ATTESTATION_FIELDS: tuple[str, ...] = (
+    "record_kind",
     "profile",
     "schema_version",
     "posture_hash",
@@ -138,13 +140,25 @@ _REQUIRED_ATTESTATION_FIELDS: tuple[str, ...] = (
     "signer_public_key_pem",
 )
 
-#: Every field a chain-anchored signed body must carry, per record kind.
+#: Fields every chain-anchored signed body carries, whatever its kind.
 _REQUIRED_BODY_FIELDS: tuple[str, ...] = (
     "record_kind",
     "schema_version",
     "profile",
     "effective_policy",
     "timestamp",
+)
+
+#: Per-kind required fields. A drift record must carry its full refusal
+#: vocabulary: omitting ``diverging_keys`` or ``violations`` would let a record
+#: satisfy the "names a reason to refuse" check purely by absence.
+_REQUIRED_ATTESTATION_BODY_FIELDS: tuple[str, ...] = (*_REQUIRED_BODY_FIELDS, "posture_hash")
+_REQUIRED_DRIFT_BODY_FIELDS: tuple[str, ...] = (
+    *_REQUIRED_BODY_FIELDS,
+    "attested_hash",
+    "observed_hash",
+    "diverging_keys",
+    "violations",
 )
 
 
@@ -694,6 +708,11 @@ class PostureAttestation:
         profile = raw["profile"]
         if not isinstance(profile, str) or profile != SOVEREIGN_PROFILE:
             raise ValueError(f"attestation profile {profile!r} is not {SOVEREIGN_PROFILE!r}")
+        # Validate the persisted record_kind rather than silently regenerating
+        # it in signed_body(): a drift record renamed into an attestation must
+        # be rejected here, not quietly reinterpreted.
+        if raw["record_kind"] != _RECORD_KIND_ATTESTATION:
+            raise ValueError(f"attestation record_kind {raw['record_kind']!r} is not {_RECORD_KIND_ATTESTATION!r}")
         for seal in ("posture_hash", "signature", "signer_public_key_pem"):
             value = raw[seal]
             if not isinstance(value, str) or not value.strip():
@@ -785,17 +804,46 @@ def build_posture_attestation(
     return sealed
 
 
+def _normalised_pem(pem: str) -> str:
+    """Return *pem* with whitespace differences collapsed, for comparison."""
+    return "".join(pem.split())
+
+
+def installed_sovereign_public_key(workdir: Path) -> str:
+    """Return the install's sovereign public key PEM, or ``""`` if not present.
+
+    Read-only on purpose: unlike
+    :func:`load_or_create_sovereign_identity` this never generates a key. A
+    verification path that created the trust anchor it is about to check
+    against would anchor to whatever it just made up.
+    """
+    path = workdir.joinpath(*_ATTESTATION_SUBDIR, _IDENTITY_PUBLIC_NAME)
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def _read_posture_attestation_with_reason(workdir: Path) -> tuple[PostureAttestation | None, str]:
     """Return ``(attestation, rejection_reason)`` for the persisted record.
 
-    The full trust decision lives here: the record must exist, satisfy the
-    signed-record contract (:meth:`PostureAttestation.from_dict`), and carry an
-    Ed25519 signature that verifies over its canonical signed body against its
-    own embedded public key. Any failure yields ``(None, reason)`` - the caller
-    treats an untrusted record exactly like an absent one and refuses, so a
-    hand-written ``attestation.json`` cannot vouch for itself. The reason is
-    carried into the signed refusal record so the forensic trail says *why* the
-    record was not trusted rather than only that the posture was unattested.
+    The full trust decision lives here. The record must exist, satisfy the
+    signed-record contract (:meth:`PostureAttestation.from_dict`), carry an
+    Ed25519 signature that verifies over its canonical signed body, **and** be
+    signed by this install's sovereign identity.
+
+    The last step is what makes the check adversarial rather than merely
+    structural. Verifying a signature against the public key carried inside the
+    same file proves only self-consistency: anyone who can write the file can
+    generate a fresh keypair, re-sign a forged posture with it, and hand over a
+    document that verifies perfectly. Anchoring the embedded key to the
+    install's own public key on disk means a forged posture must also be signed
+    by the install's identity to be believed.
+
+    Any failure yields ``(None, reason)`` - the caller treats an untrusted
+    record exactly like an absent one and refuses. The reason is carried into
+    the signed refusal record so the forensic trail says *why* the record was
+    not trusted rather than only that the posture was unattested.
     """
     from bernstein.core.skills.catalog.signature import verify_payload
 
@@ -814,6 +862,17 @@ def _read_posture_attestation_with_reason(workdir: Path) -> tuple[PostureAttesta
     )
     if not outcome.verified:
         return None, f"posture attestation at {path} failed signature verification ({outcome.reason})"
+    trusted_pem = installed_sovereign_public_key(workdir)
+    if not trusted_pem.strip():
+        return None, (
+            f"posture attestation at {path} cannot be anchored: this install has no sovereign "
+            "identity public key on disk to check the signer against"
+        )
+    if _normalised_pem(trusted_pem) != _normalised_pem(attestation.signer_public_key_pem):
+        return None, (
+            f"posture attestation at {path} is signed by a key that is not this install's "
+            "sovereign identity; the record verifies against its own embedded key only"
+        )
     return attestation, ""
 
 
@@ -1090,8 +1149,10 @@ def _verify_one_record(
     # record is allowed to stand as evidence, so a record missing its posture
     # document (or a drift record replayed as an attestation) fails here rather
     # than passing on the strength of a valid signature over a partial body.
-    hash_field = "observed_hash" if kind == _RECORD_KIND_DRIFT else "posture_hash"
-    missing = [f for f in (*_REQUIRED_BODY_FIELDS, hash_field) if f not in body]
+    is_drift = kind == _RECORD_KIND_DRIFT
+    hash_field = "observed_hash" if is_drift else "posture_hash"
+    required = _REQUIRED_DRIFT_BODY_FIELDS if is_drift else _REQUIRED_ATTESTATION_BODY_FIELDS
+    missing = [f for f in required if f not in body]
     if missing:
         errors.append(f"{kind} {subject}: record is missing required field(s) {sorted(missing)}")
         return

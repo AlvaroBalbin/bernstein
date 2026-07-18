@@ -2803,7 +2803,11 @@ class AgentSpawner:
                 attestation. Deliberately not a ``SpawnError`` so the
                 per-provider failover loop never retries it -- a hard stop.
         """
-        from bernstein.core.security.network_policy import SovereignMarkerError, is_sovereign_profile
+        from bernstein.core.security.network_policy import (
+            SovereignMarkerError,
+            is_sovereign_profile,
+            policy_from_env,
+        )
 
         extra_violations: list[str] = []
         try:
@@ -2835,9 +2839,16 @@ class AgentSpawner:
             snapshot = None
             extra_violations.append(str(exc))
 
+        # Pass the runtime policy explicitly rather than letting the evaluator
+        # derive it: it only derives one under the airgap marker, so a process
+        # whose markers were stripped -- the exact case the attestation-armed
+        # branch above exists for -- would skip the egress invariant while
+        # ``policy_from_env`` sits at allow-all. An attested deny-all posture
+        # over an open runtime must refuse here, not pass quietly.
         evaluation = evaluate_posture_drift(
             workdir=self._workdir,
             config_snapshot=snapshot,
+            runtime_policy=policy_from_env(),
             extra_violations=tuple(extra_violations),
         )
         if not evaluation.should_refuse:

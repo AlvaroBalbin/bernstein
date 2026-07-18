@@ -308,6 +308,12 @@ def install_policy(policy: NetworkPolicy, *, profile: str | None = None, soverei
     see a half-set state; the caller must pass ``profile=PROFILE_AIRGAP``
     alongside it because sovereign composes the airgap network posture.
 
+    Markers that the new policy does not assert are *cleared*, not left behind.
+    Installing a policy is a full statement of the process posture: a second
+    install in the same process must not inherit the first one's sovereign or
+    airgap marker, which would leave exactly the half-set state
+    :func:`is_sovereign_profile` refuses.
+
     Raises:
         SovereignMarkerError: When *sovereign* is requested without the airgap
             network profile.
@@ -319,5 +325,9 @@ def install_policy(policy: NetworkPolicy, *, profile: str | None = None, soverei
     os.environ[ENV_NETWORK_POLICY] = policy.to_env_value()
     if profile:
         os.environ[ENV_PROFILE_MODE] = profile
+    else:
+        os.environ.pop(ENV_PROFILE_MODE, None)
     if sovereign:
         os.environ[ENV_SOVEREIGN_MODE] = PROFILE_SOVEREIGN
+    else:
+        os.environ.pop(ENV_SOVEREIGN_MODE, None)
