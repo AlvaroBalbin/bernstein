@@ -26,8 +26,12 @@ This module turns the active posture into a **signed, verifiable claim**:
    with the install's Ed25519 sovereign identity
    (:mod:`bernstein.core.lineage.identity`) and anchored in the HMAC audit
    chain via ``record_sovereign_attestation``. The attestation -- not the
-   config file -- is what an auditor checks; the embedded public key makes the
-   signature key-material-free to verify offline.
+   config file -- is what an auditor checks. The record embeds its signer's
+   public key so the signature needs no key distribution to check, but the key
+   is *anchored* against the install's own sovereign identity before the record
+   is believed: a record that verifies only against the key it carries proves
+   self-consistency, not authorship, and anyone who can rewrite the record can
+   also mint a fresh keypair for it.
 
 3. Drift refusal: at spawn time the orchestrator recomputes the effective
    posture from the live config and compares its hash to the attested hash;
@@ -235,7 +239,15 @@ def _egress_token_is_local(token: str) -> bool:
         host = tok[1 : tok.index("]")]
     elif tok.count(":") == 1:  # host:port (single colon => not bare IPv6)
         host = tok.rsplit(":", 1)[0]
-    return is_local_or_eu_host(host)
+    # Classify a bare IP literal directly. ``is_local_or_eu_host`` parses a URL,
+    # and a bare IPv6 literal is not a parseable authority there (``//::1``
+    # yields no hostname), so delegating would mark loopback ``[::1]`` and
+    # unique-local ``[fd00::1]`` as non-local and refuse an honest config.
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return is_local_or_eu_host(host)
+    return ip.is_loopback or ip.is_private
 
 
 # ---------------------------------------------------------------------------
@@ -409,14 +421,22 @@ def sovereign_egress_allowlist(config_snapshot: Mapping[str, Any] | None) -> tup
     allows a destination. ``--allow-network`` is rejected under sovereign
     precisely so the CLI and the attested config cannot diverge.
 
-    Normalisation is what makes the two sides *comparable*, not merely derived
-    from one source: tokens are stripped, lower-cased, de-duplicated, sorted,
-    and the vacuous ``none`` token is dropped. The result is exactly the tuple
+    Tokens are stripped, de-duplicated, and sorted (as before), and the vacuous
+    ``none`` token is dropped. Dropping ``none`` is what makes the attestation
+    truthful rather than merely tidy:
     :meth:`NetworkPolicy.from_specs <bernstein.core.security.network_policy.NetworkPolicy.from_specs>`
-    keeps as its ``rules``, so :func:`egress_attestation_mismatch` compares
-    equal tuples rather than two spellings of the same intent. An all-``none``
-    list normalises to ``()`` and therefore attests deny-all, which is what the
-    runtime installs for it.
+    discards ``none`` from its ``rules``, so a list that still carried it would
+    attest a token the runtime never enforces - and an all-``none`` list would
+    attest ``allow-list`` over a runtime that is deny-all. The result is exactly
+    the tuple the runtime keeps as its ``rules``, so
+    :func:`egress_attestation_mismatch` compares equal tuples.
+
+    Token *case* is deliberately preserved. The runtime never case-folds
+    (``from_specs`` keeps ``rules`` verbatim and ``to_env_value`` /
+    ``policy_from_env`` round-trip them unchanged), so folding here would be an
+    asymmetric normalisation - and it would move ``posture_hash`` for configs
+    whose attestation was already truthful. The ``none`` comparison stays
+    case-insensitive because the runtime's own check is.
     """
     config: Mapping[str, Any] = config_snapshot or {}
     block = config.get("sovereign")
@@ -425,8 +445,8 @@ def sovereign_egress_allowlist(config_snapshot: Mapping[str, Any] | None) -> tup
     raw = block.get("allowed_egress")
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         return ()
-    tokens = {str(t).strip().lower() for t in raw if str(t).strip()}
-    return tuple(sorted(t for t in tokens if t != "none"))
+    tokens = {str(t).strip() for t in raw if str(t).strip()}
+    return tuple(sorted(t for t in tokens if t.lower() != "none"))
 
 
 def enforced_egress_posture(policy: NetworkPolicy) -> tuple[str, tuple[str, ...]]:
@@ -437,10 +457,15 @@ def enforced_egress_posture(policy: NetworkPolicy) -> tuple[str, tuple[str, ...]
     *enforced* half of the attested-equals-enforced invariant: it reads the
     policy object the adapters and the socket guard actually consult, so it
     cannot agree with the attestation by construction - only by fact.
+
+    The normalisation here mirrors :func:`sovereign_egress_allowlist` exactly -
+    strip, drop ``none`` case-insensitively, sort, preserve case. An asymmetry
+    between the two would reject honest records rather than catch dishonest
+    ones.
     """
     if policy.allow_any:
         return EGRESS_ALLOW_ANY, ()
-    rules = tuple(sorted(r.strip().lower() for r in policy.rules if r.strip().lower() != "none"))
+    rules = tuple(sorted(r.strip() for r in policy.rules if r.strip() and r.strip().lower() != "none"))
     if not rules:
         return EGRESS_DENY_ALL, ()
     return EGRESS_ALLOW_LIST, rules
@@ -926,6 +951,12 @@ class DriftEvaluation:
     diverging_keys: tuple[str, ...]
     observed_policy: EffectivePolicy
     violations: tuple[str, ...] = ()
+    #: Why an attestation that *exists on disk* was not trusted (bad contract,
+    #: bad signature, foreign signer). Empty when the record was trusted or when
+    #: there is genuinely no record. Callers must not infer "never activated"
+    #: from an empty ``attested_hash`` alone: a rejected record also has no
+    #: attested hash, and the two mean very different things to an auditor.
+    attestation_rejected: str = ""
 
     @property
     def should_refuse(self) -> bool:
@@ -998,6 +1029,7 @@ def evaluate_posture_drift(
             diverging_keys=(),
             observed_policy=observed,
             violations=violations + ((rejection,) if rejection else ()),
+            attestation_rejected=rejection,
         )
     if attestation.posture_hash == observed_hash:
         return DriftEvaluation(
@@ -1107,11 +1139,42 @@ def verify_sovereign_attestations(audit_dir: Path, *, key: bytes | None = None) 
     att_events = log.query(event_type=EVENT_SOVEREIGN_ATTESTATION)
     drift_events = log.query(event_type=EVENT_SOVEREIGN_DRIFT)
     errors: list[str] = []
+    if not att_events and not drift_events:
+        return SovereignVerifyResult(ok=True, errors=[], attestation_count=0, drift_count=0)
+
+    # Anchor the signer the same way the on-disk attestation path does. Without
+    # this, a rewritten chain row re-signed with a freshly generated keypair
+    # (embedding its own public key) verifies clean, which would make the
+    # Ed25519 layer worthless in exactly the two situations it exists for:
+    # ``--merkle-only`` runs that skip the HMAC check, and a compromised HMAC
+    # key. ``audit_dir`` is ``<workdir>/.sdd/audit``.
+    workdir = audit_dir.parent.parent
+    trusted_pem = installed_sovereign_public_key(workdir)
+    if not trusted_pem.strip():
+        errors.append(
+            f"sovereign records are present but this install has no sovereign identity public key "
+            f"under {workdir / '.sdd' / 'sovereign'} to anchor their signatures against"
+        )
+        return SovereignVerifyResult(
+            ok=False, errors=errors, attestation_count=len(att_events), drift_count=len(drift_events)
+        )
 
     for event in att_events:
-        _verify_one_record(event.details, kind=_RECORD_KIND_ATTESTATION, errors=errors, verify_payload=verify_payload)
+        _verify_one_record(
+            event.details,
+            kind=_RECORD_KIND_ATTESTATION,
+            errors=errors,
+            verify_payload=verify_payload,
+            trusted_pem=trusted_pem,
+        )
     for event in drift_events:
-        _verify_one_record(event.details, kind=_RECORD_KIND_DRIFT, errors=errors, verify_payload=verify_payload)
+        _verify_one_record(
+            event.details,
+            kind=_RECORD_KIND_DRIFT,
+            errors=errors,
+            verify_payload=verify_payload,
+            trusted_pem=trusted_pem,
+        )
 
     return SovereignVerifyResult(
         ok=not errors,
@@ -1127,6 +1190,7 @@ def _verify_one_record(
     kind: str,
     errors: list[str],
     verify_payload: Any,
+    trusted_pem: str,
 ) -> None:
     body = details.get("signed_body")
     signature = details.get("signature")
@@ -1143,6 +1207,14 @@ def _verify_one_record(
     subject = str(body.get("posture_hash") or body.get("observed_hash") or "?")
     if not outcome.verified:
         errors.append(f"{kind} {subject}: signature check failed ({outcome.reason})")
+        return
+    # A signature that verifies against a key carried by the record proves only
+    # that whoever wrote the record also chose the key. Anchor it.
+    if not isinstance(public_key, str) or _normalised_pem(public_key) != _normalised_pem(trusted_pem):
+        errors.append(
+            f"{kind} {subject}: signed by a key that is not this install's sovereign identity; "
+            "the record verifies against its own embedded key only"
+        )
         return
     # The signature proves the body was not edited; it does not prove the body
     # is a complete record of the expected kind. Both are required before the

@@ -206,6 +206,100 @@ def test_sovereign_egress_allowlist_normalises_tokens() -> None:
     assert sovereign_egress_allowlist({"sovereign": {"allowed_egress": ["none"]}}) == ()
 
 
+def test_sovereign_egress_allowlist_preserves_token_case() -> None:
+    """Case is preserved: the runtime never folds it, so neither may we.
+
+    Folding here would be an asymmetric normalisation against the runtime and
+    would move ``posture_hash`` for configs whose attestation was already
+    truthful. See the v1 hash-parity test below.
+    """
+    config = {"sovereign": {"allowed_egress": ["Box.Internal:443"]}}
+    assert sovereign_egress_allowlist(config) == ("Box.Internal:443",)
+    runtime = NetworkPolicy.from_specs(("Box.Internal:443",))
+    assert enforced_egress_posture(runtime) == ("allow-list", ("Box.Internal:443",))
+
+
+#: Posture hashes for configs whose pre-existing attestation was already
+#: truthful. These are byte-identical to the values ``main`` produces, and they
+#: must not move without an ``EFFECTIVE_POLICY_SCHEMA_VERSION`` bump: the
+#: documented contract is that an auditor recomputes the identical hash from the
+#: config file alone, so a silent projection change invalidates every attestation
+#: an operator has already collected.
+_V1_GOLDEN_POSTURE_HASHES: dict[str, tuple[dict[str, Any], str]] = {
+    "bare": (
+        {"storage": {"backend": "memory"}},
+        "sha256:0eb7b68baa46bd75bfde2d677516ba04a777e155ba6483bfadbf2a793f25c4f6",
+    ),
+    "empty_egress": (
+        {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": []}},
+        "sha256:0eb7b68baa46bd75bfde2d677516ba04a777e155ba6483bfadbf2a793f25c4f6",
+    ),
+    "single_token": (
+        {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": ["10.0.0.5:11434"]}},
+        "sha256:3d2e59dfedcd5202e277c0c4d2ef960f67e9bc6a43185ee73da6a6a61d7026c0",
+    ),
+    "cidr": (
+        {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": ["10.0.0.0/8"]}},
+        "sha256:f3bff9e6fadb1186b685f0b02b6c1cf4438a00af1f83852351002089508c8625",
+    ),
+    "mixed_case": (
+        {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": ["Box.Internal:443"]}},
+        "sha256:35d8a113e9b736ea32926e8dcae7c470ca2cb85a763e8ba9899ae13639c1e78f",
+    ),
+    "whitespace": (
+        {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": ["  10.0.0.5:11434  "]}},
+        "sha256:3d2e59dfedcd5202e277c0c4d2ef960f67e9bc6a43185ee73da6a6a61d7026c0",
+    ),
+    "duplicates": (
+        {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": ["10.0.0.0/8", "10.0.0.0/8"]}},
+        "sha256:f3bff9e6fadb1186b685f0b02b6c1cf4438a00af1f83852351002089508c8625",
+    ),
+    "endpoints_catalogs": (
+        {
+            "storage": {"backend": "memory"},
+            "catalogs": [{"name": "core", "enabled": False}],
+            "role_model_policy": {"planner": {"base_url": "http://10.0.0.5:11434/v1", "model": "m"}},
+        },
+        "sha256:715efdab5aa936ce5238ed29eb54dc27b35deaebfcca830a4d46d57afddbdd4b",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_V1_GOLDEN_POSTURE_HASHES))
+def test_v1_posture_hash_parity_for_truthful_configs(shape: str) -> None:
+    """A truthful config's posture hash must stay byte-identical to v1."""
+    config, expected = _V1_GOLDEN_POSTURE_HASHES[shape]
+    assert resolve_effective_policy(SOVEREIGN_PROFILE, config).posture_hash() == expected
+
+
+@pytest.mark.parametrize(
+    "allowed_egress",
+    [["none"], ["none", "10.0.0.5:11434"], ["NONE", "10.0.0.5:11434"]],
+)
+def test_none_bearing_configs_are_the_only_ones_whose_hash_moves(allowed_egress: list[str]) -> None:
+    """The hash movement this PR causes is confined to configs that were lying.
+
+    A ``none`` token in the list is discarded by ``NetworkPolicy.from_specs``,
+    so the previous projection attested a token the runtime never enforced -
+    and an all-``none`` list attested ``allow-list`` over a deny-all runtime.
+    Dropping ``none`` is therefore required by the invariant, and the resulting
+    hash change only invalidates attestations that were false.
+    """
+    config = {"storage": {"backend": "memory"}, "sovereign": {"allowed_egress": allowed_egress}}
+    policy = resolve_effective_policy(SOVEREIGN_PROFILE, config)
+    real = [t for t in allowed_egress if t.lower() != "none"]
+
+    assert "none" not in [t.lower() for t in policy.egress_allowlist]
+    if real:
+        assert policy.network_egress == "allow-list"
+        runtime = NetworkPolicy.from_specs(tuple(allowed_egress))
+    else:
+        assert policy.network_egress == "deny-all"
+        runtime = NetworkPolicy.deny_all()
+    # The whole point: the projection now equals what the runtime enforces.
+    assert egress_attestation_mismatch(policy, runtime) is None
+
+
 # ---------------------------------------------------------------------------
 # Enforcement before attestation
 # ---------------------------------------------------------------------------
@@ -440,6 +534,100 @@ def test_wrong_record_kind_is_rejected(tmp_path: Path) -> None:
     assert read_posture_attestation(tmp_path) is None
 
 
+# The checks inside ``from_dict`` are exercised directly below rather than only
+# through ``read_posture_attestation``. Going through the file path lets a
+# neighbouring check (signature verification, the posture-hash recompute, the
+# signer anchor) reject the record first, so those tests stay green even if the
+# validator under test is deleted. Calling the validator where it lives is the
+# only way to prove it carries its own weight.
+
+
+def _valid_attestation_dict(tmp_path: Path) -> dict[str, Any]:
+    _seal(tmp_path)
+    return json.loads(attestation_path(tmp_path).read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "record_kind",
+        "profile",
+        "schema_version",
+        "posture_hash",
+        "effective_policy",
+        "timestamp",
+        "signature",
+        "signer_public_key_pem",
+    ],
+)
+def test_from_dict_requires_each_contract_field(tmp_path: Path, field: str) -> None:
+    """The required-field check rejects on its own, not via a later check."""
+    raw = _valid_attestation_dict(tmp_path)
+    raw.pop(field)
+    with pytest.raises(ValueError, match="missing required field"):
+        PostureAttestation.from_dict(raw)
+
+
+def test_from_dict_rejects_a_foreign_record_kind(tmp_path: Path) -> None:
+    raw = _valid_attestation_dict(tmp_path)
+    raw["record_kind"] = "sovereign_drift"
+    with pytest.raises(ValueError, match="record_kind"):
+        PostureAttestation.from_dict(raw)
+
+
+@pytest.mark.parametrize("seal", ["posture_hash", "signature", "signer_public_key_pem"])
+def test_from_dict_rejects_a_blank_seal_field(tmp_path: Path, seal: str) -> None:
+    """A blank seal is rejected here, not left to the signature check."""
+    raw = _valid_attestation_dict(tmp_path)
+    raw[seal] = "   "
+    with pytest.raises(ValueError, match=seal):
+        PostureAttestation.from_dict(raw)
+
+
+def test_from_dict_rejects_a_foreign_profile(tmp_path: Path) -> None:
+    raw = _valid_attestation_dict(tmp_path)
+    raw["profile"] = "airgap"
+    with pytest.raises(ValueError, match="profile"):
+        PostureAttestation.from_dict(raw)
+
+
+def test_from_dict_rejects_a_mistyped_timestamp(tmp_path: Path) -> None:
+    raw = _valid_attestation_dict(tmp_path)
+    raw["timestamp"] = "1"
+    with pytest.raises(ValueError, match="timestamp"):
+        PostureAttestation.from_dict(raw)
+
+
+def test_corrupt_signature_alone_is_rejected(tmp_path: Path) -> None:
+    """Isolates signature verification from every other check.
+
+    The body is untouched, so the posture hash still recomputes and the contract
+    is complete; the signer key is still the install's own, so the anchor
+    matches. Only the signature bytes are corrupted, which leaves the signature
+    check as the single thing that can reject this record.
+    """
+    from bernstein.core.security.deployment_profile import _canonical_bytes
+    from bernstein.core.skills.catalog.signature import verify_payload
+
+    attestation = _seal(tmp_path)
+    raw = json.loads(attestation_path(tmp_path).read_text(encoding="utf-8"))
+
+    # Corrupt one byte of the signature, keeping it well-formed base64url.
+    signature = raw["signature"]
+    flipped = ("B" if signature[0] != "B" else "C") + signature[1:]
+    raw["signature"] = flipped
+    attestation_path(tmp_path).write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+    # Premise: everything except the signature still checks out.
+    parsed = PostureAttestation.from_dict(raw)  # contract + hash recompute pass
+    assert parsed.signer_public_key_pem == attestation.signer_public_key_pem  # anchor matches
+    assert not verify_payload(
+        _canonical_bytes(parsed.signed_body()), flipped, parsed.signer_public_key_pem, allow_unverified=True
+    ).verified
+
+    assert read_posture_attestation(tmp_path) is None
+
+
 def test_posture_hash_must_match_the_recorded_document(tmp_path: Path) -> None:
     _seal(tmp_path)
     _rewrite_attestation(tmp_path, lambda raw: raw.update({"posture_hash": "sha256:" + "0" * 64}), resign=True)
@@ -493,6 +681,48 @@ def test_verify_rejects_a_record_with_no_effective_policy(tmp_path: Path) -> Non
     assert any("effective_policy" in err or "missing required field" in err for err in result.errors), result.errors
 
 
+def test_verify_rejects_a_drift_record_missing_its_refusal_vocabulary(tmp_path: Path) -> None:
+    """Isolates the chain required-field check for drift records.
+
+    ``attested_hash`` has no downstream type or value check, so dropping it and
+    re-signing leaves the required-field check as the only thing that can
+    reject the record. Without that check the record would verify clean.
+    """
+    from bernstein.core.security.deployment_profile import (
+        _canonical_bytes,
+        record_and_sign_drift,
+        verify_sovereign_attestations,
+    )
+    from bernstein.core.skills.catalog.signature import sign_payload
+
+    _write_config(tmp_path, "goal: x\nstorage:\n  backend: postgres\n")
+    audit_dir = tmp_path / ".sdd" / "audit"
+    snapshot = load_config_snapshot(tmp_path)
+    evaluation = evaluate_posture_drift(workdir=tmp_path, config_snapshot=snapshot)
+    record_and_sign_drift(workdir=tmp_path, evaluation=evaluation, timestamp=1, chain=AuditChainStore(audit_dir))
+    assert verify_sovereign_attestations(audit_dir).ok is True
+
+    private_pem = _install_private_key(tmp_path)
+    target = sorted(audit_dir.glob("*.jsonl"))[0]
+    mutated = False
+    patched: list[str] = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        details = row.get("details", {})
+        body = details.get("signed_body")
+        if isinstance(body, dict) and "attested_hash" in body:
+            body.pop("attested_hash")
+            details["signature"] = sign_payload(_canonical_bytes(body), private_pem)
+            mutated = True
+        patched.append(json.dumps(row))
+    assert mutated, "no drift record found to mutate"
+    target.write_text("\n".join(patched) + "\n", encoding="utf-8")
+
+    result = verify_sovereign_attestations(audit_dir)
+    assert result.ok is False
+    assert any("attested_hash" in err for err in result.errors), result.errors
+
+
 # ---------------------------------------------------------------------------
 # Marker pair consistency
 # ---------------------------------------------------------------------------
@@ -536,6 +766,228 @@ def test_half_set_markers_do_not_bypass_the_spawn_gate(tmp_path: Path, monkeypat
     monkeypatch.delenv(ENV_PROFILE_MODE, raising=False)
     with pytest.raises(PostureDriftRefusal):
         _preflight(tmp_path)
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_half_set_markers_arm_the_gate_with_no_attestation_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Isolates the half-set marker guard from the attestation-presence guard.
+
+    With no attestation on disk the only thing that can arm the gate is the
+    half-set marker pair. If a half-set state were read as "not sovereign" the
+    gate would return early and the spawn would proceed unchecked, which is the
+    bypass itself.
+    """
+    _write_config(tmp_path, _COMPLIANT_DENY_ALL)
+    assert not attestation_path(tmp_path).exists()  # premise: nothing else can arm the gate
+    monkeypatch.setenv(ENV_SOVEREIGN_MODE, "1")
+    monkeypatch.delenv(ENV_PROFILE_MODE, raising=False)
+    with pytest.raises(PostureDriftRefusal) as excinfo:
+        _preflight(tmp_path)
+    assert any("markers are inconsistent" in v for v in excinfo.value.record["violations"])
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_absent_markers_and_no_attestation_leave_the_gate_closed(tmp_path: Path) -> None:
+    """The counterpart: with neither signal the gate must stay a no-op."""
+    _write_config(tmp_path, _COMPLIANT_DENY_ALL)
+    _preflight(tmp_path)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# The auditor-facing surface must agree with the enforcement surface
+# ---------------------------------------------------------------------------
+
+
+def _doctor_attestation_row(workdir: Path) -> Any:
+    from bernstein.core.distribution.doctor_sovereign import run_sovereign_checks
+
+    report = run_sovereign_checks(workdir)
+    row = next(c for c in report.checks if c.name == "posture attested (no drift)")
+    return report, row
+
+
+def test_doctor_fails_when_the_attestation_is_present_but_untrusted(tmp_path: Path) -> None:
+    """A tampered record must not read as "you have not activated yet".
+
+    Rejecting an untrusted record leaves ``attested_hash`` empty, which is also
+    what a genuinely never-activated workspace looks like. Reporting the two the
+    same way hands an auditor a clean bill of health at the exact moment the
+    spawn gate is refusing every spawn.
+    """
+    from bernstein.core.distribution.doctor_sovereign import CheckStatus
+
+    _seal(tmp_path)
+    _rewrite_attestation(tmp_path, lambda raw: raw["effective_policy"].update({"storage_backend": "postgres"}))
+
+    _, row = _doctor_attestation_row(tmp_path)
+    assert row.status is CheckStatus.FAIL, f"expected FAIL, got {row.status}: {row.detail}"
+    assert "not trusted" in row.detail
+    # And the gate agrees, which is the point: one posture, one verdict.
+    assert (
+        evaluate_posture_drift(workdir=tmp_path, config_snapshot=load_config_snapshot(tmp_path)).should_refuse is True
+    )
+
+
+def test_doctor_still_warns_when_genuinely_never_activated(tmp_path: Path) -> None:
+    """The never-activated case stays a WARN, distinct from a tampered record."""
+    from bernstein.core.distribution.doctor_sovereign import CheckStatus
+
+    _write_config(tmp_path, _COMPLIANT_DENY_ALL)
+    assert not attestation_path(tmp_path).exists()
+    _, row = _doctor_attestation_row(tmp_path)
+    assert row.status is CheckStatus.WARN
+    assert "no attestation yet" in row.detail
+
+
+def test_verify_rejects_a_chain_record_signed_by_a_foreign_key(tmp_path: Path) -> None:
+    """Isolates the chain-side signer anchor.
+
+    The rewritten body is fully self-consistent - non-compliant posture, hash
+    recomputed to match, signed with a fresh keypair whose public key is
+    embedded. Every structural check passes; only the anchor can reject it.
+    Without the anchor this is the shape that makes the Ed25519 layer useless
+    under `--merkle-only` or a compromised HMAC key.
+    """
+    from bernstein.core.security.deployment_profile import (
+        _canonical_bytes,
+        _sha256_of,
+        verify_sovereign_attestations,
+    )
+    from bernstein.core.skills.catalog.signature import generate_signer_keypair, sign_payload, verify_payload
+
+    _seal(tmp_path)
+    audit_dir = tmp_path / ".sdd" / "audit"
+    assert verify_sovereign_attestations(audit_dir).ok is True
+
+    foreign_private, foreign_public = generate_signer_keypair()
+    target = sorted(audit_dir.glob("*.jsonl"))[0]
+    mutated = False
+    patched: list[str] = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        details = row.get("details", {})
+        body = details.get("signed_body")
+        if isinstance(body, dict) and "effective_policy" in body:
+            body["effective_policy"]["storage_backend"] = "postgres"
+            body["posture_hash"] = _sha256_of(body["effective_policy"])
+            details["signature"] = sign_payload(_canonical_bytes(body), foreign_private)
+            details["signer_public_key_pem"] = foreign_public
+            # Premise: the forged record is internally consistent.
+            assert verify_payload(
+                _canonical_bytes(body), details["signature"], foreign_public, allow_unverified=True
+            ).verified
+            mutated = True
+        patched.append(json.dumps(row))
+    assert mutated, "no sovereign record found to mutate"
+    target.write_text("\n".join(patched) + "\n", encoding="utf-8")
+
+    result = verify_sovereign_attestations(audit_dir)
+    assert result.ok is False
+    assert any("not this install's sovereign identity" in err for err in result.errors), result.errors
+
+
+def test_verify_fails_closed_when_the_trust_anchor_is_missing(tmp_path: Path) -> None:
+    """Sovereign records with no identity to anchor them against cannot pass.
+
+    Deleting the public key is the cheap way to defeat an anchor that treats
+    "no anchor available" as "nothing to check", so the absence has to be an
+    error rather than a skip. A workspace with zero sovereign records is
+    unaffected (that stays a silent pass), so this only bites where it should.
+    """
+    from bernstein.core.security.deployment_profile import verify_sovereign_attestations
+
+    _seal(tmp_path)
+    audit_dir = tmp_path / ".sdd" / "audit"
+    assert verify_sovereign_attestations(audit_dir).ok is True
+
+    (tmp_path / ".sdd" / "sovereign" / "sovereign-identity-public.pem").unlink()
+    result = verify_sovereign_attestations(audit_dir)
+    assert result.ok is False
+    assert any("no sovereign identity public key" in err for err in result.errors), result.errors
+
+
+def test_verify_is_a_silent_pass_with_no_sovereign_records(tmp_path: Path) -> None:
+    """A workspace that never activated sovereign must not be dragged into this."""
+    from bernstein.core.security.deployment_profile import verify_sovereign_attestations
+
+    audit_dir = tmp_path / ".sdd" / "audit"
+    audit_dir.mkdir(parents=True)
+    result = verify_sovereign_attestations(audit_dir)
+    assert result.ok is True
+    assert result.errors == []
+    assert (result.attestation_count, result.drift_count) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Honest configs must not be refused
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["[::1]:8080", "[::1]", "[fd00::1]:443", "127.0.0.1", "10.0.0.5:11434", "10.0.0.0/8", "192.168.1.7"],
+)
+def test_local_egress_tokens_are_accepted(token: str) -> None:
+    """IPv6 loopback and unique-local are self-hosted destinations like any other.
+
+    ``[::1]`` is what ``localhost`` resolves to on a dual-stack host, so a local
+    model server reached over IPv6 is an ordinary sovereign deployment. Bracket
+    stripping used to hand a bare IPv6 literal to a URL parser that cannot
+    represent one, which classified it as non-local - previously a spurious
+    warning, and now, with enforcement before attestation, a hard refusal of an
+    honest config.
+    """
+    from bernstein.core.security.deployment_profile import _egress_token_is_local
+
+    assert _egress_token_is_local(token) is True
+
+
+@pytest.mark.parametrize("token", ["api.example.com:443", "8.8.8.8", "1.1.1.1:443", "0.0.0.0/0", "::/0", "any"])
+def test_non_local_egress_tokens_are_still_refused(token: str) -> None:
+    """The counterpart: globally routable destinations must stay refused."""
+    from bernstein.core.security.deployment_profile import _egress_token_is_local
+
+    assert _egress_token_is_local(token) is False
+
+
+@pytest.mark.parametrize("token", ["[2001:db8::1]:443", "192.0.2.1", "198.51.100.1:80"])
+def test_documentation_prefixes_follow_the_module_locality_definition(token: str) -> None:
+    """Documentation prefixes count as local, matching the endpoint path exactly.
+
+    This module defines local as ``ip.is_loopback or ip.is_private``, and
+    Python's ``is_private`` covers the RFC 5737 / RFC 3849 documentation ranges
+    for both families - so ``is_local_or_eu_host`` already classifies
+    ``192.0.2.1`` as local on the endpoint path. Pinning the same answer for
+    egress tokens keeps the two paths from disagreeing about the same address.
+    These prefixes are unroutable by definition, so they are not an egress path.
+    """
+    from bernstein.core.security.deployment_profile import _egress_token_is_local, is_local_or_eu_host
+
+    assert _egress_token_is_local(token) is True
+    bare = (
+        token[1 : token.index("]")]
+        if token.startswith("[")
+        else token.rsplit(":", 1)[0]
+        if (token.count(":") == 1)
+        else token
+    )
+    url = f"http://[{bare}]/" if ":" in bare else f"http://{bare}/"
+    assert is_local_or_eu_host(url) is True, "egress and endpoint paths must agree on the same address"
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_ipv6_loopback_egress_activates_cleanly(tmp_path: Path) -> None:
+    """End-to-end: an IPv6-loopback allow-list activates and stays truthful."""
+    _write_config(
+        tmp_path,
+        "goal: x\nstorage:\n  backend: memory\nsovereign:\n  allowed_egress: ['[::1]:8080']\n",
+    )
+    _activate(tmp_path)
+    assert attestation_path(tmp_path).is_file()
+    assert _attested_egress(tmp_path) == enforced_egress_posture(policy_from_env())
+    assert policy_from_env().is_allowed("::1", 8080) is True
 
 
 @pytest.mark.usefixtures("clean_env")

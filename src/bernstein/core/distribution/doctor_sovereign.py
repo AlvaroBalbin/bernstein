@@ -181,7 +181,25 @@ def check_endpoints_certified(policy: EffectivePolicy, workdir: Path) -> Check:
 
 
 def check_posture_attested(policy: EffectivePolicy, evaluation: DriftEvaluation) -> Check:
-    """Verify the posture is attested and the live posture has not drifted."""
+    """Verify the posture is attested and the live posture has not drifted.
+
+    An attestation that exists but is *not trusted* (incomplete contract, bad
+    signature, foreign signer) is a FAIL, not the never-activated WARN. Both
+    leave ``attested_hash`` empty, so keying off that alone would report a
+    tampered record as "you have not activated yet" - a clean bill of health on
+    the one surface an auditor reads, at the moment the spawn gate is refusing
+    every spawn.
+    """
+    if evaluation.attestation_rejected:
+        return Check(
+            name="posture attested (no drift)",
+            status=CheckStatus.FAIL,
+            detail=f"attestation present but not trusted: {evaluation.attestation_rejected}",
+            fix=(
+                "investigate the attestation record; re-activate with "
+                "'bernstein run --profile sovereign' only after establishing why it was replaced"
+            ),
+        )
     if not evaluation.attested_hash:
         return Check(
             name="posture attested (no drift)",
