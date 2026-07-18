@@ -28,20 +28,55 @@ guarantee.
 
 1. **Issue.** The gate builds the envelope, computes `card_hash`, and appends a
    `chat.approval_card.issued` event carrying the full envelope, the hash, and
-   the previous chain digest. Drivers render the envelope fields **verbatim**
-   (`render_card_text`), so the displayed card equals the hashed record.
-2. **Resolve.** A decision must echo the exact `card_hash`. The gate refuses
-   when:
-   - the echoed hash matches no issued envelope (any field the operator saw was
-     changed), recording a `chat.approval_card.refused` event with reason
-     `hash_mismatch`, or
-   - the decision arrives at or after `not_after`, recording a refusal with
-     reason `expired`.
+   the previous chain digest. The event is appended *before* the card becomes
+   resolvable, so a failed append leaves no settleable card behind. Drivers
+   render the envelope fields **verbatim** (`render_card_text`): every hashed
+   field is shown with a round-trippable value, and the canonical JSON envelope
+   is printed alongside the hash, so an operator can re-hash exactly what they
+   read and confirm it equals the committed record.
+2. **Resolve.** A decision must echo the exact `card_hash`. The whole
+   check-and-commit runs under one lock, so concurrent decisions on the same
+   hash cannot both settle. The gate refuses, recording a
+   `chat.approval_card.refused` event, when:
+
+   | Reason | Refused because |
+   |---|---|
+   | `hash_mismatch` | The echoed hash matches no issued envelope, so some field the operator saw was changed |
+   | `already_settled` | The card has already been decided; a card settles exactly once |
+   | `invalid_decision` | The decision is not `approve` or `reject` |
+   | `expired` | The decision arrived at or after `not_after` |
+   | `cross_worktree` | The card was pinned to a different worktree |
+   | `cross_conversation` | The card was issued on a different conversation |
+
    A clean resolve records `chat.approval_card.resolved`.
-3. **Verify offline.** `bernstein audit verify` reconstructs every resolved
-   card from the issue event, confirms the stored envelope still hashes to its
-   recorded `card_hash`, confirms the decision echoed an issued envelope, and
-   confirms the decision landed before expiry.
+3. **Verify offline.** `bernstein audit verify` walks the chain in order and,
+   for every resolved card, confirms the stored envelope still hashes to its
+   recorded `card_hash`, that the decision echoed an envelope issued *earlier
+   in the chain*, and that the decision timestamp is finite, positive, and
+   inside the envelope's window (`created_at <= resolved_at < not_after`).
+
+## Settling exactly once
+
+A card settles once. The settled set is rebuilt from the chain's `resolved` and
+terminally-`refused` events, not from process memory, so a restart does not
+reopen a card the chain already shows as decided, and a captured `card_hash` is
+a single-use token rather than a reusable one.
+
+Only expiry counts as a terminal refusal. Expiry is monotone: once the chain has
+seen a card pass its `not_after`, no later clock reading revives it. The other
+refusal reasons describe a rejected *attempt*, not a settled card, and
+deliberately leave the card pending. Burning a card on a `cross_worktree` or
+`hash_mismatch` refusal would let anyone who can reach the chat surface deny the
+operator their pending decision.
+
+## Origin pinning
+
+A card issued into a worktree and a conversation commits to that origin. A
+decision arriving from a different worktree or conversation is refused and
+chain-recorded rather than honoured, so observing a `card_hash` in one context
+does not let it be exercised in another. Each check is skipped when the card
+carried no such pin, and the conversation check is skipped when the caller
+supplies no conversation, so drivers that cannot attribute one are unaffected.
 
 ## Chain-enforced expiry
 
@@ -57,6 +92,14 @@ Issuing the same pending approval against identical repository state produces
 byte-identical envelopes and an identical `card_hash`. The envelope is a pure
 projection of its inputs (the tool call, the stated intent, the blast-radius
 detectors, and the issue time), so two operators reconstruct the same card.
+
+Timestamps must be finite numbers, and integer timestamps are widened to
+floats before hashing. Both rules protect the projection: `NaN` compares false
+against everything, so a `NaN` `not_after` would produce a card that never
+expires, and `1000` and `1000.0` serialise to different bytes, so the same
+instant would otherwise yield two different hashes. Canonical JSON is emitted
+with `allow_nan` disabled, so an envelope can never hash over bytes that no
+conforming JSON parser reads back.
 
 ## Irreversible actions
 
