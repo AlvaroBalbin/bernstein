@@ -287,6 +287,51 @@ def test_build_card_rejects_non_finite_created_at(bad: float) -> None:
         )
 
 
+def test_integer_timestamps_widen_so_the_hash_stays_stable() -> None:
+    """An int timestamp must not produce different canonical bytes than a float.
+
+    ``json.dumps`` emits ``1000`` for an int and ``1000.0`` for a float, so
+    without widening, the same instant would hash to two different cards.
+    """
+    as_int = build_card(
+        approval_id="ap-1",
+        tool_name="Edit",
+        tool_args={"file_path": "a.py"},
+        reasoning="r",
+        created_at=1_000,
+        ttl_seconds=600,
+    )
+    as_float = build_card(
+        approval_id="ap-1",
+        tool_name="Edit",
+        tool_args={"file_path": "a.py"},
+        reasoning="r",
+        created_at=1_000.0,
+        ttl_seconds=600.0,
+    )
+    assert canonical_card_bytes(as_int) == canonical_card_bytes(as_float)
+    assert card_hash(as_int) == card_hash(as_float)
+
+
+@pytest.mark.parametrize("bad", ["1000.0", None, True, {"v": 1}, []])
+def test_from_dict_rejects_non_numeric_timestamps(bad: object) -> None:
+    """A stored envelope with a non-numeric timestamp is rejected, not coerced."""
+    payload = _card().to_dict()
+    payload["created_at"] = bad
+    with pytest.raises(ValueError, match="finite number"):
+        ApprovalCardV2.from_dict(payload)
+
+
+def test_verifier_rejects_non_numeric_resolved_at(tmp_path: Path) -> None:
+    chain = _chain(tmp_path)
+    digest = _issue_via_gate(chain, _card())
+    _raw_resolve(chain, digest, "1100.0")
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("resolved_at" in e for e in result.errors)
+
+
 def test_build_card_rejects_negative_ttl() -> None:
     with pytest.raises(ValueError, match="ttl_seconds"):
         build_card(

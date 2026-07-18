@@ -109,6 +109,17 @@ ALLOWED_DECISIONS = frozenset({"approve", "reject"})
 _TERMINAL_REFUSAL_REASONS = frozenset({REFUSAL_REASON_EXPIRED})
 
 
+def _is_terminal_event(event_type: str, details: dict[str, Any]) -> bool:
+    """Return ``True`` when a chain event settles its card permanently.
+
+    A ``resolved`` event always settles. A ``refused`` event settles only when
+    its reason is in :data:`_TERMINAL_REFUSAL_REASONS`.
+    """
+    if event_type == EVENT_APPROVAL_CARD_RESOLVED:
+        return True
+    return event_type == EVENT_APPROVAL_CARD_REFUSED and str(details.get("reason", "")) in _TERMINAL_REFUSAL_REASONS
+
+
 class ApprovalCardHashMismatch(RuntimeError):
     """Raised when a resolve echoes a ``card_hash`` that no issued card matches.
 
@@ -183,7 +194,7 @@ class ApprovalCardGate:
         self._session_id = session_id
         self._issued: dict[str, IssuedCard] = {}
         #: Hashes known to have reached a terminal state in this process. It is
-        #: a cache, not the source of truth: :meth:`_is_settled` falls back to
+        #: a cache, not the source of truth: :meth:`_state_for` falls back to
         #: the chain so a restart (or a second gate over the same audit dir)
         #: still sees settlements this process never made.
         self._settled: set[str] = set()
@@ -294,7 +305,7 @@ class ApprovalCardGate:
         current = time.time() if now is None else now
         echoed = card_hash
         with self._lock:
-            issued = self._lookup(echoed)
+            issued, settled = self._state_for(echoed)
             if issued is None:
                 self._refuse(
                     card_hash=echoed,
@@ -306,7 +317,7 @@ class ApprovalCardGate:
                 raise ApprovalCardHashMismatch(
                     f"echoed card_hash {echoed!r} matches no issued approval card; refusing to resolve",
                 )
-            self._guard_settled(echoed, approver=approver, worktree_id=worktree_id, issued=issued)
+            self._guard_settled(echoed, settled=settled, approver=approver, worktree_id=worktree_id, issued=issued)
             self._guard_decision(decision, echoed, approver=approver, worktree_id=worktree_id, issued=issued)
             self._guard_expiry(echoed, approver=approver, worktree_id=worktree_id, issued=issued, current=current)
             self._guard_binding(
@@ -339,9 +350,17 @@ class ApprovalCardGate:
     # Resolve guards
     # ------------------------------------------------------------------
 
-    def _guard_settled(self, echoed: str, *, approver: str, worktree_id: str, issued: IssuedCard) -> None:
+    def _guard_settled(
+        self,
+        echoed: str,
+        *,
+        settled: bool,
+        approver: str,
+        worktree_id: str,
+        issued: IssuedCard,
+    ) -> None:
         """Refuse a card that already reached a terminal state."""
-        if not self._is_settled(echoed):
+        if not settled:
             return
         self._refuse(
             card_hash=echoed,
@@ -449,74 +468,74 @@ class ApprovalCardGate:
     # Internals
     # ------------------------------------------------------------------
 
-    def _lookup(self, digest: str) -> IssuedCard | None:
-        """Return the issued card for *digest*, reconstructing from the chain.
+    def _rehydrate(self, digest: str, details: dict[str, Any]) -> IssuedCard | None:
+        """Rebuild an :class:`IssuedCard` from a stored issue event, or ``None``."""
+        envelope_any: Any = details.get("envelope")
+        if not isinstance(envelope_any, dict):
+            return None
+        try:
+            card = ApprovalCardV2.from_dict(cast("dict[str, Any]", envelope_any))
+        except (TypeError, ValueError):
+            # A stored envelope carrying a non-finite or non-numeric timestamp
+            # is treated as unknown rather than rehydrated: a NaN not_after
+            # would produce a card that never expires.
+            return None
+        # Only trust a reconstructed envelope whose stored hash still matches
+        # its bytes; a mutated envelope is rejected as unknown.
+        if card_hash(card) != digest:
+            return None
+        return IssuedCard(
+            card=card,
+            card_hash=digest,
+            worktree_id=str(details.get("worktree_id", "")),
+            thread_id=str(details.get("thread_id", "")),
+        )
 
-        In-memory issued cards are consulted first; on a miss (for example
-        after a chat-process restart) the audit chain is walked for the
-        matching ``chat.approval_card.issued`` event and the envelope is
-        rehydrated so expiry can still be enforced.
+    def _chain_state(self, digest: str) -> tuple[IssuedCard | None, bool]:
+        """Return ``(issued_card, settled)`` for *digest* from the audit chain.
+
+        One ordered pass answers both questions. They are deliberately resolved
+        together: the settlement check cannot be served from memory alone (a
+        second process over the same audit dir may have settled the card), so
+        it always costs a chain read, and folding the issue lookup into the same
+        read keeps a resolve at one pass over the log instead of three.
         """
-        with self._lock:
-            hit = self._issued.get(digest)
-        if hit is not None:
-            return hit
-        for event in self._chain.query(event_type=EVENT_APPROVAL_CARD_ISSUED):
+        issued: IssuedCard | None = None
+        settled = False
+        for event in self._chain.query():
             details: dict[str, Any] = event.details
             if str(details.get("card_hash", "")) != digest:
                 continue
-            envelope_any: Any = details.get("envelope")
-            if not isinstance(envelope_any, dict):
-                continue
-            try:
-                card = ApprovalCardV2.from_dict(cast("dict[str, Any]", envelope_any))
-            except (TypeError, ValueError):
-                # A stored envelope carrying a non-finite or non-numeric
-                # timestamp is treated as unknown rather than rehydrated: a
-                # NaN not_after would produce a card that never expires.
-                continue
-            # Only trust a reconstructed envelope whose stored hash still
-            # matches its bytes; a mutated envelope is rejected as unknown.
-            if card_hash(card) != digest:
-                continue
-            issued = IssuedCard(
-                card=card,
-                card_hash=digest,
-                worktree_id=str(details.get("worktree_id", "")),
-                thread_id=str(details.get("thread_id", "")),
-            )
-            with self._lock:
-                self._issued.setdefault(digest, issued)
-            return issued
-        return None
+            if event.event_type == EVENT_APPROVAL_CARD_ISSUED:
+                if issued is None:
+                    issued = self._rehydrate(digest, details)
+            elif _is_terminal_event(event.event_type, details):
+                settled = True
+        return issued, settled
 
-    def _is_settled(self, digest: str) -> bool:
-        """Return ``True`` when *digest* already reached a terminal state.
+    def _state_for(self, digest: str) -> tuple[IssuedCard | None, bool]:
+        """Return ``(issued_card, settled)`` for *digest*, chain-backed.
 
-        The in-memory settled set is consulted first; on a miss the audit chain
-        is walked for a ``resolved`` event or a terminally-refused event naming
-        *digest*. Replaying those events is what stops a restart from reopening
-        a card the chain already shows as settled: reconstructing only the
-        issue events, as the gate previously did, made every settled approval
-        replayable by any party who kept its ``card_hash``.
+        The in-memory index only ever short-circuits the *envelope* lookup. The
+        settled flag is always taken from the chain unless this process already
+        recorded the settlement, because a card settled by another process (or
+        before a restart) is invisible to this one's memory. That fallback is
+        what stops a restart from reopening a decided card: reconstructing only
+        the issue events, as the gate previously did, made every settled
+        approval replayable by anyone who kept its ``card_hash``.
         """
         with self._lock:
+            cached = self._issued.get(digest)
             if digest in self._settled:
-                return True
-        for event in self._chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED):
-            if str(event.details.get("card_hash", "")) == digest:
-                with self._lock:
-                    self._settled.add(digest)
-                return True
-        for event in self._chain.query(event_type=EVENT_APPROVAL_CARD_REFUSED):
-            details: dict[str, Any] = event.details
-            if str(details.get("card_hash", "")) != digest:
-                continue
-            if str(details.get("reason", "")) in _TERMINAL_REFUSAL_REASONS:
-                with self._lock:
-                    self._settled.add(digest)
-                return True
-        return False
+                return cached, True
+        scanned, settled = self._chain_state(digest)
+        issued = cached if cached is not None else scanned
+        with self._lock:
+            if issued is not None:
+                self._issued.setdefault(digest, issued)
+            if settled:
+                self._settled.add(digest)
+        return issued, settled
 
     def _refuse(
         self,

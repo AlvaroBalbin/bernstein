@@ -87,12 +87,11 @@ def _resolved_at(details: dict[str, Any]) -> float | None:
     made every ordering comparison false.
     """
     raw: Any = details.get("resolved_at")
-    if raw is None or isinstance(raw, bool):
+    # bool is an int subclass, so it is excluded before the numeric check: a
+    # ``True`` timestamp silently meaning 1.0 would pass every later test.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
-    try:
-        value = float(cast("float", raw))
-    except (TypeError, ValueError):
-        return None
+    value = float(raw)
     if not math.isfinite(value) or value <= 0.0:
         return None
     return value

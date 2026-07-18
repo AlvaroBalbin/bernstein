@@ -90,19 +90,35 @@ def _canonical_dumps(payload: dict[str, Any]) -> str:
     )
 
 
-def _require_finite(value: float, *, field: str) -> float:
-    """Return *value* as a finite float, rejecting ``NaN`` and the infinities.
+def _require_finite(value: object, *, field: str) -> float:
+    """Return *value* as a finite ``float``, rejecting anything else.
 
-    Non-finite timestamps are not merely malformed, they are exploitable: every
-    comparison against ``NaN`` is ``False``, so a ``NaN`` ``not_after`` makes
-    ``now >= not_after`` permanently false and the card never expires
-    chain-side.
+    This is a validation boundary: *value* may come straight from JSON stored on
+    the audit chain, so it is typed as ``object`` and narrowed here rather than
+    trusted.
+
+    Two things are load-bearing:
+
+    * **Non-finite rejection.** Non-finite timestamps are not merely malformed,
+      they are exploitable: every comparison against ``NaN`` is ``False``, so a
+      ``NaN`` ``not_after`` makes ``now >= not_after`` permanently false and the
+      card never expires chain-side.
+    * **Widening to ``float``.** An ``int`` must not survive into the envelope.
+      ``1000`` serialises as ``1000`` while ``1000.0`` serialises as ``1000.0``,
+      so an integer timestamp would produce different canonical bytes and a
+      different ``card_hash`` for what is the same instant.
+
+    ``bool`` is rejected explicitly: it is an ``int`` subclass, and a ``True``
+    timestamp silently meaning ``1.0`` is never what the caller meant.
     """
-    coerced = float(value)
-    if not math.isfinite(coerced):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         msg = f"{field} must be a finite number, got {value!r}"
         raise ValueError(msg)
-    return coerced
+    widened = float(value)
+    if not math.isfinite(widened):
+        msg = f"{field} must be a finite number, got {value!r}"
+        raise ValueError(msg)
+    return widened
 
 
 def args_digest(tool_args: dict[str, Any]) -> str:
@@ -258,8 +274,8 @@ class ApprovalCardV2:
             reasoning=str(data.get("reasoning", "")),
             impact=ImpactEstimate.from_dict(dict(data.get("impact", {}))),
             rollback=RollbackPlan.from_dict(dict(data.get("rollback", {}))),
-            created_at=_require_finite(float(data.get("created_at", 0.0)), field="created_at"),
-            not_after=_require_finite(float(data.get("not_after", 0.0)), field="not_after"),
+            created_at=_require_finite(data.get("created_at", 0.0), field="created_at"),
+            not_after=_require_finite(data.get("not_after", 0.0), field="not_after"),
             card_version=str(data.get("card_version", CARD_VERSION)),
         )
 
