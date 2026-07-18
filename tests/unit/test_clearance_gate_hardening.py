@@ -14,6 +14,7 @@ hold:
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import stat
 import threading
@@ -701,3 +702,205 @@ def test_tenant_mirror_failure_does_not_fail_a_committed_gate(tmp_path: Path) ->
     committed, edged = asyncio.run(scenario())
     assert committed, "a committed gate was reported as failed because its mirror failed"
     assert edged
+
+
+# ---------------------------------------------------------------------------
+# Delta review: one anchor for writer and readers, read what you authenticate,
+# honest edge attestation, and every post() call site guarded.
+# ---------------------------------------------------------------------------
+
+
+def _archive_all_segments(audit_dir: Path) -> None:
+    """Move every live segment into ``archive/`` as retention would."""
+    archive = audit_dir / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    for segment in sorted(audit_dir.glob("*.jsonl")):
+        with gzip.open(archive / (segment.name + ".gz"), "wb") as handle:
+            handle.write(segment.read_bytes())
+        segment.unlink()
+
+
+def test_writer_and_verifier_agree_on_the_gate_anchor(tmp_path: Path) -> None:
+    """The writer's back-reference must be one the verifier accepts.
+
+    Guard against the two halves drifting apart again: the coordinator's chosen
+    anchor and the verifier's anchor are compared directly, so a future edit to
+    either side that changes "which row anchors this gate" fails here.
+    """
+    from bernstein.core.communication.signal_actions import (
+        build_gate_anchors,
+        journal_prefix_hash,
+        project_clearance_gate,
+    )
+
+    board = BulletinBoard()
+    posted = board.post(_blocker())
+    spec = project_clearance_gate(
+        blocker=posted, scope_task_ids=["task-x"], journal_prefix_hash=journal_prefix_hash([posted])
+    )
+    # Two pending rows for one gate id, so "first" and "last" are different
+    # rows and an anchor disagreement is observable rather than degenerate.
+    for _ in range(2):
+        record_signal_gate_projection(
+            chain=AuditChainStore(tmp_path / "audit", key=b"k" * 32),
+            blocker_content_hash=spec.blocker_content_hash,
+            clearance_task_id=spec.clearance_task_id,
+            injected_edges=list(spec.injected_edges),
+            graph_delta_hash=spec.graph_delta_hash,
+            scope_cell_id=spec.scope_cell_id,
+            deadline=spec.deadline,
+            resolution="pending",
+        )
+
+    chain = AuditChainStore(tmp_path / "audit", key=b"k" * 32)
+    rows = chain.query_chain(event_type=EVENT_SIGNAL_GATE_PROJECTION)
+    assert len({r.hmac for r in rows}) == 2, "fixture must produce two distinct pending rows"
+
+    # Drive the hydration path the coordinator uses on restart, which is where
+    # the writer picks its anchor.
+    coord = ClearanceGateCoordinator(
+        bulletin=board, injector=InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]}), chain=chain
+    )
+    coord._load_chain_state()
+    writer_hmac = coord._entry_hmac[spec.clearance_task_id]
+
+    reader_anchor = build_gate_anchors(rows)[spec.clearance_task_id]
+    assert writer_hmac == reader_anchor.entry_hmac, "writer and reader disagree on the gate anchor"
+    assert writer_hmac in reader_anchor.entry_hmacs
+
+
+def test_legacy_duplicate_pending_rows_can_still_be_closed(tmp_path: Path) -> None:
+    """Chains written before durable idempotency must remain closable.
+
+    Pre-fix idempotency was process-local, so a restart re-materialized the same
+    blocker onto the same chain, leaving several `pending` rows for one gate id.
+    Those chains are authentic, so nothing else rejects them; if the writer and
+    verifier disagree about which row anchors the gate, the gate can never be
+    closed by any operator action.
+    """
+    from bernstein.core.communication.signal_actions import journal_prefix_hash, project_clearance_gate
+
+    board = BulletinBoard()
+    posted = board.post(_blocker())
+    spec = project_clearance_gate(
+        blocker=posted, scope_task_ids=["task-x"], journal_prefix_hash=journal_prefix_hash([posted])
+    )
+    for _ in range(2):  # two restarts, two pending rows, one gate id
+        record_signal_gate_projection(
+            chain=AuditChainStore(tmp_path / "audit", key=b"k" * 32),
+            blocker_content_hash=spec.blocker_content_hash,
+            clearance_task_id=spec.clearance_task_id,
+            injected_edges=list(spec.injected_edges),
+            graph_delta_hash=spec.graph_delta_hash,
+            scope_cell_id=spec.scope_cell_id,
+            deadline=spec.deadline,
+            resolution="pending",
+        )
+
+    chain = AuditChainStore(tmp_path / "audit", key=b"k" * 32)
+    assert chain.verify()[0], "the legacy chain is authentic"
+    coord = ClearanceGateCoordinator(
+        bulletin=board, injector=InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]}), chain=chain
+    )
+    coord.resolve(spec.clearance_task_id, resolver="operator:alex")
+
+    result = verify_clearance_gates(chain.query_chain())
+    assert result.ok, result.errors
+
+
+def test_gate_index_reads_every_segment_it_authenticates(tmp_path: Path) -> None:
+    """The verified set and the read set must be the same set.
+
+    Asserted as an identity over segments rather than as behaviour on a
+    live-only fixture: `verify()` walks archived plus live, so the read used to
+    build the gate index must walk archived plus live too.
+    """
+    from bernstein.core.security.audit import AuditLog
+
+    chain = _chain(tmp_path)
+    board = BulletinBoard()
+    ClearanceGateCoordinator(
+        bulletin=board, injector=InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]}), chain=chain
+    ).materialize(board.post(_blocker()))
+
+    log = AuditLog(tmp_path / "audit", key=b"k" * 32)
+    before = len(log.query_chain())
+    _archive_all_segments(tmp_path / "audit")
+
+    assert log.verify()[0], "archived chain still verifies"
+    assert len(log.query()) == 0, "fixture did not actually archive the live segments"
+    assert len(log.query_chain()) == before, "the read set shrank while the verified set did not"
+
+
+def test_archiving_does_not_re_enable_double_injection(tmp_path: Path) -> None:
+    """Routine retention archiving must not silently turn the gate index off."""
+    board = BulletinBoard()
+    first = InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]})
+    posted = board.post(_blocker())
+    spec = ClearanceGateCoordinator(bulletin=board, injector=first, chain=_chain(tmp_path)).materialize(posted)
+    assert spec is not None
+
+    _archive_all_segments(tmp_path / "audit")
+
+    # A fresh coordinator over the archived chain must still recognise the gate.
+    replay = InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]})
+    coord = ClearanceGateCoordinator(
+        bulletin=board, injector=replay, chain=AuditChainStore(tmp_path / "audit", key=b"k" * 32)
+    )
+    assert coord.materialize(posted) is not None
+    assert replay.created == [], "archiving re-enabled double-injection of the clearance task"
+    assert replay.edges == [], "archiving re-enabled double-injection of the dependent edges"
+    # ... and the gate is still resolvable rather than a KeyError.
+    coord.resolve(spec.clearance_task_id, resolver="operator:alex")
+
+
+def test_receipt_attests_only_the_edges_the_injector_actually_created(tmp_path: Path) -> None:
+    """A narrower applied edge set must be what the signed receipt records."""
+
+    class _NarrowingInjector(InMemoryClearanceInjector):
+        """Injector whose locked mutation gates fewer dependents than projected."""
+
+        def apply_gate(self, spec: ClearanceGateSpec, blocker: BulletinMessage) -> list[str]:
+            # 'task-y' was claimed between the unlocked scope read and this
+            # locked mutation, so only 'task-x' actually receives an edge.
+            applied = ["task-x"]
+            self.created.append(spec)
+            for dependent_id in applied:
+                self.edges.append((dependent_id, spec.clearance_task_id))
+            return applied
+
+    board = BulletinBoard()
+    injector = _NarrowingInjector(open_by_cell={"cell-a": ["task-x", "task-y"]})
+    chain = _chain(tmp_path)
+    coord = ClearanceGateCoordinator(bulletin=board, injector=injector, chain=chain)
+    spec = coord.materialize(board.post(_blocker()))
+    assert spec is not None
+
+    recorded = chain.query(event_type=EVENT_SIGNAL_GATE_PROJECTION)[0].details
+    assert list(recorded["injected_edges"]) == ["task-x"], (
+        "the signed receipt attests an edge the injector never created"
+    )
+    assert spec.injected_edges == ("task-x",)
+    # The delta hash must recompute from the edges actually applied.
+    result = verify_clearance_gates(chain.query())
+    assert result.ok, result.errors
+
+
+def test_post_bulletin_route_reports_a_pending_action_instead_of_500(tmp_path: Path) -> None:
+    """The documented hook wiring must not turn POST /bulletin into a 500."""
+    from fastapi.testclient import TestClient
+
+    from bernstein.core.server import create_app
+
+    app = create_app(jsonl_path=tmp_path / "tasks.jsonl")
+    with TestClient(app) as client:
+        ok = client.post("/bulletin", json={"agent_id": "w", "type": "blocker", "content": "x"})
+        assert ok.status_code == 201, ok.text
+
+        board = app.state.bulletin
+        board.set_post_hook(lambda _m: (_ for _ in ()).throw(RuntimeError("gate failed")))
+        pending = client.post("/bulletin", json={"agent_id": "w", "type": "blocker", "content": "y"})
+
+    assert pending.status_code == 202, f"expected 202 (stored, action pending), got {pending.status_code}"
+    assert pending.json()["content"] == "y"
+    assert len(board.pending_actions) == 1

@@ -879,6 +879,27 @@ class AuditChainStore:
             until=until,
         )
 
+    def query_chain(
+        self,
+        *,
+        event_type: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[AuditEvent]:
+        """Delegate to :meth:`AuditLog.query_chain` (archived + live segments).
+
+        Use this, not :meth:`query`, whenever the caller also calls
+        :meth:`verify`: it reads exactly the segments ``verify`` authenticates,
+        so archiving cannot silently shrink what the caller sees (#2648).
+        """
+        return self._log.query_chain(
+            event_type=event_type,
+            actor=actor,
+            since=since,
+            until=until,
+        )
+
     def verify(self) -> tuple[bool, list[str]]:
         """Delegate to the underlying :class:`AuditLog`."""
         return self._log.verify()

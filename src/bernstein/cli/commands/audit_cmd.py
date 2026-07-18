@@ -665,7 +665,10 @@ def _verify_clearance_gates() -> bool:
             console.print(f"  [red]![/red] {err}")
         return False
 
-    events = log.query()
+    # Read the same segments verify() authenticated. ``query()`` covers live
+    # files only, so after retention archiving it would hide archived gates and
+    # every claim of their dependents from the replay (#2648).
+    events = log.query_chain()
     result = verify_clearance_gates(events)
     if result.gate_count == 0 and result.ok:
         return True  # no clearance gates recorded; nothing to verify

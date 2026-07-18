@@ -445,6 +445,45 @@ def _chain_tail_from_bytes(raw_bytes: bytes) -> str | None:
     return None
 
 
+def _events_from_text(
+    text: str,
+    *,
+    event_type: str | None,
+    actor: str | None,
+    since: str | None,
+    until: str | None,
+) -> list[AuditEvent]:
+    """Parse JSONL *text* into filtered :class:`AuditEvent` records.
+
+    Shared by :meth:`AuditLog.query` and :meth:`AuditLog.query_chain` so live
+    and archived segments are decoded by exactly one code path.
+    """
+    events: list[AuditEvent] = []
+    for raw_line in text.splitlines():
+        raw = raw_line.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not _matches_query_filters(entry, event_type, actor, since, until):
+            continue
+        events.append(
+            AuditEvent(
+                timestamp=entry.get("timestamp", ""),
+                event_type=entry.get("event_type", ""),
+                actor=entry.get("actor", ""),
+                resource_type=entry.get("resource_type", ""),
+                resource_id=entry.get("resource_id", ""),
+                details=entry.get("details", {}),
+                prev_hmac=entry.get("prev_hmac", ""),
+                hmac=entry.get("hmac", ""),
+            )
+        )
+    return events
+
+
 def _archived_segment_paths(audit_dir: Path, policy: RetentionPolicy | None = None) -> list[Path]:
     """Return archived ``*.jsonl.gz`` segments ordered by their embedded date.
 
@@ -753,29 +792,50 @@ class AuditLog:
         log_files = sorted(self._audit_dir.glob(_JSONL_GLOB))
 
         for log_path in log_files:
-            for raw in log_path.read_text().splitlines():
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    entry = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+            results.extend(
+                _events_from_text(log_path.read_text(), event_type=event_type, actor=actor, since=since, until=until)
+            )
 
-                if not _matches_query_filters(entry, event_type, actor, since, until):
-                    continue
+        return results
 
-                results.append(
-                    AuditEvent(
-                        timestamp=entry.get("timestamp", ""),
-                        event_type=entry.get("event_type", ""),
-                        actor=entry.get("actor", ""),
-                        resource_type=entry.get("resource_type", ""),
-                        resource_id=entry.get("resource_id", ""),
-                        details=entry.get("details", {}),
-                        prev_hmac=entry.get("prev_hmac", ""),
-                        hmac=entry.get("hmac", ""),
-                    )
+    def query_chain(
+        self,
+        *,
+        event_type: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[AuditEvent]:
+        """Like :meth:`query`, but over the same segments :meth:`verify` walks.
+
+        ``query`` reads live ``*.jsonl`` only; ``verify`` replays archived
+        ``archive/*.jsonl.gz`` segments first and then the live files. A caller
+        that authenticates with ``verify`` and then reads with ``query`` checks
+        a strictly larger set than it uses, so once ``archive()`` has run, rows
+        it authenticated silently vanish from what it reads. This method makes
+        the read set identical to the verified set, in the same chronological
+        order (#2648).
+
+        Returns:
+            Matching events across archived and live segments, oldest first.
+        """
+        results: list[AuditEvent] = []
+        errors: list[str] = []
+        for gz_path in _archived_segment_paths(self._audit_dir):
+            raw = _read_archived_segment(gz_path, errors)
+            if raw is None:
+                continue
+            results.extend(
+                _events_from_text(
+                    raw.decode("utf-8", errors="replace"),
+                    event_type=event_type,
+                    actor=actor,
+                    since=since,
+                    until=until,
                 )
-
+            )
+        for log_path in sorted(self._audit_dir.glob(_JSONL_GLOB)):
+            results.extend(
+                _events_from_text(log_path.read_text(), event_type=event_type, actor=actor, since=since, until=until)
+            )
         return results

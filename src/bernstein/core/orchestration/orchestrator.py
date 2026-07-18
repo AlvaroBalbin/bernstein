@@ -48,7 +48,7 @@ from bernstein.core.agent_signals import AgentSignalManager
 from bernstein.core.approval import ApprovalGate, ApprovalMode
 from bernstein.core.bandit_router import BanditRouter
 from bernstein.core.batch_api import ProviderBatchManager
-from bernstein.core.bulletin import BulletinBoard, BulletinMessage
+from bernstein.core.bulletin import BulletinBoard, BulletinMessage, SignalActionFailure
 from bernstein.core.cluster import NodeHeartbeatClient
 from bernstein.core.context import refresh_knowledge_base
 from bernstein.core.context_degradation_detector import (
@@ -976,13 +976,18 @@ class Orchestrator:
 
         from bernstein.core.bulletin import MessageType
 
-        self._bulletin.post(
-            BulletinMessage(
-                agent_id="orchestrator",
-                type=_cast("MessageType", msg_type),
-                content=content,
+        try:
+            self._bulletin.post(
+                BulletinMessage(
+                    agent_id="orchestrator",
+                    type=_cast("MessageType", msg_type),
+                    content=content,
+                )
             )
-        )
+        except SignalActionFailure:
+            # The message is on the board and queued for retry; an advisory
+            # bulletin post must not abort the orchestrator loop (#2648).
+            logger.exception("bulletin signal action pending retry for %s message", msg_type)
 
     def _check_task_deadlines(self, running_tasks: list[Task]) -> None:
         """Check deadlines on running tasks and escalate or notify.
