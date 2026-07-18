@@ -232,6 +232,31 @@ def test_file_scope_globs_do_not_match_across_directory_separators(tmp_path: Pat
     assert verdict.divergences[0].reason == "file_scope_violation"
 
 
+def test_file_scope_globs_are_not_escapable_by_traversal(tmp_path: Path) -> None:
+    """``..`` must be collapsed before matching, or the prefix is a free pass."""
+    capsule = _capsule(file_scope_globs=["src/pricing/**"])
+    events = [
+        {"event": "tool.call", "tool": "Edit", "path": "src/pricing/../../etc/passwd"},
+        {"event": "tool.call", "tool": "Edit", "path": "src/pricing/./rates.py"},
+    ]
+
+    verdict = evaluate_conformance(events, capsule)
+
+    assert [d.step_index for d in verdict.divergences] == [0]
+    assert verdict.divergences[0].reason == "file_scope_violation"
+
+
+def test_path_in_scope_collapses_traversal_and_dot_segments() -> None:
+    from bernstein.core.security.intent_capsule import path_in_scope
+
+    globs = ("src/pricing/**",)
+    assert path_in_scope("src/pricing/rates.py", globs)
+    assert path_in_scope("./src/pricing/rates.py", globs)
+    assert path_in_scope("src/pricing/nested/deep.py", globs)
+    assert not path_in_scope("src/pricing/../secrets.py", globs)
+    assert not path_in_scope("src/pricing/../../../etc/passwd", globs)
+
+
 def test_empty_file_scope_globs_leave_writes_unconstrained(tmp_path: Path) -> None:
     capsule = _capsule(file_scope_globs=[])
     events = [{"event": "tool.call", "tool": "Edit", "path": "anywhere/at/all.py"}]

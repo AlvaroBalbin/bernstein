@@ -36,6 +36,7 @@ import ast
 import hashlib
 import json
 import operator
+import posixpath
 import re
 import types
 from dataclasses import dataclass
@@ -603,21 +604,29 @@ def _compiled_glob(pattern: str) -> re.Pattern[str]:
 
 
 def _normalise_path(raw: str) -> str:
-    """Return a comparable posix-style relative path for glob matching."""
-    text = raw.replace("\\", "/").strip()
-    while text.startswith("./"):
-        text = text[2:]
+    """Return a comparable posix-style relative path for glob matching.
+
+    ``..`` and ``.`` segments are collapsed lexically first. Without that, an
+    in-scope prefix is a free pass: ``src/pricing/../../etc/passwd`` would match
+    ``src/pricing/**`` while landing well outside the approved scope. The
+    collapse is purely textual (no filesystem access, no symlink resolution), so
+    the verdict stays a pure function of the journal bytes.
+    """
+    text = posixpath.normpath(raw.replace("\\", "/").strip())
     return text.lstrip("/")
 
 
 def path_in_scope(path: str, globs: tuple[str, ...]) -> bool:
     """Return True when ``path`` matches at least one glob in ``globs``.
 
-    An empty ``globs`` declares no file scope and constrains nothing.
+    An empty ``globs`` declares no file scope and constrains nothing. A path
+    that still escapes upward after normalisation is never in scope.
     """
     if not globs:
         return True
     candidate = _normalise_path(path)
+    if candidate == ".." or candidate.startswith("../"):
+        return False
     return any(_compiled_glob(g).match(candidate) is not None for g in globs)
 
 

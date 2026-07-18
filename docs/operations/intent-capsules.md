@@ -62,7 +62,10 @@ its step index:
 | `unclassified_event` | The event maps to no action class and the policy sets `allow_unclassified: false`. |
 
 Scope globs are matched segment-wise: `*` and `?` stop at `/` and `**` spans
-directories, so `src/*.py` does not silently admit `src/nested/deep.py`. An empty
+directories, so `src/*.py` does not silently admit `src/nested/deep.py`. Paths
+are lexically normalised before matching, so an in-scope prefix cannot be used as
+a free pass (`src/pricing/../../etc/passwd` does not match `src/pricing/**`), and
+a path that still escapes upward after normalisation is never in scope. An empty
 `file_scope_globs` declares no file scope and constrains nothing. Reads are not
 scope-checked: the capsule scopes the worker's mutations.
 
