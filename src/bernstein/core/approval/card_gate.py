@@ -23,6 +23,18 @@ chat client:
   audit chain, so a fresh process still refuses a stale approve whose buttons
   a client kept live.
 
+* **Exactly-once settlement.** A card settles once. The check-and-commit runs
+  under one lock, so concurrent decisions on the same ``card_hash`` cannot both
+  append a settlement, and the settled set is rebuilt from the chain's
+  ``resolved`` / terminally-``refused`` events rather than from memory alone.
+  A restart therefore does not reopen a card the chain already shows as
+  decided, which is what turns a captured ``card_hash`` from a reusable
+  bearer token into a single-use one.
+
+* **Origin pinning.** A card issued into a worktree and a conversation commits
+  to that origin, and a decision arriving from a different one is refused and
+  chain-recorded rather than honoured.
+
 Strip the audit chain and every guarantee above collapses: the "gate" becomes
 an in-memory dict that a restart forgets. The chain is the substrate that
 makes the card a decision record instead of a message with a log.
@@ -46,11 +58,19 @@ if TYPE_CHECKING:
     from bernstein.core.security.audit_chain import AuditChainStore
 
 __all__ = [
+    "ALLOWED_DECISIONS",
+    "REFUSAL_REASON_ALREADY_SETTLED",
+    "REFUSAL_REASON_CROSS_CONVERSATION",
+    "REFUSAL_REASON_CROSS_WORKTREE",
     "REFUSAL_REASON_EXPIRED",
     "REFUSAL_REASON_HASH_MISMATCH",
+    "REFUSAL_REASON_INVALID_DECISION",
+    "ApprovalCardAlreadySettled",
+    "ApprovalCardBindingMismatch",
     "ApprovalCardExpired",
     "ApprovalCardGate",
     "ApprovalCardHashMismatch",
+    "ApprovalCardInvalidDecision",
     "IssuedCard",
 ]
 
@@ -59,6 +79,34 @@ REFUSAL_REASON_HASH_MISMATCH = "hash_mismatch"
 
 #: Refusal reason recorded when a decision arrives at or after ``not_after``.
 REFUSAL_REASON_EXPIRED = "expired"
+
+#: Refusal reason recorded when the card has already reached a terminal state.
+REFUSAL_REASON_ALREADY_SETTLED = "already_settled"
+
+#: Refusal reason recorded when the decision value is not in :data:`ALLOWED_DECISIONS`.
+REFUSAL_REASON_INVALID_DECISION = "invalid_decision"
+
+#: Refusal reason recorded when a pinned card is resolved from another worktree.
+REFUSAL_REASON_CROSS_WORKTREE = "cross_worktree"
+
+#: Refusal reason recorded when a pinned card is resolved from another conversation.
+REFUSAL_REASON_CROSS_CONVERSATION = "cross_conversation"
+
+#: The only decision values a card may settle with. Anything else (an empty
+#: string, a different case, a driver-specific synonym such as ``approve_all``)
+#: is refused: an unrecognised decision that reached the chain unvalidated would
+#: be recorded as a settlement whose meaning no verifier could reconstruct.
+ALLOWED_DECISIONS = frozenset({"approve", "reject"})
+
+#: Refusal reasons that settle a card permanently.
+#:
+#: Only expiry qualifies. Expiry is monotone -- once the chain has seen a card
+#: pass its ``not_after`` no later clock reading can make it live again -- so
+#: replaying it is sound. The other reasons describe a rejected *attempt*, not a
+#: settled card: burning the card on a ``cross_worktree`` or ``hash_mismatch``
+#: refusal would hand any party who can reach the chat surface a denial of
+#: service against the legitimate operator's pending decision.
+_TERMINAL_REFUSAL_REASONS = frozenset({REFUSAL_REASON_EXPIRED})
 
 
 class ApprovalCardHashMismatch(RuntimeError):
@@ -76,6 +124,29 @@ class ApprovalCardExpired(RuntimeError):
     Expiry is enforced by the chain-side clock regardless of what the chat
     client renders. The gate records a ``chat.approval_card.refused`` event
     before raising.
+    """
+
+
+class ApprovalCardAlreadySettled(RuntimeError):
+    """Raised when a resolve targets a card that already reached a terminal state.
+
+    This is the replay guard. Without it one issued ``card_hash`` could be
+    settled arbitrarily many times, and a process restart reopened an
+    already-approved card because reconstruction replayed only the issue
+    events.
+    """
+
+
+class ApprovalCardInvalidDecision(RuntimeError):
+    """Raised when the decision value is not in :data:`ALLOWED_DECISIONS`."""
+
+
+class ApprovalCardBindingMismatch(RuntimeError):
+    """Raised when a resolve arrives from a worktree or conversation the card is not pinned to.
+
+    A card issued into worktree ``W`` and conversation ``C`` commits to that
+    origin. Settling it from elsewhere would let a party who observed the
+    ``card_hash`` in one context exercise the approval in another.
     """
 
 
@@ -111,6 +182,11 @@ class ApprovalCardGate:
         self._install_id = install_id
         self._session_id = session_id
         self._issued: dict[str, IssuedCard] = {}
+        #: Hashes known to have reached a terminal state in this process. It is
+        #: a cache, not the source of truth: :meth:`_is_settled` falls back to
+        #: the chain so a restart (or a second gate over the same audit dir)
+        #: still sees settlements this process never made.
+        self._settled: set[str] = set()
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -130,11 +206,17 @@ class ApprovalCardGate:
         The event stores the full canonical envelope and its ``card_hash`` so
         a verifier can later reconstruct exactly the fields shown to the
         operator and detect any post-hoc mutation.
+
+        The chain append happens *before* the card is published to the
+        in-memory index. A card that is resolvable but absent from the chain
+        would be an approval with no issue record: the offline verifier would
+        report the later resolution as referencing an unknown envelope, and a
+        durability fault on the append would leave a settleable card behind. By
+        ordering the write first, a failed append raises and leaves no
+        resolvable card anywhere.
         """
         digest = card_hash(card)
         issued = IssuedCard(card=card, card_hash=digest, worktree_id=worktree_id, thread_id=thread_id)
-        with self._lock:
-            self._issued[digest] = issued
         self._chain.log_with_prev_digest(
             event_type=EVENT_APPROVAL_CARD_ISSUED,
             actor=actor,
@@ -149,6 +231,8 @@ class ApprovalCardGate:
                 "session_id": self._session_id,
             },
         )
+        with self._lock:
+            self._issued[digest] = issued
         return issued
 
     # ------------------------------------------------------------------
@@ -162,16 +246,36 @@ class ApprovalCardGate:
         decision: str,
         approver: str = "",
         worktree_id: str = "",
+        thread_id: str = "",
         now: float | None = None,
     ) -> IssuedCard:
-        """Resolve an issued card, enforcing hash echo and chain-side expiry.
+        """Resolve an issued card, atomically and exactly once.
+
+        The whole check-and-commit sequence runs under the gate lock, so two
+        concurrent decisions on one ``card_hash`` cannot both observe an
+        unsettled card and both append a settlement. The card is marked settled
+        in the same critical section that writes the ``resolved`` event.
+
+        Checks, in order, each refused into the chain before raising:
+
+        1. the echoed hash names an issued envelope,
+        2. the card has not already reached a terminal state,
+        3. the decision is in :data:`ALLOWED_DECISIONS`,
+        4. the chain-side clock is before ``not_after``,
+        5. the origin worktree matches, when the card was pinned to one,
+        6. the origin conversation matches, when the card was pinned to one.
 
         Args:
             card_hash: The ``card_hash`` echoed by the decision. Must match an
                 issued envelope exactly.
             decision: ``approve`` or ``reject``.
             approver: Identifier of the operator who decided.
-            worktree_id: Worktree the decision was made from (recorded).
+            worktree_id: Worktree the decision was made from. Checked against
+                the issuing worktree when the card was pinned.
+            thread_id: Conversation the decision arrived on. Checked against the
+                issuing conversation when the card was pinned. An empty value
+                skips the check, so drivers that cannot attribute a
+                conversation keep working unchanged.
             now: Injected clock for deterministic tests; defaults to
                 ``time.time()``.
 
@@ -180,51 +284,166 @@ class ApprovalCardGate:
 
         Raises:
             ApprovalCardHashMismatch: When *card_hash* matches no issued card.
+            ApprovalCardAlreadySettled: When the card is already terminal.
+            ApprovalCardInvalidDecision: When *decision* is not allowed.
             ApprovalCardExpired: When the decision arrives at or after the
                 envelope's ``not_after``.
+            ApprovalCardBindingMismatch: When the origin worktree or
+                conversation differs from the one the card was pinned to.
         """
         current = time.time() if now is None else now
         echoed = card_hash
-        issued = self._lookup(echoed)
-        if issued is None:
-            self._refuse(
-                card_hash=echoed,
-                reason=REFUSAL_REASON_HASH_MISMATCH,
+        with self._lock:
+            issued = self._lookup(echoed)
+            if issued is None:
+                self._refuse(
+                    card_hash=echoed,
+                    reason=REFUSAL_REASON_HASH_MISMATCH,
+                    approver=approver,
+                    worktree_id=worktree_id,
+                    expected_card_hash="",
+                )
+                raise ApprovalCardHashMismatch(
+                    f"echoed card_hash {echoed!r} matches no issued approval card; refusing to resolve",
+                )
+            self._guard_settled(echoed, approver=approver, worktree_id=worktree_id, issued=issued)
+            self._guard_decision(decision, echoed, approver=approver, worktree_id=worktree_id, issued=issued)
+            self._guard_expiry(echoed, approver=approver, worktree_id=worktree_id, issued=issued, current=current)
+            self._guard_binding(
+                echoed,
                 approver=approver,
                 worktree_id=worktree_id,
-                expected_card_hash="",
+                thread_id=thread_id,
+                issued=issued,
             )
-            raise ApprovalCardHashMismatch(
-                f"echoed card_hash {echoed!r} matches no issued approval card; refusing to resolve",
+            self._chain.log_with_prev_digest(
+                event_type=EVENT_APPROVAL_CARD_RESOLVED,
+                actor=approver or "operator",
+                resource_type="approval_card",
+                resource_id=echoed,
+                details={
+                    "card_hash": echoed,
+                    "decision": decision,
+                    "approver": approver,
+                    "worktree_id": issued.worktree_id,
+                    "thread_id": issued.thread_id,
+                    "resolved_at": current,
+                    "install_id": self._install_id,
+                    "session_id": self._session_id,
+                },
             )
-        if issued.card.is_expired(now=current):
+            self._settled.add(echoed)
+        return issued
+
+    # ------------------------------------------------------------------
+    # Resolve guards
+    # ------------------------------------------------------------------
+
+    def _guard_settled(self, echoed: str, *, approver: str, worktree_id: str, issued: IssuedCard) -> None:
+        """Refuse a card that already reached a terminal state."""
+        if not self._is_settled(echoed):
+            return
+        self._refuse(
+            card_hash=echoed,
+            reason=REFUSAL_REASON_ALREADY_SETTLED,
+            approver=approver,
+            worktree_id=worktree_id or issued.worktree_id,
+            expected_card_hash=issued.card_hash,
+        )
+        raise ApprovalCardAlreadySettled(
+            f"approval card {echoed!r} is already settled on the audit chain; refusing to settle it a second time",
+        )
+
+    def _guard_decision(
+        self,
+        decision: str,
+        echoed: str,
+        *,
+        approver: str,
+        worktree_id: str,
+        issued: IssuedCard,
+    ) -> None:
+        """Refuse a decision value outside :data:`ALLOWED_DECISIONS`."""
+        if decision in ALLOWED_DECISIONS:
+            return
+        self._refuse(
+            card_hash=echoed,
+            reason=REFUSAL_REASON_INVALID_DECISION,
+            approver=approver,
+            worktree_id=worktree_id or issued.worktree_id,
+            expected_card_hash=issued.card_hash,
+        )
+        raise ApprovalCardInvalidDecision(
+            f"decision {decision!r} is not one of {sorted(ALLOWED_DECISIONS)}; refusing to resolve",
+        )
+
+    def _guard_expiry(
+        self,
+        echoed: str,
+        *,
+        approver: str,
+        worktree_id: str,
+        issued: IssuedCard,
+        current: float,
+    ) -> None:
+        """Refuse a decision at or after the envelope's ``not_after``."""
+        if not issued.card.is_expired(now=current):
+            return
+        self._refuse(
+            card_hash=echoed,
+            reason=REFUSAL_REASON_EXPIRED,
+            approver=approver,
+            worktree_id=worktree_id or issued.worktree_id,
+            expected_card_hash=issued.card_hash,
+        )
+        raise ApprovalCardExpired(
+            f"approval card {echoed!r} expired at not_after={issued.card.not_after:.0f}; "
+            f"refusing to resolve at {current:.0f} regardless of the chat client's rendered buttons",
+        )
+
+    def _guard_binding(
+        self,
+        echoed: str,
+        *,
+        approver: str,
+        worktree_id: str,
+        thread_id: str,
+        issued: IssuedCard,
+    ) -> None:
+        """Refuse a decision whose origin differs from the card's pinned origin.
+
+        Both checks are skipped when the card was issued without the
+        corresponding pin, and the conversation check is skipped when the caller
+        supplies no conversation, so drivers that cannot attribute one are
+        unaffected.
+        """
+        if issued.worktree_id and worktree_id and worktree_id != issued.worktree_id:
             self._refuse(
                 card_hash=echoed,
-                reason=REFUSAL_REASON_EXPIRED,
+                reason=REFUSAL_REASON_CROSS_WORKTREE,
+                approver=approver,
+                worktree_id=worktree_id,
+                expected_card_hash=issued.card_hash,
+                expected_worktree_id=issued.worktree_id,
+            )
+            raise ApprovalCardBindingMismatch(
+                f"approval card {echoed!r} is pinned to worktree {issued.worktree_id!r} "
+                f"and cannot be resolved from worktree {worktree_id!r}",
+            )
+        if issued.thread_id and thread_id and thread_id != issued.thread_id:
+            self._refuse(
+                card_hash=echoed,
+                reason=REFUSAL_REASON_CROSS_CONVERSATION,
                 approver=approver,
                 worktree_id=worktree_id or issued.worktree_id,
                 expected_card_hash=issued.card_hash,
+                thread_id=thread_id,
+                expected_thread_id=issued.thread_id,
             )
-            raise ApprovalCardExpired(
-                f"approval card {echoed!r} expired at not_after={issued.card.not_after:.0f}; "
-                f"refusing to resolve at {current:.0f} regardless of the chat client's rendered buttons",
+            raise ApprovalCardBindingMismatch(
+                f"approval card {echoed!r} was issued on conversation {issued.thread_id!r} "
+                f"and cannot be resolved from conversation {thread_id!r}",
             )
-        self._chain.log_with_prev_digest(
-            event_type=EVENT_APPROVAL_CARD_RESOLVED,
-            actor=approver or "operator",
-            resource_type="approval_card",
-            resource_id=echoed,
-            details={
-                "card_hash": echoed,
-                "decision": decision,
-                "approver": approver,
-                "worktree_id": issued.worktree_id,
-                "resolved_at": current,
-                "install_id": self._install_id,
-                "session_id": self._session_id,
-            },
-        )
-        return issued
 
     # ------------------------------------------------------------------
     # Internals
@@ -249,7 +468,13 @@ class ApprovalCardGate:
             envelope_any: Any = details.get("envelope")
             if not isinstance(envelope_any, dict):
                 continue
-            card = ApprovalCardV2.from_dict(cast("dict[str, Any]", envelope_any))
+            try:
+                card = ApprovalCardV2.from_dict(cast("dict[str, Any]", envelope_any))
+            except (TypeError, ValueError):
+                # A stored envelope carrying a non-finite or non-numeric
+                # timestamp is treated as unknown rather than rehydrated: a
+                # NaN not_after would produce a card that never expires.
+                continue
             # Only trust a reconstructed envelope whose stored hash still
             # matches its bytes; a mutated envelope is rejected as unknown.
             if card_hash(card) != digest:
@@ -265,6 +490,34 @@ class ApprovalCardGate:
             return issued
         return None
 
+    def _is_settled(self, digest: str) -> bool:
+        """Return ``True`` when *digest* already reached a terminal state.
+
+        The in-memory settled set is consulted first; on a miss the audit chain
+        is walked for a ``resolved`` event or a terminally-refused event naming
+        *digest*. Replaying those events is what stops a restart from reopening
+        a card the chain already shows as settled: reconstructing only the
+        issue events, as the gate previously did, made every settled approval
+        replayable by any party who kept its ``card_hash``.
+        """
+        with self._lock:
+            if digest in self._settled:
+                return True
+        for event in self._chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED):
+            if str(event.details.get("card_hash", "")) == digest:
+                with self._lock:
+                    self._settled.add(digest)
+                return True
+        for event in self._chain.query(event_type=EVENT_APPROVAL_CARD_REFUSED):
+            details: dict[str, Any] = event.details
+            if str(details.get("card_hash", "")) != digest:
+                continue
+            if str(details.get("reason", "")) in _TERMINAL_REFUSAL_REASONS:
+                with self._lock:
+                    self._settled.add(digest)
+                return True
+        return False
+
     def _refuse(
         self,
         *,
@@ -273,6 +526,9 @@ class ApprovalCardGate:
         approver: str,
         worktree_id: str,
         expected_card_hash: str,
+        thread_id: str = "",
+        expected_worktree_id: str = "",
+        expected_thread_id: str = "",
     ) -> None:
         """Append a ``chat.approval_card.refused`` event."""
         self._chain.log_with_prev_digest(
@@ -286,6 +542,9 @@ class ApprovalCardGate:
                 "expected_card_hash": expected_card_hash,
                 "approver": approver,
                 "worktree_id": worktree_id,
+                "thread_id": thread_id,
+                "expected_worktree_id": expected_worktree_id,
+                "expected_thread_id": expected_thread_id,
                 "install_id": self._install_id,
                 "session_id": self._session_id,
             },

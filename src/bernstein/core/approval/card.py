@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -73,8 +74,35 @@ REASONING_MAX_CHARS = 600
 
 
 def _canonical_dumps(payload: dict[str, Any]) -> str:
-    """Return the canonical JSON string for *payload* (sorted, compact)."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Return the canonical JSON string for *payload* (sorted, compact).
+
+    ``allow_nan`` is disabled: ``NaN`` / ``Infinity`` are JavaScript literals,
+    not JSON, so permitting them would let an envelope hash over bytes no
+    conforming parser can read back. A non-finite value therefore raises here
+    rather than producing an envelope that only round-trips through Python.
+    """
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _require_finite(value: float, *, field: str) -> float:
+    """Return *value* as a finite float, rejecting ``NaN`` and the infinities.
+
+    Non-finite timestamps are not merely malformed, they are exploitable: every
+    comparison against ``NaN`` is ``False``, so a ``NaN`` ``not_after`` makes
+    ``now >= not_after`` permanently false and the card never expires
+    chain-side.
+    """
+    coerced = float(value)
+    if not math.isfinite(coerced):
+        msg = f"{field} must be a finite number, got {value!r}"
+        raise ValueError(msg)
+    return coerced
 
 
 def args_digest(tool_args: dict[str, Any]) -> str:
@@ -218,15 +246,20 @@ class ApprovalCardV2:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ApprovalCardV2:
-        """Rebuild an envelope from its canonical dict (round-trips ``to_dict``)."""
+        """Rebuild an envelope from its canonical dict (round-trips ``to_dict``).
+
+        Timestamps are validated on the way in: an envelope rehydrated from the
+        chain with a non-finite ``created_at`` / ``not_after`` is rejected here
+        rather than silently producing a card that can never expire.
+        """
         return cls(
             approval_id=str(data.get("approval_id", "")),
             action=ActionRef.from_dict(dict(data.get("action", {}))),
             reasoning=str(data.get("reasoning", "")),
             impact=ImpactEstimate.from_dict(dict(data.get("impact", {}))),
             rollback=RollbackPlan.from_dict(dict(data.get("rollback", {}))),
-            created_at=float(data.get("created_at", 0.0)),
-            not_after=float(data.get("not_after", 0.0)),
+            created_at=_require_finite(float(data.get("created_at", 0.0)), field="created_at"),
+            not_after=_require_finite(float(data.get("not_after", 0.0)), field="not_after"),
             card_version=str(data.get("card_version", CARD_VERSION)),
         )
 
@@ -378,7 +411,8 @@ def build_card(
         reasoning: The agent's stated intent (bounded into the envelope).
         created_at: Issue time in unix epoch seconds. Passed explicitly so the
             envelope is a pure function of its inputs (determinism).
-        ttl_seconds: Lifetime; ``not_after = created_at + ttl_seconds``.
+        ttl_seconds: Lifetime; ``not_after = created_at + ttl_seconds``. Must be
+            finite and non-negative.
         report: Optional precomputed blast-radius report. When ``None`` the
             scorer is run over the derived change set.
         detectors: Optional detector override forwarded to the scorer.
@@ -386,7 +420,18 @@ def build_card(
     Returns:
         The canonical envelope. Two calls with identical inputs (and identical
         detector set / repository state) return byte-identical envelopes.
+
+    Raises:
+        ValueError: When *created_at* or *ttl_seconds* is non-finite, or when
+            *ttl_seconds* is negative (which would issue a card that is already
+            expired at the instant it is built).
     """
+    issued_at = _require_finite(created_at, field="created_at")
+    lifetime = _require_finite(ttl_seconds, field="ttl_seconds")
+    if lifetime < 0.0:
+        msg = f"ttl_seconds must be non-negative, got {ttl_seconds!r}"
+        raise ValueError(msg)
+    expires_at = _require_finite(issued_at + lifetime, field="not_after")
     effective = report if report is not None else impact_from_tool_call(tool_name, tool_args, detectors=detectors)
     impact = ImpactEstimate(
         score=effective.score,
@@ -401,8 +446,8 @@ def build_card(
         reasoning=_bound_reasoning(reasoning),
         impact=impact,
         rollback=rollback,
-        created_at=float(created_at),
-        not_after=float(created_at) + float(ttl_seconds),
+        created_at=issued_at,
+        not_after=expires_at,
     )
 
 
@@ -414,29 +459,50 @@ def build_card(
 def render_card_text(card: ApprovalCardV2) -> str:
     """Render the envelope as operator-facing text, verbatim from hashed fields.
 
-    Every driver calls this instead of re-summarising, so the displayed text
-    is a pure projection of the hashed envelope: if any field the operator saw
-    differed from what was hashed, the echoed ``card_hash`` would not match.
-    The final line prints the ``card_hash`` itself so the operator (and any
-    verifier) can confirm the message equals the committed record.
+    Every driver calls this instead of re-summarising, so the displayed text is
+    a *complete* projection of the hashed envelope rather than a summary of it.
+    Completeness is what makes the echoed ``card_hash`` meaningful: a render
+    that dropped or rounded a hashed field would let two different envelopes
+    display identically, so an operator could approve a card whose committed
+    bytes differed from the bytes they read.
+
+    Two properties are therefore load-bearing:
+
+    * **Every hashed field appears.** ``approval_id``, ``card_version``, the
+      action, the full impact estimate (including the rationale and the
+      ``hard_one_way`` flag), the rollback plan and both timestamps.
+    * **Values round-trip.** Floats are rendered with :func:`repr`, which is
+      exact for IEEE-754 doubles, instead of a truncating format. A score of
+      ``0.6449`` no longer displays as ``0.64``.
+
+    The penultimate line carries the canonical JSON envelope itself, so a
+    verifier can re-hash exactly what was displayed; the final line carries the
+    resulting ``card_hash``. Together they let an operator confirm the message
+    equals the committed record without trusting the chat client.
     """
     impact = card.impact
     if impact.fired_detectors:
-        detector_note = f"; fired detectors: {', '.join(impact.fired_detectors)}"
+        detector_note = f"fired detectors: {', '.join(impact.fired_detectors)}"
     else:
-        detector_note = "; no detectors fired"
+        detector_note = "no detectors fired"
     lines = [
+        f"Card version: {card.card_version}",
+        f"Approval id: {card.approval_id}",
         f"Action: {card.action.tool_name}",
         f"Args digest: {card.action.args_digest}",
-        f"Intent: {card.reasoning or '(none provided)'}",
-        f"Impact: score {impact.score:.2f}{detector_note}",
+        f"Intent: {card.reasoning}",
+        f"Impact: score {impact.score!r}; hard_one_way={impact.hard_one_way}; {detector_note}",
+        f"Impact rationale: {impact.rationale}",
     ]
     if impact.hard_one_way or card.rollback.irreversible:
         lines.append("IRREVERSIBLE ACTION: change tripped a one-way-door blast-radius detector.")
     lines.extend(
         (
             f"Rollback: {card.rollback.procedure}",
-            f"Expires at: {card.not_after:.0f} (enforced by the audit chain, not this chat client)",
+            f"Rollback irreversible: {card.rollback.irreversible}",
+            f"Created at: {card.created_at!r}",
+            f"Expires at: {card.not_after!r} (enforced by the audit chain, not this chat client)",
+            f"Canonical envelope: {_canonical_dumps(card.to_dict())}",
             f"Card hash: {card_hash(card)}",
         )
     )
