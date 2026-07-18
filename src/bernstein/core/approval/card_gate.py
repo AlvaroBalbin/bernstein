@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ALLOWED_DECISIONS",
     "REFUSAL_REASON_ALREADY_SETTLED",
+    "REFUSAL_REASON_BEFORE_ISSUE",
     "REFUSAL_REASON_CROSS_CONVERSATION",
     "REFUSAL_REASON_CROSS_WORKTREE",
     "REFUSAL_REASON_EXPIRED",
@@ -67,6 +68,7 @@ __all__ = [
     "REFUSAL_REASON_INVALID_DECISION",
     "ApprovalCardAlreadySettled",
     "ApprovalCardBindingMismatch",
+    "ApprovalCardClockSkew",
     "ApprovalCardExpired",
     "ApprovalCardGate",
     "ApprovalCardHashMismatch",
@@ -91,6 +93,12 @@ REFUSAL_REASON_CROSS_WORKTREE = "cross_worktree"
 
 #: Refusal reason recorded when a pinned card is resolved from another conversation.
 REFUSAL_REASON_CROSS_CONVERSATION = "cross_conversation"
+
+#: Refusal reason recorded when the decision clock predates the envelope's
+#: ``created_at``. The offline verifier requires
+#: ``created_at <= resolved_at < not_after``, so accepting such a decision would
+#: append a permanently unverifiable record to an append-only chain.
+REFUSAL_REASON_BEFORE_ISSUE = "before_issue"
 
 #: The only decision values a card may settle with. Anything else (an empty
 #: string, a different case, a driver-specific synonym such as ``approve_all``)
@@ -150,6 +158,15 @@ class ApprovalCardAlreadySettled(RuntimeError):
 
 class ApprovalCardInvalidDecision(RuntimeError):
     """Raised when the decision value is not in :data:`ALLOWED_DECISIONS`."""
+
+
+class ApprovalCardClockSkew(RuntimeError):
+    """Raised when the decision clock predates the envelope's ``created_at``.
+
+    Refusing here keeps the gate and the offline verifier symmetric: the gate
+    cannot append a settlement that ``bernstein audit verify`` would then reject
+    forever on an append-only chain.
+    """
 
 
 class ApprovalCardBindingMismatch(RuntimeError):
@@ -272,21 +289,27 @@ class ApprovalCardGate:
         1. the echoed hash names an issued envelope,
         2. the card has not already reached a terminal state,
         3. the decision is in :data:`ALLOWED_DECISIONS`,
-        4. the chain-side clock is before ``not_after``,
-        5. the origin worktree matches, when the card was pinned to one,
-        6. the origin conversation matches, when the card was pinned to one.
+        4. the chain-side clock is at or after ``created_at``,
+        5. the chain-side clock is before ``not_after``,
+        6. the origin worktree matches, when the card was pinned to one,
+        7. the origin conversation matches, when the card was pinned to one.
+
+        The settlement event records the origin the decision *arrived from*,
+        keeping the issuing origin under ``issued_worktree_id`` /
+        ``issued_thread_id``, so the chain attributes the decision to whoever
+        actually made it.
 
         Args:
             card_hash: The ``card_hash`` echoed by the decision. Must match an
                 issued envelope exactly.
             decision: ``approve`` or ``reject``.
             approver: Identifier of the operator who decided.
-            worktree_id: Worktree the decision was made from. Checked against
-                the issuing worktree when the card was pinned.
-            thread_id: Conversation the decision arrived on. Checked against the
-                issuing conversation when the card was pinned. An empty value
-                skips the check, so drivers that cannot attribute a
-                conversation keep working unchanged.
+            worktree_id: Worktree the decision was made from. Compared against
+                the issuing worktree whenever the card was pinned to one, empty
+                value included, and recorded on the settlement event.
+            thread_id: Conversation the decision arrived on. Compared against
+                the issuing conversation whenever the card was pinned to one,
+                empty value included, and recorded on the settlement event.
             now: Injected clock for deterministic tests; defaults to
                 ``time.time()``.
 
@@ -297,6 +320,8 @@ class ApprovalCardGate:
             ApprovalCardHashMismatch: When *card_hash* matches no issued card.
             ApprovalCardAlreadySettled: When the card is already terminal.
             ApprovalCardInvalidDecision: When *decision* is not allowed.
+            ApprovalCardClockSkew: When the decision clock predates the
+                envelope's ``created_at``.
             ApprovalCardExpired: When the decision arrives at or after the
                 envelope's ``not_after``.
             ApprovalCardBindingMismatch: When the origin worktree or
@@ -319,6 +344,7 @@ class ApprovalCardGate:
                 )
             self._guard_settled(echoed, settled=settled, approver=approver, worktree_id=worktree_id, issued=issued)
             self._guard_decision(decision, echoed, approver=approver, worktree_id=worktree_id, issued=issued)
+            self._guard_clock(echoed, approver=approver, worktree_id=worktree_id, issued=issued, current=current)
             self._guard_expiry(echoed, approver=approver, worktree_id=worktree_id, issued=issued, current=current)
             self._guard_binding(
                 echoed,
@@ -336,8 +362,16 @@ class ApprovalCardGate:
                     "card_hash": echoed,
                     "decision": decision,
                     "approver": approver,
-                    "worktree_id": issued.worktree_id,
-                    "thread_id": issued.thread_id,
+                    # The origin the decision actually arrived from. Recording
+                    # the issuing origin here instead would make the chain
+                    # attest that the legitimate worktree and conversation made
+                    # a decision that in fact came from somewhere else, which
+                    # is precisely the attribution this gate exists to prove.
+                    # The issuing origin is kept alongside, under its own keys.
+                    "worktree_id": worktree_id,
+                    "thread_id": thread_id,
+                    "issued_worktree_id": issued.worktree_id,
+                    "issued_thread_id": issued.thread_id,
                     "resolved_at": current,
                     "install_id": self._install_id,
                     "session_id": self._session_id,
@@ -396,6 +430,39 @@ class ApprovalCardGate:
             f"decision {decision!r} is not one of {sorted(ALLOWED_DECISIONS)}; refusing to resolve",
         )
 
+    def _guard_clock(
+        self,
+        echoed: str,
+        *,
+        approver: str,
+        worktree_id: str,
+        issued: IssuedCard,
+        current: float,
+    ) -> None:
+        """Refuse a decision whose clock predates the envelope's ``created_at``.
+
+        This is the lower half of the window the offline verifier enforces
+        (``created_at <= resolved_at < not_after``). Without it the gate would
+        happily append a settlement that its own verifier then rejects, and
+        because the audit log is append-only and HMAC-chained, that record would
+        make ``bernstein audit verify`` fail permanently with no remediation.
+        The gate must never be able to write a chain it cannot verify.
+        """
+        if current >= issued.card.created_at:
+            return
+        self._refuse(
+            card_hash=echoed,
+            reason=REFUSAL_REASON_BEFORE_ISSUE,
+            approver=approver,
+            worktree_id=worktree_id,
+            expected_card_hash=issued.card_hash,
+        )
+        raise ApprovalCardClockSkew(
+            f"approval card {echoed!r} was issued at created_at={issued.card.created_at:.0f} "
+            f"but the decision clock reads {current:.0f}; refusing to record a settlement "
+            f"that the offline verifier would reject",
+        )
+
     def _guard_expiry(
         self,
         echoed: str,
@@ -431,12 +498,14 @@ class ApprovalCardGate:
     ) -> None:
         """Refuse a decision whose origin differs from the card's pinned origin.
 
-        Both checks are skipped when the card was issued without the
-        corresponding pin, and the conversation check is skipped when the caller
-        supplies no conversation, so drivers that cannot attribute one are
-        unaffected.
+        Each check is skipped only when the card was issued *without* the
+        corresponding pin. Once a card carries a pin the comparison is
+        unconditional, including against an empty incoming origin: the value the
+        guard exists to distrust must not be able to disable the guard by being
+        absent. A caller that cannot state where a decision came from cannot
+        settle a card that was pinned to a specific origin.
         """
-        if issued.worktree_id and worktree_id and worktree_id != issued.worktree_id:
+        if issued.worktree_id and worktree_id != issued.worktree_id:
             self._refuse(
                 card_hash=echoed,
                 reason=REFUSAL_REASON_CROSS_WORKTREE,
@@ -449,7 +518,7 @@ class ApprovalCardGate:
                 f"approval card {echoed!r} is pinned to worktree {issued.worktree_id!r} "
                 f"and cannot be resolved from worktree {worktree_id!r}",
             )
-        if issued.thread_id and thread_id and thread_id != issued.thread_id:
+        if issued.thread_id and thread_id != issued.thread_id:
             self._refuse(
                 card_hash=echoed,
                 reason=REFUSAL_REASON_CROSS_CONVERSATION,

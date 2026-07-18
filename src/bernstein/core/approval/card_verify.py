@@ -11,6 +11,9 @@ A resolved approval must be re-checkable offline from the audit chain alone.
   decided against the fields that were hashed, not a divergent view),
 * the issue event was recorded *before* the resolution that settles it, so a
   settlement cannot be legitimised by an issue backfilled afterwards,
+* no card is settled twice. The gate refuses a replay live, but a chain written
+  by an unpatched build or a second writer can still carry two settlements of
+  one card, so exactly-once is reconstructed here rather than assumed,
 * the decision carries a usable timestamp and landed inside the envelope's
   window: ``created_at <= resolved_at < not_after``, with ``resolved_at``
   required to be finite and strictly positive. Expiry is reconstructable, not
@@ -100,6 +103,7 @@ def _resolved_at(details: dict[str, Any]) -> float | None:
 def _check_resolution(
     event: AuditEvent,
     issued: dict[str, ApprovalCardV2],
+    settled: set[str],
     errors: list[str],
 ) -> bool:
     """Validate one resolve event against the issues seen earlier in the chain.
@@ -108,6 +112,16 @@ def _check_resolution(
     """
     details: dict[str, Any] = event.details
     echoed = str(details.get("card_hash", ""))
+    if echoed in settled:
+        # Exactly-once is the whole point of the gate's terminality guard, so it
+        # has to be provable from the chain and not only enforced live. A chain
+        # written by an unpatched build, or by a second writer, carries the
+        # double settlement as evidence; refusing to flag it here would leave
+        # the invariant unauditable.
+        errors.append(
+            f"approval card {echoed!r} was settled more than once; a card settles exactly once",
+        )
+        return False
     card = issued.get(echoed)
     if card is None:
         # Either the hash names no issued envelope at all, or the issue event
@@ -166,6 +180,7 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
 
     errors: list[str] = []
     issued: dict[str, ApprovalCardV2] = {}
+    settled: set[str] = set()
     issued_count = 0
     resolved_count = 0
     reconstructed = 0
@@ -176,8 +191,9 @@ def verify_approval_cards(audit_dir: Path, *, key: bytes | None = None) -> Appro
             _admit_issue(event, issued, errors)
             continue
         resolved_count += 1
-        if _check_resolution(event, issued, errors):
+        if _check_resolution(event, issued, settled, errors):
             reconstructed += 1
+        settled.add(str(event.details.get("card_hash", "")))
 
     return ApprovalCardVerifyResult(
         ok=not errors,

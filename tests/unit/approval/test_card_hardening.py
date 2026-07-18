@@ -30,15 +30,19 @@ from bernstein.core.approval.card import (
     build_card,
     canonical_card_bytes,
     card_hash,
+    render_card_envelope,
     render_card_text,
 )
 from bernstein.core.approval.card_gate import (
     REFUSAL_REASON_ALREADY_SETTLED,
+    REFUSAL_REASON_BEFORE_ISSUE,
     REFUSAL_REASON_CROSS_CONVERSATION,
     REFUSAL_REASON_CROSS_WORKTREE,
+    REFUSAL_REASON_HASH_MISMATCH,
     REFUSAL_REASON_INVALID_DECISION,
     ApprovalCardAlreadySettled,
     ApprovalCardBindingMismatch,
+    ApprovalCardClockSkew,
     ApprovalCardGate,
     ApprovalCardHashMismatch,
     ApprovalCardInvalidDecision,
@@ -197,6 +201,81 @@ def test_cross_conversation_resolve_is_refused(tmp_path: Path) -> None:
     assert _reasons(chain) == [REFUSAL_REASON_CROSS_CONVERSATION]
 
 
+@pytest.mark.parametrize(
+    ("pins", "resolve_kwargs", "reason"),
+    [
+        ({"worktree_id": "wt-a"}, {"worktree_id": ""}, REFUSAL_REASON_CROSS_WORKTREE),
+        ({"thread_id": "C42"}, {"thread_id": ""}, REFUSAL_REASON_CROSS_CONVERSATION),
+    ],
+)
+def test_empty_origin_cannot_bypass_a_pin(
+    tmp_path: Path,
+    pins: dict[str, str],
+    resolve_kwargs: dict[str, str],
+    reason: str,
+) -> None:
+    """Revert-checked: fails if the guard regains its ``and worktree_id`` clause.
+
+    An absent origin must not disable the guard. The value the check exists to
+    distrust is exactly the value that would switch it off.
+    """
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(), **pins)
+
+    with pytest.raises(ApprovalCardBindingMismatch):
+        gate.resolve(card_hash=issued.card_hash, decision="approve", now=1_100.0, **resolve_kwargs)
+
+    assert chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED) == []
+    assert _reasons(chain) == [reason]
+
+
+def test_settlement_records_the_resolving_origin_not_the_issuing_one(tmp_path: Path) -> None:
+    """Revert-checked: fails if the event records ``issued.worktree_id`` again.
+
+    The chain must attribute a decision to where it came from. Recording the
+    issuing origin would make the chain attest that the legitimate worktree and
+    conversation decided something they did not.
+    """
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    # Unpinned card, so a foreign origin is allowed through and must be recorded.
+    issued = gate.issue(_card())
+    gate.resolve(
+        card_hash=issued.card_hash,
+        decision="approve",
+        worktree_id="wt-EVIL",
+        thread_id="C-EVIL",
+        now=1_100.0,
+    )
+
+    details = chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED)[0].details
+    assert details["worktree_id"] == "wt-EVIL"
+    assert details["thread_id"] == "C-EVIL"
+    # The issuing origin is preserved under its own keys, not conflated.
+    assert details["issued_worktree_id"] == ""
+    assert details["issued_thread_id"] == ""
+
+
+def test_settlement_keeps_issuing_origin_alongside_the_resolver(tmp_path: Path) -> None:
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(), worktree_id="wt-a", thread_id="C42")
+    gate.resolve(
+        card_hash=issued.card_hash,
+        decision="approve",
+        worktree_id="wt-a",
+        thread_id="C42",
+        now=1_100.0,
+    )
+
+    details = chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED)[0].details
+    assert details["worktree_id"] == "wt-a"
+    assert details["issued_worktree_id"] == "wt-a"
+    assert details["thread_id"] == "C42"
+    assert details["issued_thread_id"] == "C42"
+
+
 def test_matching_conversation_resolves(tmp_path: Path) -> None:
     chain = _chain(tmp_path)
     gate = ApprovalCardGate(chain)
@@ -226,8 +305,15 @@ def test_binding_survives_restart(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FailingChain:
-    """A chain store whose append always fails, modelling a durability fault."""
+class _FailFirstAppendChain:
+    """A chain store whose *first* append fails, modelling a durability fault.
+
+    Only the first append fails so the later refusal path still works. That
+    matters: a chain that fails every append would let the test pass on an
+    ``OSError`` raised from the refusal write, which is also what the
+    *unhardened* ordering raises, and the assertion would no longer
+    discriminate between the two.
+    """
 
     def __init__(self, real: AuditChainStore) -> None:
         self._real = real
@@ -235,25 +321,39 @@ class _FailingChain:
 
     def log_with_prev_digest(self, **kwargs: Any) -> Any:
         self.attempts += 1
-        msg = "chain append failed"
-        raise OSError(msg)
+        if self.attempts == 1:
+            msg = "chain append failed"
+            raise OSError(msg)
+        return self._real.log_with_prev_digest(**kwargs)
 
     def query(self, **kwargs: Any) -> Any:
         return self._real.query(**kwargs)
 
 
 def test_card_is_not_exposed_when_the_issued_event_fails_to_persist(tmp_path: Path) -> None:
-    chain = _FailingChain(_chain(tmp_path))
+    """Revert-checked: fails if the chain append is moved back after the memory insert.
+
+    Under the unhardened ordering the card is in ``_issued`` before the failing
+    append, so the resolve below finds it, passes every guard and settles a card
+    that never reached the chain: no ``ApprovalCardHashMismatch`` is raised and
+    a resolved event appears.
+    """
+    real = _chain(tmp_path)
+    chain = _FailFirstAppendChain(real)
     gate = ApprovalCardGate(chain)  # type: ignore[arg-type]
     card = _card()
 
     with pytest.raises(OSError, match="chain append failed"):
         gate.issue(card)
 
-    # The card never became resolvable: an approval that is not on the chain
-    # must not be settleable from memory.
-    with pytest.raises((ApprovalCardHashMismatch, OSError)):
+    # An approval that is not on the chain must not be settleable from memory.
+    # The refusal itself is chain-recorded, so this asserts the specific
+    # unknown-card refusal rather than tolerating any error.
+    with pytest.raises(ApprovalCardHashMismatch):
         gate.resolve(card_hash=card_hash(card), decision="approve", now=1_100.0)
+
+    assert real.query(event_type=EVENT_APPROVAL_CARD_RESOLVED) == []
+    assert _reasons(real) == [REFUSAL_REASON_HASH_MISMATCH]
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +486,7 @@ def test_nan_not_after_cannot_defeat_chain_side_expiry() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_render_includes_the_canonical_envelope_that_rehashes_to_the_card_hash() -> None:
+def test_render_card_envelope_rehashes_to_the_card_hash() -> None:
     card = build_card(
         approval_id="ap-precision",
         tool_name="Edit",
@@ -395,14 +495,63 @@ def test_render_includes_the_canonical_envelope_that_rehashes_to_the_card_hash()
         created_at=1_000.123_456_789,
         ttl_seconds=600.987_654_321,
     )
-    text = render_card_text(card)
-
-    envelope_line = next(line for line in text.splitlines() if line.startswith("Canonical envelope:"))
-    payload = json.loads(envelope_line.split(": ", 1)[1])
-    # The displayed envelope re-hashes to the displayed hash: the operator can
-    # verify the message equals the committed record without trusting the client.
+    rendered = render_card_envelope(card)
+    payload = json.loads(rendered.splitlines()[0])
+    # The canonical envelope re-hashes to the committed hash, so a verifier can
+    # confirm it without trusting the chat client.
     assert card_hash(ApprovalCardV2.from_dict(payload)) == card_hash(card)
-    assert f"Card hash: {card_hash(card)}" in text
+    assert f"Card hash: {card_hash(card)}" in rendered
+
+
+#: Shortest body cap across the chat drivers. Discord rejects `content` over
+#: 2000 characters and Slack caps a Block Kit section's text at 3000; neither
+#: driver chunks, so the card body has to fit as-is. Drivers prepend a title
+#: (``f"{title}\n\n{body}"``), so the body is held to a margin below the cap.
+_DISCORD_BODY_CAP = 2000
+_TITLE_ALLOWANCE = 200
+
+
+@pytest.mark.parametrize("depth", [1, 40, 160, 1_000])
+def test_chat_body_stays_within_the_tightest_driver_cap(depth: int) -> None:
+    """Revert-checked: fails if the canonical envelope is inlined, or the path unbounded.
+
+    The card that matters most is the one with the widest blast radius, which is
+    also the longest. An oversized body is not truncated by any driver, it fails
+    to deliver, so the operator never sees the approval at all. The bound must
+    therefore hold for adversarial input, not just typical input.
+    """
+    worst = build_card(
+        approval_id="ap-worst",
+        tool_name="Write",
+        tool_args={"file_path": "/srv/" + "deeply/" * depth + "file.py", "content": "y" * 200},
+        reasoning="q" * 700,
+        created_at=1_000.0,
+        ttl_seconds=600.0,
+    )
+    body = render_card_text(worst)
+    assert len(body.encode("utf-8")) < _DISCORD_BODY_CAP - _TITLE_ALLOWANCE
+    # Completeness is not traded away for size: every hashed field is still
+    # present and round-trippable in the delivered body.
+    assert worst.approval_id in body
+    assert repr(worst.not_after) in body
+    assert card_hash(worst) in body
+
+
+def test_render_size_does_not_grow_with_unbounded_arguments() -> None:
+    """A card's rendered size must not scale with attacker-controlled argument length."""
+
+    def render_len(path_depth: int, command_len: int) -> int:
+        card = build_card(
+            approval_id="ap",
+            tool_name="Write",
+            tool_args={"file_path": "/srv/" + "deeply/" * path_depth + "f.py", "content": "y" * command_len},
+            reasoning="q" * 700,
+            created_at=1_000.0,
+            ttl_seconds=600.0,
+        )
+        return len(render_card_text(card).encode("utf-8"))
+
+    assert render_len(40, 200) == render_len(4_000, 20_000)
 
 
 def test_render_does_not_round_away_hashed_precision() -> None:
@@ -510,6 +659,56 @@ def test_verifier_rejects_resolved_at_before_created_at(tmp_path: Path) -> None:
     result = verify_approval_cards(tmp_path / "audit", key=_KEY)
     assert not result.ok
     assert any("created_at" in e for e in result.errors)
+
+
+def test_verifier_rejects_two_settlements_of_one_card(tmp_path: Path) -> None:
+    """Revert-checked: fails without the ``settled`` set in the verifier pass.
+
+    Exactly-once is the headline invariant, so it has to be reconstructable from
+    the chain and not merely enforced live by the gate. A chain written by an
+    unpatched build or a second writer carries the double settlement as
+    evidence.
+    """
+    chain = _chain(tmp_path)
+    digest = _issue_via_gate(chain, _card())
+    _raw_resolve(chain, digest, 1_100.0)
+    _raw_resolve(chain, digest, 1_200.0)
+
+    result = verify_approval_cards(tmp_path / "audit", key=_KEY)
+    assert not result.ok
+    assert any("more than once" in e for e in result.errors)
+    assert result.reconstructed_count == 1
+
+
+def test_gate_never_writes_a_settlement_its_own_verifier_rejects(tmp_path: Path) -> None:
+    """Revert-checked: fails without ``_guard_clock``.
+
+    The verifier requires ``created_at <= resolved_at``. The audit log is
+    append-only, so a settlement below that bound would fail verification
+    permanently with no remediation. The gate must refuse instead of writing it.
+    """
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(created_at=1_000.0, ttl=600.0))
+
+    with pytest.raises(ApprovalCardClockSkew):
+        gate.resolve(card_hash=issued.card_hash, decision="approve", now=900.0)
+
+    assert chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED) == []
+    assert _reasons(chain) == [REFUSAL_REASON_BEFORE_ISSUE]
+    # The chain the gate did write still verifies clean.
+    assert verify_approval_cards(tmp_path / "audit", key=_KEY).ok
+
+
+def test_resolve_at_exactly_created_at_is_allowed(tmp_path: Path) -> None:
+    """The lower bound is inclusive, matching the verifier's ``created_at <=``."""
+    chain = _chain(tmp_path)
+    gate = ApprovalCardGate(chain)
+    issued = gate.issue(_card(created_at=1_000.0, ttl=600.0))
+    gate.resolve(card_hash=issued.card_hash, decision="approve", now=1_000.0)
+
+    assert len(chain.query(event_type=EVENT_APPROVAL_CARD_RESOLVED)) == 1
+    assert verify_approval_cards(tmp_path / "audit", key=_KEY).ok
 
 
 def test_verifier_accepts_a_well_formed_pair(tmp_path: Path) -> None:

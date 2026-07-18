@@ -57,6 +57,7 @@ __all__ = [
     "canonical_card_bytes",
     "card_hash",
     "impact_from_tool_call",
+    "render_card_envelope",
     "render_card_text",
     "rollback_for",
 ]
@@ -360,6 +361,27 @@ _NET_TOOLS = frozenset({"webfetch", "websearch", "fetch", "http", "curl"})
 
 _IRREVERSIBLE_PREFIX = "IRREVERSIBLE: this change tripped a one-way-door detector; there is no clean automatic undo. "
 
+#: The rollback template embeds the touched path twice, so an unbounded path is
+#: the one field that can push a rendered card past a chat driver's body cap
+#: (Discord 2000, Slack 3000) -- and no driver chunks, so an oversized card is
+#: not truncated, it fails to deliver. Bounding the path keeps the highest
+#: blast-radius approvals deliverable. The bound is part of the contract, like
+#: :data:`REASONING_MAX_CHARS`: the same path always truncates to the same
+#: bytes, so the envelope stays deterministic and the truncated form is what
+#: gets hashed and displayed.
+ROLLBACK_PATH_MAX_CHARS = 160
+
+
+def _bound_path(path: str) -> str:
+    """Return *path* trimmed to :data:`ROLLBACK_PATH_MAX_CHARS`, keeping the tail.
+
+    The tail is kept because the filename and its immediate parents identify the
+    target far better than the leading directories do.
+    """
+    if len(path) <= ROLLBACK_PATH_MAX_CHARS:
+        return path
+    return "..." + path[-(ROLLBACK_PATH_MAX_CHARS - 3) :]
+
 
 def rollback_for(tool_name: str, tool_args: dict[str, Any], *, irreversible: bool) -> RollbackPlan:
     """Return a rollback plan for a tool call, keyed by tool class.
@@ -367,13 +389,17 @@ def rollback_for(tool_name: str, tool_args: dict[str, Any], *, irreversible: boo
     When *irreversible* is ``True`` (a ``hard_one_way`` detector fired) the
     plan is prefixed with an explicit irreversible marker and carries the
     ``irreversible`` flag, both of which land inside the hashed envelope.
+
+    The touched path is bounded (see :data:`ROLLBACK_PATH_MAX_CHARS`) so the
+    rendered card stays deliverable. The full arguments remain committed through
+    ``action.args_digest``, so nothing is lost from the proof.
     """
     name = tool_name.strip().lower()
     path = ""
     for field_name in _PATH_FIELDS:
         value = tool_args.get(field_name)
         if isinstance(value, str) and value:
-            path = value
+            path = _bound_path(value)
             break
 
     if name in _WRITE_TOOLS:
@@ -491,10 +517,16 @@ def render_card_text(card: ApprovalCardV2) -> str:
       exact for IEEE-754 doubles, instead of a truncating format. A score of
       ``0.6449`` no longer displays as ``0.64``.
 
-    The penultimate line carries the canonical JSON envelope itself, so a
-    verifier can re-hash exactly what was displayed; the final line carries the
-    resulting ``card_hash``. Together they let an operator confirm the message
-    equals the committed record without trusting the chat client.
+    The final line carries the ``card_hash``. Because the lines above already
+    reproduce every hashed field losslessly, an operator can rebuild the
+    envelope from what they read and confirm it hashes to that value.
+
+    The canonical JSON envelope is deliberately *not* inlined here. Duplicating
+    every field a second time as JSON more than doubled the body and pushed
+    large cards past the Discord (2000) and Slack (3000) character caps, and no
+    driver chunks, so the approval card for exactly the highest-blast-radius
+    operations would fail to deliver. Callers that need the exact canonical
+    bytes use :func:`render_card_envelope`.
     """
     impact = card.impact
     if impact.fired_detectors:
@@ -518,8 +550,19 @@ def render_card_text(card: ApprovalCardV2) -> str:
             f"Rollback irreversible: {card.rollback.irreversible}",
             f"Created at: {card.created_at!r}",
             f"Expires at: {card.not_after!r} (enforced by the audit chain, not this chat client)",
-            f"Canonical envelope: {_canonical_dumps(card.to_dict())}",
             f"Card hash: {card_hash(card)}",
         )
     )
     return "\n".join(lines)
+
+
+def render_card_envelope(card: ApprovalCardV2) -> str:
+    """Return the canonical JSON envelope with its ``card_hash``, for verification.
+
+    This is the exact byte sequence that was hashed, so a verifier can re-hash
+    it and compare. It is kept out of :func:`render_card_text` because inlining
+    it in a chat body doubles the message length and pushes large cards past the
+    Discord and Slack limits; surface it where length is not constrained (a CLI
+    lookup, a file attachment, a details pane).
+    """
+    return f"{_canonical_dumps(card.to_dict())}\nCard hash: {card_hash(card)}"
