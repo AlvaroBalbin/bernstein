@@ -441,7 +441,7 @@ def egress_attestation_mismatch(policy: EffectivePolicy, runtime: NetworkPolicy)
     posture is sealed and again at every spawn, so neither activation nor drift
     can leave a false claim standing.
     """
-    attested = (policy.network_egress, tuple(policy.egress_allowlist))
+    attested = (policy.network_egress, policy.egress_allowlist)
     enforced = enforced_egress_posture(runtime)
     if attested == enforced:
         return None
@@ -584,7 +584,8 @@ def sovereign_posture_violations(
     3. the attested-equals-enforced egress invariant, when a runtime policy is
        available to compare against.
     """
-    problems = list(policy.violations())
+    # ``violations()`` already returns a fresh list, so this owns it outright.
+    problems = policy.violations()
     problems.extend(endpoint_certification_violations(policy, workdir=workdir))
     if runtime_policy is not None:
         mismatch = egress_attestation_mismatch(policy, runtime_policy)
