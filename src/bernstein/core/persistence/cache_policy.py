@@ -289,11 +289,10 @@ def compose_recipe(policy: CachePolicy, inputs: RecipeInputs) -> dict[str, Any]:
     into the recipe so two policies over identical inputs still produce distinct
     keys.
     """
-    ordered: list[dict[str, str]] = []
-    for name in MANDATORY_INGREDIENTS:
-        ordered.append({"name": name, "hash": _sha256_hex(_canonical_bytes(inputs.value_for(name)))})
-    for name in policy.ingredients:
-        ordered.append({"name": name, "hash": _sha256_hex(_canonical_bytes(inputs.value_for(name)))})
+    ordered: list[dict[str, str]] = [
+        {"name": name, "hash": _sha256_hex(_canonical_bytes(inputs.value_for(name)))}
+        for name in (*MANDATORY_INGREDIENTS, *policy.ingredients)
+    ]
     return {
         "v": 1,
         "policy_hash": policy.policy_hash(),
@@ -463,10 +462,10 @@ class CacheEntry:
         """Return the canonical dict form of the entry."""
         return {
             "key": self.key,
-            "input_hashes": dict(self.input_hashes),
+            "input_hashes": self.input_hashes.copy(),
             "output_hash": self.output_hash,
             "producing_task": self.producing_task,
-            "diff_file_hashes": dict(self.diff_file_hashes),
+            "diff_file_hashes": self.diff_file_hashes.copy(),
             "base_commit": self.base_commit,
             "verified": self.verified,
             "recipe_hash": self.recipe_hash,
