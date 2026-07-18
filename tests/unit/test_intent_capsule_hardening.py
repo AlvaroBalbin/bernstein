@@ -179,14 +179,15 @@ def test_verify_requires_a_capsule_bound_anchor(tmp_path: Path) -> None:
 
 
 def test_verify_rejects_a_capsule_bound_anchor_for_another_capsule(tmp_path: Path) -> None:
-    capsule = _approve(tmp_path)
+    """An anchor naming a different capsule does not attribute this run."""
+    _approve(tmp_path)
     _journal(tmp_path, _RUN_ID, capsule_h="sha256:" + "0" * 64)
 
     result = verify_intent_conformance(sdd_dir=_sdd(tmp_path), chain=_chain(tmp_path), task_id=_TASK_ID)
 
     assert not result.ok
+    assert "0 matching" in result.reason
     assert "capsule_bound" in result.reason
-    assert capsule_hash(capsule) not in result.reason or "no matching" in result.reason
 
 
 def test_verify_rejects_duplicate_capsule_bound_anchors(tmp_path: Path) -> None:
