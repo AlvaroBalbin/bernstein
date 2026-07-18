@@ -32,18 +32,26 @@ from bernstein.core.security.network_policy import (
 
 
 @pytest.fixture(autouse=True)
-def _restore_profile_markers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Guarantee the profile markers this module installs never outlive it.
+def _isolate_profile_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test from a process with no profile markers, and restore after.
 
+    Two hazards this closes. Inbound: an earlier module can leave
+    ``BERNSTEIN_NETWORK_POLICY`` set to an allow-list, and the gate now compares
+    the attested egress posture against the *enforced* one - so a leaked policy
+    makes a deny-all attestation genuinely mismatch and the gate correctly
+    refuses, failing a test that never meant to declare any egress. Outbound:
     ``install_policy`` writes ``os.environ`` directly, and
     ``monkeypatch.delenv(..., raising=False)`` on an already-absent variable
-    records nothing to restore. Touching each variable with ``setenv`` first
-    registers the pre-test state so teardown always puts it back.
+    records nothing to restore, so the markers would leak onward.
+
+    Touching each variable with ``setenv`` first registers the pre-test state
+    (including "absent") so teardown always puts it back.
     """
     from bernstein.core.security.network_policy import ENV_NETWORK_POLICY
 
     for var in (ENV_PROFILE_MODE, ENV_NETWORK_POLICY, ENV_SOVEREIGN_MODE):
         monkeypatch.setenv(var, os.environ.get(var, ""))
+        monkeypatch.delenv(var, raising=False)
 
 
 def _preflight(workdir: Path) -> None:
@@ -73,6 +81,12 @@ def test_gate_passes_when_posture_matches(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setenv(ENV_SOVEREIGN_MODE, "1")
     monkeypatch.setenv(ENV_PROFILE_MODE, PROFILE_AIRGAP)
     _attest_clean(tmp_path)
+    # Premise: the config declares no egress, so the attested posture is
+    # deny-all and the enforced runtime policy must be deny-all to match.
+    from bernstein.core.security.network_policy import policy_from_env
+
+    assert policy_from_env().allow_any is False
+    assert not policy_from_env().rules
     _preflight(tmp_path)  # posture matches attestation -> no refusal
 
 
