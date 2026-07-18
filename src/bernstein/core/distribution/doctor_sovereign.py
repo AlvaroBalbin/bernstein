@@ -66,8 +66,19 @@ class SovereignReport:
 
 
 def check_sovereign_profile_active() -> Check:
-    """Verify ``--profile sovereign`` marked this process tree."""
-    if os.environ.get(ENV_SOVEREIGN_MODE, "").strip().lower() in {"1", "true", SOVEREIGN_PROFILE}:
+    """Verify the sovereign marker *pair* consistently marked this process tree."""
+    from bernstein.core.security.network_policy import SovereignMarkerError, is_sovereign_profile
+
+    try:
+        active = is_sovereign_profile()
+    except SovereignMarkerError as exc:
+        return Check(
+            name="sovereign profile active",
+            status=CheckStatus.FAIL,
+            detail=f"markers are inconsistent: {exc}",
+            fix="rerun with --profile sovereign so both profile markers are installed together",
+        )
+    if active:
         return Check(
             name="sovereign profile active",
             status=CheckStatus.PASS,
@@ -201,11 +212,28 @@ def run_sovereign_checks(workdir: Path | None = None) -> SovereignReport:
     """
     from pathlib import Path
 
+    from bernstein.core.security.deployment_profile import SovereignConfigError
+
     cwd = workdir or Path.cwd()
-    snapshot = load_config_snapshot(cwd)
+    config_rows: list[Check] = []
+    try:
+        snapshot: dict[str, object] | None = load_config_snapshot(cwd, require=True)
+    except SovereignConfigError as exc:
+        # Report the fail-closed condition instead of silently reporting on the
+        # permissive default posture an unreadable config would project to.
+        snapshot = None
+        config_rows.append(
+            Check(
+                name="source configuration readable",
+                status=CheckStatus.FAIL,
+                detail=str(exc),
+                fix="restore a readable bernstein.yaml in the project root",
+            )
+        )
     policy = resolve_effective_policy(SOVEREIGN_PROFILE, snapshot)
     evaluation = evaluate_posture_drift(workdir=cwd, config_snapshot=snapshot)
     rows: list[Check] = [
+        *config_rows,
         check_sovereign_profile_active(),
         check_network_policy_deny_all(),
         check_runtime_socket_guard_active(),
