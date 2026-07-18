@@ -12,9 +12,15 @@ them against the capsule; the conformance verdict is a pure function of
 
 ``show`` prints the operator projection of the capsule (never the free-text
 goal, only its digest). ``verify`` recomputes conformance offline: it checks the
-capsule hash against the audit chain, walks the run journal's Merkle chain, and
-maps observed action classes against the capsule. A tampered capsule or a
-reordered journal fails; a drifted run reports the divergence.
+capsule hash against the audit chain, resolves the governed run from the signed
+audit entry, walks that run journal's Merkle chain, and maps observed action
+classes against the capsule. A tampered capsule, a repointed capsule record, a
+missing capsule-bound anchor, or a reordered journal fails; a drifted run
+reports the divergence.
+
+Both commands are read-only. ``verify`` in particular never creates audit key
+material: a minted key cannot authenticate an existing chain, so doing so would
+turn a missing-key setup error into a false tamper report.
 """
 
 from __future__ import annotations
@@ -27,20 +33,21 @@ import click
 from bernstein.cli.helpers import console
 
 
-def _load_hmac_key() -> bytes:
-    from bernstein.core.security.audit import load_or_create_audit_key
-
-    return load_or_create_audit_key()
-
-
 def _sdd_dir(workdir: Path) -> Path:
     return workdir / ".sdd"
 
 
-def _chain(workdir: Path):
+def _read_only_chain(workdir: Path):
+    """Open the audit chain for reading, never minting key material.
+
+    ``verify`` only reads. Creating a key here would produce one that cannot
+    authenticate the existing chain, so every entry would fail its HMAC check
+    and a plain missing-key setup error would be reported as tampering.
+    """
+    from bernstein.core.security.audit import load_audit_key
     from bernstein.core.security.audit_chain import AuditChainStore
 
-    return AuditChainStore(_sdd_dir(workdir) / "audit", key=_load_hmac_key())
+    return AuditChainStore(_sdd_dir(workdir) / "audit", key=load_audit_key())
 
 
 @click.group("intent")
@@ -128,19 +135,32 @@ def intent_show_cmd(task_id: str, workdir: str, as_json: bool) -> None:
 def intent_verify_cmd(task_id: str, workdir: str, as_json: bool) -> None:
     """Recompute conformance offline from journal + capsule.
 
-    Checks the capsule hash against the audit chain, walks the run journal's
-    Merkle chain, and maps observed action classes against the capsule. Exit
-    codes: 0 = conformant, 1 = no capsule, 2 = drift or tamper.
+    Checks the capsule hash against the audit chain, resolves the run from the
+    signed audit entry, walks the run journal's Merkle chain, and maps observed
+    action classes against the capsule. Read-only: it never writes to the chain
+    and never creates an audit key. Exit codes: 0 = conformant, 1 = no capsule,
+    2 = drift or tamper, 3 = cannot verify (no audit key).
     """
+    from bernstein.core.security.audit import AuditKeyMissingError
     from bernstein.core.security.intent_capsule import (
         project_conformance_verdict,
         verify_intent_conformance,
     )
 
     root = Path(workdir).resolve()
+    try:
+        chain = _read_only_chain(root)
+    except AuditKeyMissingError as exc:
+        if as_json:
+            console.print_json(json.dumps({"ok": False, "error": "audit_key_missing", "reason": str(exc)}))
+        else:
+            console.print()
+            console.print(f"[yellow]CANNOT VERIFY[/yellow] -- {exc}")
+        raise SystemExit(3) from exc
+
     result = verify_intent_conformance(
         sdd_dir=_sdd_dir(root),
-        chain=_chain(root),
+        chain=chain,
         task_id=task_id,
     )
 

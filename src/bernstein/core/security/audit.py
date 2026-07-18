@@ -111,6 +111,16 @@ class AuditKeyPermissionError(RuntimeError):
     """Raised when the audit key file has permissions looser than 0600."""
 
 
+class AuditKeyMissingError(RuntimeError):
+    """Raised when a read-only caller finds no audit key to load.
+
+    Read-only verification paths must never mint key material: a freshly
+    generated key cannot authenticate an existing chain, so the chain would
+    fail verification and report a bogus tamper. Callers that only read the
+    chain use :func:`load_audit_key` and surface this error instead.
+    """
+
+
 def _default_audit_key_path() -> Path:
     """Return the default HMAC key path outside of ``.sdd/``.
 
@@ -155,6 +165,37 @@ def _enforce_key_permissions(key_path: Path) -> None:
             f"Audit key {key_path} has insecure permissions {file_mode:04o}; "
             f"required {_REQUIRED_KEY_MODE:04o} (owner-only)."
         )
+
+
+def load_audit_key(key_path: Path | None = None) -> bytes:
+    """Load an existing audit HMAC key without ever creating one.
+
+    The load-only counterpart to :func:`load_or_create_audit_key`, for commands
+    that only read and verify the chain. It resolves the key path identically
+    but creates no directory and no key file: a verifier that minted its own key
+    would fail every HMAC check against a chain written under the real key and
+    report that as tampering, turning a missing-key operator error into a false
+    integrity alarm.
+
+    Args:
+        key_path: Optional explicit override. Useful for tests.
+
+    Returns:
+        The raw key bytes suitable for ``hmac.new``.
+
+    Raises:
+        AuditKeyMissingError: If no key file exists at the resolved path.
+        AuditKeyPermissionError: If the key file is readable by anyone besides
+            its owner.
+    """
+    resolved = key_path if key_path is not None else _default_audit_key_path()
+    if not resolved.exists():
+        raise AuditKeyMissingError(
+            f"No audit HMAC key at {resolved}. This command only reads the audit chain and will not "
+            f"create key material. Set ${AUDIT_KEY_ENV} to the key used to write the chain."
+        )
+    _enforce_key_permissions(resolved)
+    return resolved.read_bytes().strip()
 
 
 def load_or_create_audit_key(key_path: Path | None = None) -> bytes:

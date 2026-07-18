@@ -56,6 +56,11 @@ _HMAC_KEY = b"k" * 32
 _RUN_ID = "run-intent-1"
 _TASK_ID = "task-abc123"
 
+#: Far-future expiry. Capsule expiry is enforced against the ``ts`` on each
+#: journal row (#2649), so fixtures that build a real journal need a capsule
+#: that has not already expired.
+_FUTURE_EXPIRY = 4_102_444_800  # 2100-01-01T00:00:00Z
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -94,7 +99,7 @@ def _capsule() -> IntentCapsule:
         file_scope_globs=["src/pricing/**", "tests/**"],
         permitted_adapters=["claude", "codex"],
         egress_classes=[],
-        expiry_ts=1_700_100_000,
+        expiry_ts=_FUTURE_EXPIRY,
     )
 
 
@@ -112,7 +117,9 @@ def _journal_events(*, drift: bool):
         {"event": "task.tick", "action_class": None, "seq": 0},
         {"event": "tool.call", "tool": "Read", "seq": 1},
         {"event": "tool.call", "tool": "Edit", "seq": 2},
-        {"event": "tool.call", "tool": "Bash", "action_class": "git.commit", "seq": 3},
+        # A real commit tool, not a shell call labelled as one: the reviewed
+        # tool map outranks a worker-stamped action_class (#2649).
+        {"event": "tool.call", "tool": "git_commit", "seq": 3},
     ]
     if drift:
         events.append({"event": "tool.call", "tool": "WebFetch", "seq": 4})
@@ -127,7 +134,7 @@ def _build_run_journal(tmp_path: Path, *, capsule_h: str, drift: bool):
     bind_capsule_into_journal(journal, task_id=_TASK_ID, capsule_hash=capsule_h)
     journal.record("tool.call", tool="Read", seq=1)
     journal.record("tool.call", tool="Edit", seq=2)
-    journal.record("tool.call", tool="Bash", action_class="git.commit", seq=3)
+    journal.record("tool.call", tool="git_commit", seq=3)
     if drift:
         journal.record("tool.call", tool="WebFetch", seq=4)
     return journal
@@ -154,7 +161,7 @@ def test_compile_capsule_binds_goal_and_cost_by_digest_not_text() -> None:
     assert cap.goal_digest.startswith("sha256:")
     assert "Refactor" not in canonicalise(cap).decode("utf-8")
     assert cap.cost_envelope_ref.startswith("sha256:")
-    assert cap.expiry_ts == 1_700_100_000
+    assert cap.expiry_ts == _FUTURE_EXPIRY
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +182,7 @@ def test_ac1_approve_writes_capsule_to_audit_chain(tmp_path: Path) -> None:
         file_scope_globs=["src/pricing/**"],
         permitted_adapters=["claude"],
         egress_classes=[],
-        expiry_ts=1_700_100_000,
+        expiry_ts=_FUTURE_EXPIRY,
     )
     assert event.event_type == EVENT_INTENT_CAPSULE
     assert event.details["capsule_hash"] == capsule_hash(capsule)
@@ -220,8 +227,11 @@ def test_classify_journal_event_maps_tools_to_action_classes() -> None:
     assert classify_journal_event({"tool": "Read"}) == "fs.read"
     assert classify_journal_event({"tool": "Edit"}) == "fs.write"
     assert classify_journal_event({"tool": "WebFetch"}) == "web.fetch"
-    # Explicit action_class wins over the tool table.
-    assert classify_journal_event({"tool": "Bash", "action_class": "git.commit"}) == "git.commit"
+    # The reviewed tool table outranks a worker-stamped action_class, so a
+    # shell call cannot relabel itself as a commit (#2649).
+    assert classify_journal_event({"tool": "Bash", "action_class": "git.commit"}) == "shell.exec"
+    # For a tool the reviewed map does not know, the stamped class is the fallback.
+    assert classify_journal_event({"tool": "custom_tool", "action_class": "git.commit"}) == "git.commit"
     # Non-action events classify to None (ticks, capsule bindings, snapshots).
     assert classify_journal_event({"event": "task.tick"}) is None
     assert classify_journal_event({"event": CAPSULE_BOUND_EVENT, "capsule_hash": "x"}) is None
@@ -286,7 +296,7 @@ def test_ac3_clean_run_verifies(tmp_path: Path) -> None:
         file_scope_globs=["src/pricing/**"],
         permitted_adapters=["claude"],
         egress_classes=[],
-        expiry_ts=1_700_100_000,
+        expiry_ts=_FUTURE_EXPIRY,
     )
     _build_run_journal(tmp_path, capsule_h=capsule_hash(cap), drift=False)
     result = verify_intent_conformance(sdd_dir=_sdd(tmp_path), chain=_chain(tmp_path), task_id=_TASK_ID)
@@ -306,7 +316,7 @@ def test_ac3_tampered_capsule_bytes_fail_verify(tmp_path: Path) -> None:
         file_scope_globs=["src/pricing/**"],
         permitted_adapters=["claude"],
         egress_classes=[],
-        expiry_ts=1_700_100_000,
+        expiry_ts=_FUTURE_EXPIRY,
     )
     _build_run_journal(tmp_path, capsule_h=capsule_hash(cap), drift=False)
     # Tamper the on-disk capsule: widen the allow-list after approval.
@@ -334,7 +344,7 @@ def test_ac3_reordered_journal_steps_fail_verify(tmp_path: Path) -> None:
         file_scope_globs=["src/pricing/**"],
         permitted_adapters=["claude"],
         egress_classes=[],
-        expiry_ts=1_700_100_000,
+        expiry_ts=_FUTURE_EXPIRY,
     )
     _build_run_journal(tmp_path, capsule_h=capsule_hash(cap), drift=False)
     journal_path = _sdd(tmp_path) / "runs" / _RUN_ID / "journal.jsonl"

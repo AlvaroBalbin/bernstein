@@ -36,8 +36,10 @@ import ast
 import hashlib
 import json
 import operator
+import re
 import types
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -135,6 +137,25 @@ _EVENT_TO_ACTION_CLASS: dict[str, str] = {
     "shell.exec": "shell.exec",
 }
 
+#: Action classes whose events are checked against the capsule's
+#: ``file_scope_globs``. The capsule scopes the worker's *mutations*: a read
+#: outside the declared write scope is not itself a scope violation, so
+#: enforcing reads here would flag ordinary config/context lookups as drift.
+_FILE_SCOPED_ACTION_CLASSES: frozenset[str] = frozenset({"fs.write", "fs.delete"})
+
+#: Journal payload keys carrying a single path, in deterministic probe order.
+_PATH_FIELDS: tuple[str, ...] = ("path", "file_path", "file")
+
+#: Journal payload keys carrying a list of paths, in deterministic probe order.
+_PATH_LIST_FIELDS: tuple[str, ...] = ("paths", "files")
+
+#: Journal payload keys naming the adapter that executed an event.
+_ADAPTER_FIELDS: tuple[str, ...] = ("adapter", "adapter_name")
+
+#: Journal event types that are structural rather than worker actions. They are
+#: never counted as unclassified drift under ``allow_unclassified=False``.
+_STRUCTURAL_EVENTS: frozenset[str] = frozenset({CAPSULE_BOUND_EVENT})
+
 #: Action classes that carry outbound communication. An observed action class in
 #: this set requires ``external_comm`` in the capsule's ``egress_classes``.
 _EXTERNAL_COMM_ACTION_CLASSES: frozenset[str] = frozenset(
@@ -155,21 +176,30 @@ def classify_journal_event(event: dict[str, Any]) -> str | None:
 
     Resolution order (deterministic, no inference):
 
-    1. an explicit truthy ``action_class`` field stamped by the worker/adapter,
-    2. the ``tool`` field mapped through :data:`_TOOL_TO_ACTION_CLASS`,
+    1. the ``tool`` field mapped through the reviewed :data:`_TOOL_TO_ACTION_CLASS`,
+    2. an explicit truthy ``action_class`` field, **only** for a tool the
+       reviewed map does not recognise,
     3. the ``event`` type mapped through :data:`_EVENT_TO_ACTION_CLASS`.
+
+    The reviewed map wins over the worker-stamped label by design. The
+    ``action_class`` field arrives from the same worker whose conformance is
+    being judged, so honouring it first would let a drifting worker relabel its
+    own actions: a ``Bash`` call stamped ``git.commit`` would launder shell
+    execution past a capsule that never permitted it. The label is accepted only
+    where the reviewed map has nothing to say (custom or MCP tools), and even
+    then it can only ever name a class the capsule must already allow.
 
     Ticks, snapshots, and capsule-binding events carry no action class and
     return ``None`` so they never count as drift.
     """
-    explicit = event.get("action_class")
-    if isinstance(explicit, str) and explicit:
-        return explicit
     tool = event.get("tool")
     if isinstance(tool, str) and tool:
         mapped = _TOOL_TO_ACTION_CLASS.get(tool) or _TOOL_TO_ACTION_CLASS.get(tool.lower())
         if mapped:
             return mapped
+    explicit = event.get("action_class")
+    if isinstance(explicit, str) and explicit:
+        return explicit
     event_type = event.get("event")
     if isinstance(event_type, str) and event_type:
         return _EVENT_TO_ACTION_CLASS.get(event_type)
@@ -354,6 +384,20 @@ def capsule_path(sdd_dir: Path, task_id: str) -> Path:
     return sdd_dir / "intent" / "capsules" / f"{_safe_task_id(task_id)}.json"
 
 
+#: A run_id names exactly one journal directory and must be a single safe path
+#: segment. Mirrors the allowlist in ``core/replay/journal.py``: an anchored
+#: match then a return of the checked value, so no attacker-controlled character
+#: reaches the filesystem sink below.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _run_journal_path(sdd_dir: Path, run_id: str) -> Path:
+    """Return the journal path for ``run_id``, rejecting unsafe segments."""
+    if run_id in {".", ".."} or not _RUN_ID_RE.match(run_id):
+        raise IntentCapsuleError(f"unsafe run_id for journal path: {run_id!r}")
+    return sdd_dir / "runs" / run_id / "journal.jsonl"
+
+
 def write_capsule(sdd_dir: Path, capsule: IntentCapsule, *, run_id: str = "") -> Path:
     """Persist a capsule record (capsule + hash + run association) to disk."""
     path = capsule_path(sdd_dir, capsule.task_id)
@@ -524,6 +568,125 @@ def _assert_llm_free_runtime() -> None:
                 raise AssertionError(f"LLM module {name!r} is imported into the drift-decision module")
 
 
+@lru_cache(maxsize=512)
+def _compiled_glob(pattern: str) -> re.Pattern[str]:
+    """Compile one path glob to an anchored regex (cached, pure).
+
+    ``fnmatch`` is deliberately not used: its ``*`` also matches ``/``, so
+    ``src/*.py`` would accept ``src/nested/deep.py`` and silently widen the
+    approved scope. Here ``*`` and ``?`` stop at a separator, ``**`` spans them,
+    and everything else is escaped literally.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        char = pattern[i]
+        if char == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                # ``**/`` spans zero or more directories; a trailing ``**``
+                # spans the rest of the path.
+                if i + 2 < n and pattern[i + 2] == "/":
+                    out.append("(?:.*/)?")
+                    i += 3
+                    continue
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(char))
+        i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _normalise_path(raw: str) -> str:
+    """Return a comparable posix-style relative path for glob matching."""
+    text = raw.replace("\\", "/").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def path_in_scope(path: str, globs: tuple[str, ...]) -> bool:
+    """Return True when ``path`` matches at least one glob in ``globs``.
+
+    An empty ``globs`` declares no file scope and constrains nothing.
+    """
+    if not globs:
+        return True
+    candidate = _normalise_path(path)
+    return any(_compiled_glob(g).match(candidate) is not None for g in globs)
+
+
+def _event_paths(event: dict[str, Any]) -> list[str]:
+    """Return every path an event records, in deterministic probe order."""
+    found: list[str] = []
+    for key in _PATH_FIELDS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            found.append(value)
+    for key in _PATH_LIST_FIELDS:
+        value = event.get(key)
+        if isinstance(value, list):
+            found.extend(item for item in value if isinstance(item, str) and item)
+    return found
+
+
+def _event_adapter(event: dict[str, Any]) -> str:
+    for key in _ADAPTER_FIELDS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _event_timestamp(event: dict[str, Any]) -> int | None:
+    """Return the event's integer Unix timestamp, or ``None`` when absent.
+
+    Read off the journal row rather than a clock, so the verdict stays a pure
+    function of the journal bytes.
+    """
+    value = event.get("ts")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _divergence_reason(
+    event: dict[str, Any],
+    action_class: str,
+    capsule: IntentCapsule,
+    *,
+    policy: DriftPolicy,
+    allowed: set[str],
+    permitted_adapters: set[str],
+    egress_ok: bool,
+) -> str | None:
+    """Return the first constraint ``event`` violates, or ``None`` if conformant.
+
+    Checks run in a fixed order so one event yields at most one divergence and
+    ``verdict_hash`` stays stable across verifiers.
+    """
+    if action_class not in allowed:
+        return "action_class_not_permitted"
+    if policy.escalate_on_egress and action_class in _EXTERNAL_COMM_ACTION_CLASSES and not egress_ok:
+        return "egress_not_permitted"
+    timestamp = _event_timestamp(event)
+    if capsule.expiry_ts and timestamp is not None and timestamp > capsule.expiry_ts:
+        return "capsule_expired"
+    adapter = _event_adapter(event)
+    if permitted_adapters and adapter and adapter not in permitted_adapters:
+        return "adapter_not_permitted"
+    if action_class in _FILE_SCOPED_ACTION_CLASSES and any(
+        not path_in_scope(p, capsule.file_scope_globs) for p in _event_paths(event)
+    ):
+        return "file_scope_violation"
+    return None
+
+
 def evaluate_conformance(
     events: list[dict[str, Any]],
     capsule: IntentCapsule,
@@ -533,40 +696,59 @@ def evaluate_conformance(
     """Compare an observed journal against a capsule; return a pure verdict.
 
     Pure function of ``(events, capsule, policy)``: no clock, no socket, no
-    model. Every observed action class outside the capsule's allow-list (or
-    carrying egress the capsule did not permit) produces one :class:`Divergence`
-    at its step index. The verdict is conformant iff there are no divergences.
+    model. Every constraint the capsule declares is enforced here, because a
+    declared-but-unenforced scope is not a control:
+
+    * the observed action class must be in ``allowed_action_classes``;
+    * an action class carrying outbound communication requires
+      ``external_comm`` in ``egress_classes`` (when ``escalate_on_egress``);
+    * paths touched by a mutating file action must match ``file_scope_globs``;
+    * a recorded adapter must be in ``permitted_adapters``;
+    * an action's timestamp must not be past ``expiry_ts``;
+    * an event that maps to no action class is a divergence unless
+      ``allow_unclassified`` is set.
+
+    Each violated constraint produces one :class:`Divergence` at the event's step
+    index; the checks are ordered so the strongest signal is reported first and
+    one event yields at most one divergence, keeping ``verdict_hash`` stable.
+    The verdict is conformant iff there are no divergences.
     """
     _assert_llm_free_runtime()
     active = policy or DriftPolicy.default()
     allowed = set(capsule.allowed_action_classes)
+    permitted_adapters = set(capsule.permitted_adapters)
     egress_ok = "external_comm" in set(capsule.egress_classes)
 
     divergences: list[Divergence] = []
     for index, event in enumerate(events):
         action_class = classify_journal_event(event)
+
         if action_class is None:
-            continue
-        event_hash = str(event.get("event_hash", ""))
-        if action_class not in allowed:
-            divergences.append(
-                Divergence(
-                    step_index=index,
-                    event_hash=event_hash,
-                    action_class=action_class,
-                    reason="action_class_not_permitted",
-                )
+            if active.allow_unclassified or str(event.get("event", "")) in _STRUCTURAL_EVENTS:
+                continue
+            reason = "unclassified_event"
+            action_class = ""
+        else:
+            reason = _divergence_reason(
+                event,
+                action_class,
+                capsule,
+                policy=active,
+                allowed=allowed,
+                permitted_adapters=permitted_adapters,
+                egress_ok=egress_ok,
             )
-            continue
-        if active.escalate_on_egress and action_class in _EXTERNAL_COMM_ACTION_CLASSES and not egress_ok:
-            divergences.append(
-                Divergence(
-                    step_index=index,
-                    event_hash=event_hash,
-                    action_class=action_class,
-                    reason="egress_not_permitted",
-                )
+            if reason is None:
+                continue
+
+        divergences.append(
+            Divergence(
+                step_index=index,
+                event_hash=str(event.get("event_hash", "")),
+                action_class=action_class,
+                reason=reason,
             )
+        )
 
     ch = capsule_hash(capsule)
     verdict_hash = _sha256_ref(
@@ -715,6 +897,7 @@ def assemble_intent_drift_escalation(
     run_id: str,
     capsule: IntentCapsule,
     verdict: ConformanceVerdict,
+    policy: DriftPolicy | None = None,
     worker_id: str = "",
     session_id: str = "",
     worktree_id: str = "",
@@ -730,18 +913,48 @@ def assemble_intent_drift_escalation(
     ``bernstein escalation verify``. The ``extra_binding`` carries the capsule
     hash, the verdict hash, and the divergent events, so the receipt names
     exactly which capsule was violated and where.
+
+    The caller's ``verdict`` is treated as a claim, never as fact. The run
+    journal is loaded and its Merkle chain verified, the verdict is recomputed
+    from ``(journal, capsule, policy)``, and only that recomputed verdict is
+    signed. A signature is what makes a receipt evidence, so signing an
+    unchecked caller verdict would let any caller mint cryptographic proof of a
+    drift that never happened -- or of the wrong divergences.
+
+    Raises:
+        IntentCapsuleError: If the journal is missing or its chain diverges, if
+            the run is actually conformant, or if the supplied verdict does not
+            match the recomputed one.
     """
     from bernstein.core.orchestration.escalation import (
         DEFAULT_ESCALATION_WINDOW,
         assemble_escalation_receipt,
     )
     from bernstein.core.orchestration.supervisor_receipt import StallReason
+    from bernstein.core.replay.journal import load_events, verify_journal
+
+    journal_path = _run_journal_path(sdd_dir, run_id)
+    if not journal_path.exists():
+        raise IntentCapsuleError(f"run journal for {run_id!r} is missing; refusing to sign an unverifiable verdict")
+    jres = verify_journal(journal_path)
+    if not jres.ok:
+        detail = jres.errors[0] if jres.errors else "chain break"
+        raise IntentCapsuleError(f"run journal chain diverges ({detail}); refusing to sign a verdict over it")
+
+    recomputed = evaluate_conformance(load_events(journal_path), capsule, policy=policy)
+    if recomputed.conformant:
+        raise IntentCapsuleError("recomputed verdict is conformant; there is no drift to escalate")
+    if recomputed.verdict_hash != verdict.verdict_hash:
+        raise IntentCapsuleError(
+            "supplied verdict does not match the verdict recomputed from the journal "
+            f"({verdict.verdict_hash} != {recomputed.verdict_hash})"
+        )
 
     extra_binding = {
         "kind": "intent_drift",
         "capsule_hash": capsule_hash(capsule),
-        "verdict_hash": verdict.verdict_hash,
-        "divergent_events": [d.to_dict() for d in verdict.divergences],
+        "verdict_hash": recomputed.verdict_hash,
+        "divergent_events": [d.to_dict() for d in recomputed.divergences],
     }
     return assemble_escalation_receipt(
         sdd_dir=sdd_dir,
@@ -794,9 +1007,19 @@ def verify_intent_conformance(
     * the capsule loads and its recomputed hash matches the ``intent.capsule``
       entry recorded in the HMAC audit chain (a tampered capsule diverges here);
     * the audit chain itself verifies;
+    * the run the capsule governs is taken from the **signed** audit entry, and
+      an unsigned sidecar that names a different run is rejected as tampering;
     * the run journal's Merkle chain verifies (a reordered journal fails here);
+    * that journal carries exactly one ``intent.capsule_bound`` anchor for this
+      task and capsule hash;
     * the conformance verdict is recomputed as a pure function of the journal
       and the capsule.
+
+    The run_id deliberately comes from the chain rather than from the on-disk
+    capsule record. The sidecar is unsigned: were it authoritative, repointing
+    it at any clean run would launder a drifted run into a clean verdict, and
+    the capsule-bound anchor is what stops a clean journal from being replayed
+    under a capsule it never governed.
 
     ``ok`` is True only when the chain and journal verify and the run is
     conformant. A drifted-but-untampered run returns ``ok=False`` with
@@ -805,61 +1028,70 @@ def verify_intent_conformance(
     from bernstein.core.replay.journal import load_events, verify_journal
     from bernstein.core.security.audit_chain import EVENT_INTENT_CAPSULE
 
-    capsule, run_id = read_capsule_binding(sdd_dir, task_id)
+    capsule, sidecar_run_id = read_capsule_binding(sdd_dir, task_id)
     if capsule is None:
         return IntentVerifyResult(ok=False, conformant=False, reason="no intent capsule for task")
+
+    def _fail(reason: str, run_id: str = "") -> IntentVerifyResult:
+        return IntentVerifyResult(
+            ok=False,
+            conformant=False,
+            reason=reason,
+            capsule=capsule,
+            run_id=run_id,
+        )
 
     ok_chain, chain_errors = chain.verify()
     if not ok_chain:
         detail = chain_errors[0] if chain_errors else "chain break"
-        return IntentVerifyResult(
-            ok=False,
-            conformant=False,
-            reason=f"audit chain fails verification ({detail})",
-            capsule=capsule,
-            run_id=run_id,
-        )
+        return _fail(f"audit chain fails verification ({detail})", sidecar_run_id)
 
     recorded = [e for e in chain.query(event_type=EVENT_INTENT_CAPSULE) if e.details.get("task_id") == task_id]
     if not recorded:
-        return IntentVerifyResult(
-            ok=False,
-            conformant=False,
-            reason="capsule is not recorded in the audit chain",
-            capsule=capsule,
-            run_id=run_id,
-        )
+        return _fail("capsule is not recorded in the audit chain", sidecar_run_id)
+    entry = recorded[-1]
     recomputed = capsule_hash(capsule)
-    if str(recorded[-1].details.get("capsule_hash", "")) != recomputed:
-        return IntentVerifyResult(
-            ok=False,
-            conformant=False,
-            reason="capsule bytes do not match the audit-chain-recorded capsule hash (tampered)",
-            capsule=capsule,
-            run_id=run_id,
+    if str(entry.details.get("capsule_hash", "")) != recomputed:
+        return _fail("capsule bytes do not match the audit-chain-recorded capsule hash (tampered)", sidecar_run_id)
+
+    # The signed entry is the only authority on which run this capsule governs.
+    run_id = str(entry.details.get("run_id", ""))
+    if not run_id:
+        return _fail("audit-chain capsule entry records no run_id; cannot locate the run journal", sidecar_run_id)
+    if sidecar_run_id and sidecar_run_id != run_id:
+        return _fail(
+            f"capsule record run_id {sidecar_run_id!r} does not match the audit-chain-signed "
+            f"run_id {run_id!r} (tampered)",
+            run_id,
         )
 
-    journal_path = sdd_dir / "runs" / run_id / "journal.jsonl"
+    try:
+        journal_path = _run_journal_path(sdd_dir, run_id)
+    except IntentCapsuleError as exc:
+        return _fail(str(exc), run_id)
     if not journal_path.exists():
-        return IntentVerifyResult(
-            ok=False,
-            conformant=False,
-            reason=f"run journal for {run_id!r} is missing; cannot recompute conformance",
-            capsule=capsule,
-            run_id=run_id,
-        )
+        return _fail(f"run journal for {run_id!r} is missing; cannot recompute conformance", run_id)
     jres = verify_journal(journal_path)
     if not jres.ok:
         detail = jres.errors[0] if jres.errors else "chain break"
-        return IntentVerifyResult(
-            ok=False,
-            conformant=False,
-            reason=f"run journal chain diverges ({detail}); steps were reordered or tampered",
-            capsule=capsule,
-            run_id=run_id,
+        return _fail(f"run journal chain diverges ({detail}); steps were reordered or tampered", run_id)
+
+    events = load_events(journal_path)
+    anchors = [
+        e
+        for e in events
+        if str(e.get("event", "")) == CAPSULE_BOUND_EVENT
+        and str(e.get("task_id", "")) == task_id
+        and str(e.get("capsule_hash", "")) == recomputed
+    ]
+    if len(anchors) != 1:
+        return _fail(
+            f"run journal carries {len(anchors)} matching {CAPSULE_BOUND_EVENT} anchors for this capsule, "
+            f"expected exactly 1; the run is not attributable to the approved capsule",
+            run_id,
         )
 
-    verdict = evaluate_conformance(load_events(journal_path), capsule, policy=policy)
+    verdict = evaluate_conformance(events, capsule, policy=policy)
     if verdict.conformant:
         return IntentVerifyResult(
             ok=True,
@@ -903,6 +1135,7 @@ __all__ = [
     "compile_capsule",
     "evaluate_conformance",
     "iter_module_import_names",
+    "path_in_scope",
     "project_conformance_verdict",
     "read_capsule",
     "read_capsule_binding",
