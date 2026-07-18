@@ -658,7 +658,14 @@ def _event_timestamp(event: dict[str, Any]) -> int | None:
     """Return the event's integer Unix timestamp, or ``None`` when absent.
 
     Read off the journal row rather than a clock, so the verdict stays a pure
-    function of the journal bytes.
+    function of the journal bytes and two verifiers agree.
+
+    Scope note: ``ts`` sits outside the journal's hashed payload (a faithful
+    replay differs only in timing, so timestamps are excluded from the Merkle
+    chain). Expiry enforcement therefore catches a run that honestly overran its
+    capsule; it is not by itself a defence against an editor who rewrites
+    timestamps in place. The chain-anchored checks -- capsule hash, signed
+    run_id, and the capsule-bound anchor -- are what make tampering evident.
     """
     value = event.get("ts")
     if isinstance(value, bool) or not isinstance(value, (int, float)):

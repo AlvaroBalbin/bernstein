@@ -74,6 +74,13 @@ divergence list, so two verifiers on different machines recompute the
 byte-identical verdict offline. Timestamps are read off the journal rows rather
 than a clock, which keeps expiry enforcement deterministic.
 
+One scope note on expiry: a journal row's `ts` sits outside the hashed payload,
+because a faithful replay differs only in timing. Expiry enforcement therefore
+catches a run that honestly overran its capsule; it is not by itself a defence
+against an editor rewriting timestamps in place. The chain-anchored checks below
+(capsule hash, signed `run_id`, capsule-bound anchor) are what make tampering
+evident.
+
 Deterministic replay of a run re-derives the same drift decisions at the same
 step indices. No LLM call exists on the drift-decision path: a static import
 guard plus a test-suite runtime profiler assertion keep it that way.
