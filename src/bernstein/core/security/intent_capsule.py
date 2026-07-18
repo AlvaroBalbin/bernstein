@@ -289,6 +289,29 @@ class IntentCapsule:
     cost_envelope_ref: str
     expiry_ts: int
 
+    def __post_init__(self) -> None:
+        """Normalise field types so construction and reload agree byte for byte.
+
+        :meth:`from_dict` coerces every field on the way in (``int``, ``str``,
+        ``tuple``). Without the identical coercion here, an in-memory capsule
+        built from a caller's loosely-typed value canonicalises differently from
+        the same capsule reloaded from disk: a float ``expiry_ts`` of
+        ``1700000000.0`` hashes as ``1700000000.0`` in memory and as
+        ``1700000000`` after a round trip. Because verification compares a
+        recomputed hash against the persisted one, that asymmetry rejects an
+        honest capsule as "tampered or never approved". Type hints are not
+        enforced at runtime, and an upstream ``time.time() + ttl`` is a float,
+        so the normalisation has to be real rather than assumed.
+        """
+        object.__setattr__(self, "v", int(self.v))
+        object.__setattr__(self, "task_id", str(self.task_id))
+        object.__setattr__(self, "plan_id", str(self.plan_id))
+        object.__setattr__(self, "goal_digest", str(self.goal_digest))
+        object.__setattr__(self, "cost_envelope_ref", str(self.cost_envelope_ref))
+        object.__setattr__(self, "expiry_ts", int(self.expiry_ts))
+        for field_name in ("allowed_action_classes", "file_scope_globs", "permitted_adapters", "egress_classes"):
+            object.__setattr__(self, field_name, tuple(str(x) for x in getattr(self, field_name)))
+
     def to_canonical_dict(self) -> dict[str, Any]:
         """Return the JCS-canonical mapping (lists, sorted at compile time)."""
         return {

@@ -35,6 +35,7 @@ from bernstein.core.security.intent_capsule import (
     classify_journal_event,
     compile_capsule,
     evaluate_conformance,
+    read_capsule_binding,
     verify_intent_conformance,
 )
 from bernstein.core.tasks.models import TaskCostEstimate, TaskPlan
@@ -608,3 +609,98 @@ def test_escalation_recomputes_under_the_supplied_policy(tmp_path: Path) -> None
 
     assert receipt.extra_binding is not None
     assert receipt.extra_binding["verdict_hash"] == verdict.verdict_hash
+
+
+# ---------------------------------------------------------------------------
+# The recomputation must agree with what was actually persisted
+# ---------------------------------------------------------------------------
+
+
+def _approved_then_reloaded(tmp_path: Path, **overrides) -> tuple[IntentCapsule, IntentCapsule, str]:
+    """Approve through the production path, then read the capsule back off disk."""
+    from bernstein.core.security.audit_chain import EVENT_INTENT_CAPSULE
+
+    in_memory = _approve(tmp_path, **overrides)
+    from_disk, _ = read_capsule_binding(_sdd(tmp_path), _TASK_ID)
+    assert from_disk is not None
+    entries = [
+        e for e in _chain(tmp_path).query(event_type=EVENT_INTENT_CAPSULE) if e.details.get("task_id") == _TASK_ID
+    ]
+    return in_memory, from_disk, str(entries[-1].details["capsule_hash"])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({}, id="defaults"),
+        pytest.param({"expiry_ts": 0}, id="zero-expiry"),
+        pytest.param(
+            {"file_scope_globs": [], "permitted_adapters": [], "egress_classes": []},
+            id="empty-collections",
+        ),
+        pytest.param({"file_scope_globs": ["src/prix-cafe/**"]}, id="non-ascii-glob"),
+        pytest.param({"permitted_adapters": ["", "claude"]}, id="empty-string-entry"),
+        pytest.param({"expiry_ts": float(_FUTURE_EXPIRY)}, id="float-expiry"),
+    ],
+)
+def test_capsule_hash_survives_the_write_read_round_trip(tmp_path: Path, overrides: dict) -> None:
+    """A reloaded capsule must hash to the value the chain recorded.
+
+    Verification compares a hash recomputed from a capsule object against the
+    hash persisted in the chain, so any transformation between the in-memory
+    object and the stored bytes rejects an honest capsule as tampered.
+    ``from_dict`` coerces every field on read; the constructor has to apply the
+    same normalisation or the two disagree. A float ``expiry_ts`` -- what an
+    upstream ``time.time() + ttl`` produces, since type hints are not enforced
+    -- is the case that actually diverged.
+    """
+    in_memory, from_disk, chain_hash = _approved_then_reloaded(tmp_path, **overrides)
+
+    assert capsule_hash(in_memory) == chain_hash
+    assert capsule_hash(from_disk) == chain_hash
+    assert from_disk.to_dict() == in_memory.to_dict()
+
+
+def test_verify_accepts_an_honest_capsule_with_a_float_expiry(tmp_path: Path) -> None:
+    """End to end: the loosely-typed value must not read back as tampering."""
+    capsule = _approve(tmp_path, expiry_ts=float(_FUTURE_EXPIRY))
+    _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(capsule))
+
+    result = verify_intent_conformance(sdd_dir=_sdd(tmp_path), chain=_chain(tmp_path), task_id=_TASK_ID)
+
+    assert result.ok, result.reason
+
+
+def test_escalation_accepts_a_capsule_reloaded_from_disk(tmp_path: Path) -> None:
+    """The honest path must survive persistence, not just in-memory equality.
+
+    Escalating with the capsule object still in memory would hide any lossy
+    step between the object and the stored bytes, so this reloads it first.
+    """
+    _approve(tmp_path)
+    from_disk, sidecar_run_id = read_capsule_binding(_sdd(tmp_path), _TASK_ID)
+    assert from_disk is not None
+    journal = _journal(tmp_path, _RUN_ID, capsule_h=capsule_hash(from_disk), drift=True)
+    verdict = evaluate_conformance(load_events(journal.path), from_disk)
+
+    receipt = _escalate(tmp_path, from_disk, verdict, run_id=sidecar_run_id or _RUN_ID)
+
+    assert receipt.extra_binding is not None
+    assert receipt.extra_binding["capsule_hash"] == capsule_hash(from_disk)
+    assert [d["action_class"] for d in receipt.extra_binding["divergent_events"]] == ["web.fetch"]
+
+
+def test_divergence_set_is_stable_across_journal_reloads(tmp_path: Path) -> None:
+    """Ordering of the stored form and the recomputed form must not differ."""
+    capsule = _approve(tmp_path, allowed_action_classes=["fs.read"])
+    journal = EventJournal(_RUN_ID, _sdd(tmp_path))
+    bind_capsule_into_journal(journal, task_id=_TASK_ID, capsule_hash=capsule_hash(capsule))
+    for tool in ("WebFetch", "Bash", "git_push", "WebSearch"):
+        journal.record("tool.call", tool=tool)
+
+    first = evaluate_conformance(load_events(journal.path), capsule)
+    second = evaluate_conformance(load_events(journal.path), capsule)
+
+    assert len(first.divergences) == 4
+    assert first.verdict_hash == second.verdict_hash
+    assert [d.to_dict() for d in first.divergences] == [d.to_dict() for d in second.divergences]
