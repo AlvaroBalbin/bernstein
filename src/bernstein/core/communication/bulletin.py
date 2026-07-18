@@ -491,12 +491,59 @@ class BulletinBoard:
         Args:
             hook: Callable invoked with each stored message, or ``None`` to clear.
             outbox_path: Optional JSONL path. When set, every failed action is
-                durably appended there before the failure is raised, so the
-                pending action survives a crash and can be replayed by
+                durably appended there before the failure is raised, and any
+                actions already recorded there are loaded back into the pending
+                queue, so a pending action survives a crash and is replayed by
                 :meth:`retry_pending_actions`.
         """
         self._post_hook = hook
         self._outbox_path = outbox_path
+        if outbox_path is not None:
+            self._load_outbox(outbox_path)
+
+    def _load_outbox(self, path: Path) -> None:
+        """Hydrate the pending queue from a durable outbox file.
+
+        Without this the outbox would be write-only: a crash would leave the
+        failed action on disk with nothing ever reading it back (#2648).
+        """
+        if not path.is_file():
+            return
+        loaded: list[BulletinMessage] = []
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.exception("failed to read pending signal actions from %s", path)
+            return
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                loaded.append(BulletinMessage(**json.loads(line)))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.exception("skipping malformed pending signal action in %s", path)
+        if not loaded:
+            return
+        with self._lock:
+            known = {(m.agent_id, m.type, m.content, m.timestamp) for m in self._pending_actions}
+            self._pending_actions.extend(m for m in loaded if (m.agent_id, m.type, m.content, m.timestamp) not in known)
+
+    def _rewrite_outbox(self) -> None:
+        """Rewrite the outbox so drained entries are not replayed again."""
+        path = self._outbox_path
+        if path is None:
+            return
+        with self._lock:
+            remaining = self._pending_actions.copy()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                for msg in remaining:
+                    handle.write(json.dumps(asdict(msg), sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            logger.exception("failed to compact pending signal actions in %s", path)
 
     @property
     def pending_actions(self) -> list[BulletinMessage]:
@@ -546,6 +593,9 @@ class BulletinBoard:
             drained_ids = {id(m) for m in drained}
             with self._lock:
                 self._pending_actions[:] = [m for m in self._pending_actions if id(m) not in drained_ids]
+            # Compact the durable copy too, so a later load does not replay an
+            # action that already succeeded.
+            self._rewrite_outbox()
         return len(drained)
 
     def post(self, msg: BulletinMessage) -> BulletinMessage:

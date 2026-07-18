@@ -85,12 +85,12 @@ def test_concurrent_materialize_does_not_double_apply(tmp_path: Path) -> None:
     coord = ClearanceGateCoordinator(bulletin=board, injector=injector, chain=chain)
     blocker = board.post(_blocker())
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def run() -> None:
         try:
             coord.materialize(blocker)
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=run) for _ in range(2)]
@@ -267,27 +267,41 @@ def _materialize_on_cwd_chain() -> str:
 
 
 def test_verify_gates_rejects_tampered_audit_rows(isolated_audit: Path) -> None:
+    """The HMAC pre-check must be the reason a tampered chain is rejected.
+
+    The tamper is deliberately one the semantic gate replay cannot see: the
+    ``actor`` field is covered by the HMAC but by no gate invariant. A tamper
+    the replay already catches (for example editing ``injected_edges``, which
+    feeds ``graph_delta_hash``) would make this test pass with the production
+    change reverted, and so would prove nothing.
+    """
     from click.testing import CliRunner
 
     from bernstein.cli.commands.audit_cmd import audit_group
+    from bernstein.core.communication.signal_actions import verify_clearance_gates
+    from bernstein.core.security.audit import AuditLog
 
     _materialize_on_cwd_chain()
 
-    # Flip a recorded field without recomputing the HMAC: the semantic replay
-    # must never run on rows that fail the chain check.
     log_path = next(iter(sorted(AUDIT_DIR.glob("*.jsonl"))))
     rows = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
     for row in rows:
         if row.get("event_type") == EVENT_SIGNAL_GATE_PROJECTION:
-            row["details"]["injected_edges"] = []
+            row["actor"] = "mallory"
             break
     else:  # pragma: no cover - defensive
         pytest.fail("no gate projection row found")
     log_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
+    # Precondition: the semantic replay alone is blind to this tamper, so the
+    # HMAC pre-check is the only thing that can reject it.
+    assert verify_clearance_gates(AuditLog(AUDIT_DIR).query()).ok, (
+        "tamper is visible to the semantic replay, so this test would not exercise the HMAC gate"
+    )
+
     result = CliRunner().invoke(audit_group, ["verify-gates"])
     assert result.exit_code == 1, result.output
-    assert "FAILED" in result.output
+    assert "audit chain HMAC verification failed; gate replay not attempted" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -489,3 +503,201 @@ def test_observe_only_signals_are_unaffected_by_a_failing_hook(tmp_path: Path) -
     stored = board.post(BulletinMessage(agent_id="w", type="status", content="up", timestamp=1.0, cell_id="cell-a"))
     assert stored.type == "status"
     assert board.pending_actions == []
+
+
+# ---------------------------------------------------------------------------
+# Follow-up hardening: the gate index must not trust unauthenticated rows,
+# the saga must cover every sealing step, and the outbox must be readable.
+# ---------------------------------------------------------------------------
+
+
+def _audit_log_path(audit_dir: Path) -> Path:
+    return next(iter(sorted(audit_dir.glob("*.jsonl"))))
+
+
+def test_forged_pending_row_does_not_suppress_materialization(tmp_path: Path) -> None:
+    """An unsigned `pending` row must never stand in for a real gate receipt.
+
+    `AuditChainStore.query` performs no HMAC verification, so hydrating the
+    idempotency index straight from it would let anyone with write access to
+    the audit directory suppress gate materialization entirely.
+    """
+    from bernstein.core.communication.signal_actions import (
+        ClearanceChainUnverified,
+        clearance_task_id_for,
+        journal_prefix_hash,
+    )
+
+    board = BulletinBoard()
+    injector = InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x", "task-y"]})
+    chain = _chain(tmp_path)
+    coord = ClearanceGateCoordinator(bulletin=board, injector=injector, chain=chain)
+    posted = board.post(_blocker())
+
+    # Seed the chain so a log file exists, then forge a pending row for the
+    # gate this blocker would materialize.
+    chain.log(event_type="task.transition", actor="x", resource_type="task", resource_id="t1", details={})
+    cid = clearance_task_id_for(blocker=posted, journal_prefix_hash=journal_prefix_hash([posted]))
+    forged = {
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "event_type": EVENT_SIGNAL_GATE_PROJECTION,
+        "actor": "mallory",
+        "resource_type": "signal_gate_projection",
+        "resource_id": cid,
+        "details": {"clearance_task_id": cid, "resolution": "pending", "injected_edges": []},
+        "prev_hmac": "0" * 64,
+        "hmac": "deadbeef",
+    }
+    path = _audit_log_path(tmp_path / "audit")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(forged) + "\n")
+
+    # The coordinator must refuse rather than silently treat the blocker as
+    # already gated. Silently returning a spec with no injection is the failure.
+    with pytest.raises(ClearanceChainUnverified):
+        coord.materialize(posted)
+    assert injector.created == [], "a forged row caused the gate to be treated as materialized"
+
+
+def test_lineage_seal_failure_compensates_the_gate(tmp_path: Path) -> None:
+    """A failure in any sealing step must compensate the graph mutation."""
+    board = BulletinBoard()
+    injector = InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x", "task-y"]})
+
+    def exploding_seal(_spec: object, _resolution: str) -> str:
+        raise RuntimeError("lineage spine unavailable")
+
+    coord = ClearanceGateCoordinator(
+        bulletin=board, injector=injector, chain=_chain(tmp_path), lineage_seal=exploding_seal
+    )
+    with pytest.raises(RuntimeError, match="lineage spine unavailable"):
+        coord.materialize(board.post(_blocker()))
+
+    assert injector.released == ["clearance-" + injector.created[0].clearance_task_id[10:]], (
+        "a lineage-seal failure left the gate injected with no receipt and no compensation"
+    )
+
+
+def test_resolve_seals_the_receipt_before_releasing_the_gate(tmp_path: Path) -> None:
+    """A failed terminal append must not leave the gate released un-attested."""
+    board = BulletinBoard()
+    injector = InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]})
+    chain = _chain(tmp_path)
+    coord = ClearanceGateCoordinator(bulletin=board, injector=injector, chain=chain)
+    spec = coord.materialize(board.post(_blocker()))
+    assert spec is not None
+
+    def exploding_log(**_kwargs: object) -> None:
+        raise OSError("chain unavailable")
+
+    chain.log_with_prev_digest = exploding_log  # type: ignore[assignment,method-assign]
+    with pytest.raises(OSError, match="chain unavailable"):
+        coord.resolve(spec.clearance_task_id, resolver="operator:alex")
+
+    assert injector.released == [], "the gate was released before its terminal receipt was sealed"
+
+
+def test_project_gate_states_refuses_an_unanchored_resolution(tmp_path: Path) -> None:
+    """The read-side projection must agree with the verifier about open gates."""
+    from bernstein.core.communication.signal_actions import ClearanceStatus, project_gate_states
+
+    chain = _chain(tmp_path)
+    clearance_id, _hmac = _seal_gate(chain)
+    pending = chain.query(event_type=EVENT_SIGNAL_GATE_PROJECTION)[0].details
+    record_signal_gate_projection(
+        chain=chain,
+        blocker_content_hash=str(pending["blocker_content_hash"]),
+        clearance_task_id=clearance_id,
+        injected_edges=[str(e) for e in pending["injected_edges"]],
+        graph_delta_hash=str(pending["graph_delta_hash"]),
+        scope_cell_id=str(pending["scope_cell_id"]),
+        deadline=int(pending["deadline"] or 0),
+        resolution="cleared",
+        resolver="mallory",
+        blocker_entry_hash="0" * 64,
+    )
+
+    states = project_gate_states(chain.query(event_type=EVENT_SIGNAL_GATE_PROJECTION))
+    assert states[clearance_id].status is ClearanceStatus.PENDING, (
+        "the read-side projection closed a gate the verifier keeps open"
+    )
+
+
+def test_resolve_after_a_restart_seals_the_same_lineage_entry(tmp_path: Path) -> None:
+    """The sealed lineage entry must not depend on whether a restart happened."""
+
+    def seal(spec: ClearanceGateSpec, _resolution: str) -> str:
+        return spec.journal_prefix_hash
+
+    board = BulletinBoard()
+    chain = _chain(tmp_path)
+    coord = ClearanceGateCoordinator(
+        bulletin=board,
+        injector=InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]}),
+        chain=chain,
+        lineage_seal=seal,
+    )
+    spec = coord.materialize(board.post(_blocker()))
+    assert spec is not None
+
+    # Resolve through a fresh coordinator over the same chain (a restart).
+    restarted = ClearanceGateCoordinator(
+        bulletin=board,
+        injector=InMemoryClearanceInjector(open_by_cell={"cell-a": ["task-x"]}),
+        chain=AuditChainStore(tmp_path / "audit", key=b"k" * 32),
+        lineage_seal=seal,
+    )
+    event = restarted.resolve(spec.clearance_task_id, resolver="operator:alex")
+
+    assert event.details["journal_entry_hash"] == spec.journal_prefix_hash, (
+        "resolve after a restart sealed a different lineage entry than resolve in process"
+    )
+
+
+def test_outbox_replays_a_pending_action_after_a_restart(tmp_path: Path) -> None:
+    """A durable outbox must be readable, or it preserves nothing."""
+    outbox = tmp_path / "outbox.jsonl"
+
+    def failing_hook(_msg: BulletinMessage) -> None:
+        raise RuntimeError("materialization failed")
+
+    board = BulletinBoard()
+    board.set_post_hook(failing_hook, outbox_path=outbox)
+    with pytest.raises(SignalActionFailure):
+        board.post(_blocker())
+
+    # Restart: a fresh board pointed at the same outbox must see the pending
+    # action and be able to replay it.
+    seen: list[BulletinMessage] = []
+    restarted = BulletinBoard()
+    restarted.set_post_hook(seen.append, outbox_path=outbox)
+    assert len(restarted.pending_actions) == 1, "the outbox was never read back after a restart"
+    assert restarted.retry_pending_actions() == 1
+    assert len(seen) == 1
+    assert seen[0].content == "shared dep broke"
+    # A drained entry is compacted away, so a later loader cannot re-replay it.
+    assert restarted.pending_actions == []
+    assert outbox.read_text().strip() == "", "a drained outbox entry was never compacted"
+
+
+def test_tenant_mirror_failure_does_not_fail_a_committed_gate(tmp_path: Path) -> None:
+    """The secondary mirror must not report failure for a committed mutation."""
+    from bernstein.core.server import TaskCreate
+    from bernstein.core.tasks.task_store_core import TaskStore
+
+    async def scenario() -> tuple[bool, bool]:
+        store = TaskStore(tmp_path / "runtime" / "tasks.jsonl")
+        dep = await store.create(TaskCreate(title="dependent", description="d", role="backend", cell_id="cell-a"))
+
+        async def flaky(_record: object, _line: str) -> None:
+            raise OSError("tenant backlog unavailable")
+
+        store._append_tenant_backlog_record = flaky  # type: ignore[assignment,method-assign]
+        gate, edges = await store.create_gate_with_edges(
+            clearance_task_id="clearance-abc123", title="gate", role="clearance", cell_id="cell-a"
+        )
+        return gate.id in store._tasks, edges == [dep.id]
+
+    committed, edged = asyncio.run(scenario())
+    assert committed, "a committed gate was reported as failed because its mirror failed"
+    assert edged

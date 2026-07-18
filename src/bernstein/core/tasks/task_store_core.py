@@ -1201,9 +1201,18 @@ class TaskStore:
 
             # Mirror into the tenant backlog only after the primary journal
             # write committed, so a rolled-back gate never appears in the
-            # tenant view.
+            # tenant view. The mirror is a derived view: by this point the
+            # mutation is durable, so a mirror failure is logged rather than
+            # raised, which would report failure for a committed gate and
+            # strand it with no receipt.
             for record, line in zip(rows, lines, strict=True):
-                await self._append_tenant_backlog_record(record, line)
+                try:
+                    await self._append_tenant_backlog_record(record, line)
+                except Exception:
+                    logger.exception(
+                        "tenant backlog mirror failed for clearance gate %s; the gate is committed",
+                        clearance_task_id,
+                    )
 
         return gate, targets
 

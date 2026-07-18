@@ -2140,6 +2140,7 @@ class SignalGateProjectionDetails:
     last_state_hash: str
     journal_entry_hash: str
     blocker_entry_hash: str
+    journal_prefix_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2154,6 +2155,7 @@ class SignalGateProjectionDetails:
             "last_state_hash": self.last_state_hash,
             "journal_entry_hash": self.journal_entry_hash,
             "blocker_entry_hash": self.blocker_entry_hash,
+            "journal_prefix_hash": self.journal_prefix_hash,
         }
 
 
@@ -2171,6 +2173,7 @@ def record_signal_gate_projection(
     last_state_hash: str = "genesis",
     journal_entry_hash: str = "",
     blocker_entry_hash: str = "",
+    journal_prefix_hash: str = "",
     actor: str = "clearance_gate",
 ) -> AuditEvent:
     """Append a ``signal.gate_projection`` event into *chain* (#2556).
@@ -2207,6 +2210,12 @@ def record_signal_gate_projection(
             into; empty when no lineage sealer is wired.
         blocker_entry_hash: For a resolution entry, the HMAC of the
             materialization entry it clears; empty for the materialization entry.
+        journal_prefix_hash: Digest of the ordered bulletin journal prefix the
+            projection was computed against. Recorded so a replay after a
+            restart reconstructs the same spec the in-process path held, and
+            therefore seals the same lineage entry. Excluded from
+            ``graph_delta_hash``, so recording it does not change any existing
+            digest (#2648).
         actor: Recorded actor; defaults to ``"clearance_gate"``.
 
     Returns:
@@ -2232,6 +2241,7 @@ def record_signal_gate_projection(
         last_state_hash=last_state_hash,
         journal_entry_hash=journal_entry_hash,
         blocker_entry_hash=blocker_entry_hash,
+        journal_prefix_hash=journal_prefix_hash,
     ).to_dict()
     return chain.log_with_prev_digest(
         event_type=EVENT_SIGNAL_GATE_PROJECTION,
