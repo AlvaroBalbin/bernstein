@@ -78,12 +78,35 @@ def _activate(workdir: Path, allow_network: tuple[str, ...] = ()) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _uninstall_socket_guard() -> Any:
-    """The activation path installs the runtime socket guard; always remove it."""
-    from bernstein.core.security.socket_guard import uninstall_runtime_socket_guard
+def _restore_socket_guard() -> Any:
+    """Restore ``socket.socket`` exactly as this test found it.
 
-    yield
-    uninstall_runtime_socket_guard()
+    The activation path installs the runtime socket guard, which patches
+    ``socket.socket.connect`` on the class and stashes the pre-patch callable in
+    a class attribute. Calling ``uninstall_runtime_socket_guard()`` blindly is
+    not safe here: if a stale install flag is left over from an earlier module,
+    uninstall restores *that* module's captured connect over the one currently
+    installed, permanently swapping in a foreign patch. Snapshotting and
+    restoring the three pieces of state is exact and cannot leak either way.
+    """
+    import socket
+
+    from bernstein.core.security.socket_guard import _INSTALLED_FLAG, _ORIGINAL_FLAG
+
+    sentinel = object()
+    prior_connect = socket.socket.connect
+    prior_installed = getattr(socket.socket, _INSTALLED_FLAG, sentinel)
+    prior_original = getattr(socket.socket, _ORIGINAL_FLAG, sentinel)
+    try:
+        yield
+    finally:
+        socket.socket.connect = prior_connect  # type: ignore[method-assign]
+        for flag, value in ((_INSTALLED_FLAG, prior_installed), (_ORIGINAL_FLAG, prior_original)):
+            if value is sentinel:
+                if hasattr(socket.socket, flag):
+                    delattr(socket.socket, flag)
+            else:
+                setattr(socket.socket, flag, value)
 
 
 def _preflight(workdir: Path) -> None:
