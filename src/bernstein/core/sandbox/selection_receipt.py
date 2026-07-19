@@ -289,6 +289,12 @@ def build_selection_receipt(
         raise SelectionReceiptError("a selection receipt requires at least one candidate")
 
     ordered = sorted(candidates, key=lambda c: c.task_id)
+    ids = [c.task_id for c in ordered]
+    if not all(ids):
+        raise SelectionReceiptError("every candidate must have a non-empty task_id")
+    if len(set(ids)) != len(ids):
+        dupes = sorted({t for t in ids if ids.count(t) > 1})
+        raise SelectionReceiptError(f"candidate task_ids must be unique; duplicates: {dupes}")
     by_id = {c.task_id: c for c in ordered}
     winner = by_id.get(winner_task_id)
     if winner is None:
@@ -381,6 +387,15 @@ def verify_receipt(
         errors.append(
             f"keyid {got}... is not the trusted signer {expected_keyid[:16]}...",
         )
+
+    # Reject duplicate/empty candidate task_ids: _candidate_digest_map keys on
+    # task_id, so a deserialised receipt with a collision would otherwise pass
+    # loser/winner cross-checks while hiding a candidate's real terminal digest.
+    receipt_ids = [str(c.get("task_id", "")) for c in receipt.candidates]
+    if not all(receipt_ids):
+        errors.append("a candidate has an empty task_id")
+    if len(set(receipt_ids)) != len(receipt_ids):
+        errors.append("candidate task_ids are not unique")
 
     digest_by_id = _candidate_digest_map(receipt)
     if receipt.winner_task_id not in digest_by_id:

@@ -57,7 +57,7 @@ from bernstein.core.sandbox.selection_receipt import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterable, Iterator
     from pathlib import Path
 
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -156,6 +156,26 @@ def _profile_to_dict(profile: CriterionProfile) -> dict[str, Any]:
     }
 
 
+def _require_unique_task_ids(task_ids: Iterable[str]) -> None:
+    """Reject empty or duplicate candidate task ids.
+
+    ``task_id`` keys both the terminal-digest map and the receipt's candidate
+    map, so a collision would silently drop a candidate's terminal snapshot from
+    the signed receipt (and from ``snapshot_digests`` verification) - the race
+    the receipt attests could then no longer be reconstructed or attributed.
+    """
+    seen: set[str] = set()
+    dupes: set[str] = set()
+    for tid in task_ids:
+        if not tid:
+            raise ValueError("fork_race candidate task_ids must be non-empty")
+        if tid in seen:
+            dupes.add(tid)
+        seen.add(tid)
+    if dupes:
+        raise ValueError(f"fork_race candidate task_ids must be unique; duplicates: {sorted(dupes)}")
+
+
 async def fork_race(
     *,
     backend: ForkRaceBackend,
@@ -238,6 +258,11 @@ async def fork_race(
     # float sums) is identical across runs - not merely before serialising.
     ordered = sorted(outcomes, key=lambda pair: pair[0].task_id)
     results = [result for result, _ in ordered]
+
+    # Task ids must be unique and non-empty: terminal_by_id (and the receipt's
+    # candidate map) key on task_id, so a duplicate would silently collapse a
+    # candidate's terminal snapshot out of the signed attestation.
+    _require_unique_task_ids(result.task_id for result in results)
     terminal_by_id = {result.task_id: digest for result, digest in ordered}
 
     winner = select_winner(results, profile=ranking_profile)

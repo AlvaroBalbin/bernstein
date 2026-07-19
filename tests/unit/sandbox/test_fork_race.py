@@ -199,6 +199,28 @@ async def test_concurrent_fork_races_do_not_fork_audit_chain(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_fork_race_rejects_duplicate_task_ids(tmp_path: Path) -> None:
+    """Candidates that return a colliding task_id must be rejected, not silently
+    collapsed into one entry in the signed receipt."""
+    backend = _backend(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    base = await _base_snapshot(backend)
+
+    async def dup_candidate(session: object, index: int) -> CandidateResult:
+        await session.write(f"c{index}.txt", f"work-{index}".encode())  # type: ignore[attr-defined]
+        return CandidateResult(task_id="same-id", tests_passing=True)
+
+    with pytest.raises(ValueError, match="unique"):
+        await fork_race(
+            backend=backend,
+            base_snapshot_digest=base,
+            run_candidate=dup_candidate,
+            k=2,
+            signing_key=key,
+        )
+
+
+@pytest.mark.asyncio
 async def test_fork_race_rejects_zero_k(tmp_path: Path) -> None:
     backend = _backend(tmp_path)
     key = Ed25519PrivateKey.generate()

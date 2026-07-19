@@ -99,6 +99,40 @@ def test_verify_receipt_expected_keyid_tolerates_none_keyid() -> None:
     assert any("trusted signer" in e for e in result.errors)
 
 
+def test_build_rejects_duplicate_or_empty_task_ids() -> None:
+    """Duplicate/empty task_ids would collapse in the candidate map, dropping a
+    candidate's terminal snapshot from the signed receipt - reject at build."""
+    key = Ed25519PrivateKey.generate()
+    with pytest.raises(SelectionReceiptError, match="unique"):
+        build_selection_receipt(
+            base_snapshot_digest="a" * 64,
+            candidates=[_cand("dup", "b" * 64), _cand("dup", "c" * 64)],
+            winner_task_id="dup",
+            ranker_profile={"method": "topsis", "criteria": []},
+            public_key=key.public_key(),
+        )
+    with pytest.raises(SelectionReceiptError, match="non-empty"):
+        build_selection_receipt(
+            base_snapshot_digest="a" * 64,
+            candidates=[_cand("", "b" * 64)],
+            winner_task_id="",
+            ranker_profile={"method": "topsis", "criteria": []},
+            public_key=key.public_key(),
+        )
+
+
+def test_verify_rejects_duplicate_candidate_task_ids() -> None:
+    """A deserialised receipt whose candidate list has a collision must fail
+    verification rather than silently collapsing on the task_id map."""
+    key = Ed25519PrivateKey.generate()
+    signed = _build_signed(key)
+    tampered = receipt_to_dict(signed)
+    tampered["candidates"] = [dict(tampered["candidates"][0]), dict(tampered["candidates"][0])]
+    result = verify_receipt(receipt_from_dict(tampered))
+    assert not result.ok
+    assert any("not unique" in e for e in result.errors)
+
+
 def test_receipt_is_byte_identical_across_builds_with_same_key() -> None:
     key = Ed25519PrivateKey.generate()
     a = _build_signed(key)
