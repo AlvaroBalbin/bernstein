@@ -5382,6 +5382,20 @@ EVENT_SCHEDULE_COLLISION = "schedule.collision_receipt"
 #: the apply receipt binds the reviewed plan to the registry mutation.
 EVENT_RECIPE_FLEET_APPLY = "recipe.fleet_apply"
 
+#: An operator resolved a forked definition lineage by naming which successor
+#: of the contended predecessor the projection must follow. Nothing is
+#: deleted: the losing branch stays on the chain and in ``history``, and the
+#: resolution is itself an auditable receipt. This is the recovery path for a
+#: fork produced by a concurrent write, which fails closed everywhere else.
+EVENT_RECIPE_LINEAGE_RESOLVE = "recipe.lineage_resolve"
+
+#: A registered recipe actually submitted work. Written only after the task
+#: graph was handed to the dispatcher and the dispatcher returned identifiers
+#: for work the sink accepted, so the presence of this receipt is evidence
+#: that the fire happened; its absence means nothing was submitted. The
+#: identifiers ride in the entry so the claim is checkable, not just signed.
+EVENT_RECIPE_FIRE = "recipe.fire"
+
 #: Issue #2518 -- emitted once per sovereign-profile activation. The active
 #: residency posture (deny-all egress, offline catalog, local storage, strict
 #: EU residency, compliance pack, and the config-derived declared endpoints /
@@ -5554,6 +5568,102 @@ def record_schedule_collision(
             "running_fire_id": running_fire_id,
             "resume_from_checkpoint": resume_from_checkpoint,
             "warm_resume": warm_resume,
+        },
+    )
+
+
+def record_recipe_lineage_resolve(
+    *,
+    chain: AuditChainStore,
+    name: str,
+    predecessor: str,
+    chosen_receipt: str,
+    superseded_receipts: tuple[str, ...],
+    actor: str = "operator",
+) -> AuditEvent:
+    """Append a ``recipe.lineage_resolve`` event fixing a forked lineage (#2654).
+
+    A fork means one predecessor has two successors, so the projection cannot
+    honestly pick a branch and fails closed. On an append-only chain the fork
+    cannot be removed, so recovery is additive: the operator names the branch
+    to follow, and that decision is recorded rather than applied silently.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        name: Recipe name whose lineage is being resolved.
+        predecessor: Receipt hmac that has more than one successor (``""``
+            for a fork at genesis).
+        chosen_receipt: Successor hmac the projection must follow.
+        superseded_receipts: The other successors, recorded so the discarded
+            branch stays visible.
+        actor: Operator performing the resolution.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded.
+    """
+    return chain.log_with_prev_digest(
+        event_type=EVENT_RECIPE_LINEAGE_RESOLVE,
+        actor=actor,
+        resource_type="registered_recipe",
+        resource_id=name,
+        details={
+            "name": name,
+            "predecessor": predecessor,
+            "chosen_receipt": chosen_receipt,
+            "superseded_receipts": list(superseded_receipts),
+        },
+    )
+
+
+def record_recipe_fire(
+    *,
+    chain: AuditChainStore,
+    name: str,
+    recipe_hash: str,
+    fire_time: int,
+    projection_hash: str,
+    schedule_id: str,
+    submitted_ids: tuple[str, ...],
+    actor: str = "recipe_registry",
+) -> AuditEvent:
+    """Append a ``recipe.fire`` event for a fire that submitted work (#2654).
+
+    The caller appends this only after the dispatcher returned identifiers for
+    work the sink accepted, so the receipt is evidence that the fire ran
+    rather than an assertion about it. A fire whose submission failed appends
+    nothing and reports the failure to its caller instead.
+
+    The identifiers are recorded, not merely counted: a reader of the chain
+    can resolve each one and confirm the work exists, which is what separates
+    an auditable receipt from a signed claim.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        name: Operator-facing recipe name that fired.
+        recipe_hash: The live content-addressed definition identity.
+        fire_time: Unix epoch of the fire instant.
+        projection_hash: Deterministic fire-projection hash.
+        schedule_id: Content-derived id of the declared schedule that
+            triggered the fire, or ``""`` for a schedule-neutral manual fire.
+        submitted_ids: Identifiers of the work items the sink accepted.
+        actor: Recorded actor; defaults to ``"recipe_registry"``.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded.
+    """
+    return chain.log_with_prev_digest(
+        event_type=EVENT_RECIPE_FIRE,
+        actor=actor,
+        resource_type="registered_recipe",
+        resource_id=recipe_hash,
+        details={
+            "name": name,
+            "recipe_hash": recipe_hash,
+            "fire_time": fire_time,
+            "projection_hash": projection_hash,
+            "schedule_id": schedule_id,
+            "submitted": len(submitted_ids),
+            "submitted_ids": list(submitted_ids),
         },
     )
 
@@ -6699,7 +6809,9 @@ __all__ = [
     "EVENT_PROVENANCE_QUARANTINE",
     "EVENT_PROVENANCE_TAINT_DECISION",
     "EVENT_PROVIDER_STATE_MUTATION",
+    "EVENT_RECIPE_FIRE",
     "EVENT_RECIPE_FLEET_APPLY",
+    "EVENT_RECIPE_LINEAGE_RESOLVE",
     "EVENT_RECIPE_PAUSE",
     "EVENT_RECIPE_REGISTER",
     "EVENT_RECIPE_RESUME",
@@ -6811,7 +6923,9 @@ __all__ = [
     "record_process_reap_receipt",
     "record_provenance_quarantine",
     "record_provider_state_mutation",
+    "record_recipe_fire",
     "record_recipe_fleet_apply",
+    "record_recipe_lineage_resolve",
     "record_recipe_pause",
     "record_recipe_register",
     "record_recipe_rollback",
