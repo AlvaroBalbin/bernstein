@@ -241,10 +241,16 @@ def fork_race_cmd(
 
     cas = CASStore(cas_dir)
     # Validate the base digest through CAS *before* any side-effectful state:
-    # a malformed/unknown --base must fail without minting a signing key,
-    # creating the audit directory, or booting a candidate. (Also turns the
-    # otherwise-uncaught KeyError from resume() into a clean CLI error.)
-    if not cas.has(base_digest):
+    # a malformed or unknown --base must fail cleanly without minting a signing
+    # key, creating the audit directory, or booting a candidate. cas.has()
+    # raises ValueError on a non-hex/wrong-length digest and returns False on a
+    # well-formed-but-absent one; both become a clean CLI error here (and this
+    # also turns the otherwise-uncaught KeyError from resume() into one).
+    try:
+        base_present = cas.has(base_digest)
+    except ValueError as exc:
+        raise click.ClickException(f"invalid base snapshot digest {base_digest!r}: {exc}") from exc
+    if not base_present:
         raise click.ClickException(f"base snapshot digest not found in CAS ({cas_dir}): {base_digest}")
     backend = MicroVMSandboxBackend(cas=cas)
     signing_key = load_or_create_signing_key(key_path)
