@@ -468,7 +468,15 @@ class FirecrackerMonitor:
             "rather than silently degrading isolation.",
         )
 
-    async def exec(self, *args: object, **kwargs: object) -> ExecResult:
+    async def exec(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
+        stdin: bytes | None = None,
+    ) -> ExecResult:
         self._require_available()
         raise MicroVMUnavailableError("Firecracker guest exec path not provisioned on this host")
 

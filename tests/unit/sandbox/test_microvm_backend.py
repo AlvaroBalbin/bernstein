@@ -17,19 +17,22 @@ import pytest
 import pytest_asyncio
 
 from bernstein.core.persistence.cas_store import CASIntegrityError, CASStore
-from bernstein.core.sandbox.backend import SandboxCapability
+from bernstein.core.sandbox.backend import ExecResult, SandboxCapability
 from bernstein.core.sandbox.backends._vmmonitor import (
     FakeMonitor,
     MicroVMUnavailableError,
     canonical_workspace_image,
     extract_workspace_image,
 )
-from bernstein.core.sandbox.backends.microvm import MicroVMSandboxBackend
+from bernstein.core.sandbox.backends.microvm import (
+    MicroVMProvisioningError,
+    MicroVMSandboxBackend,
+)
 from bernstein.core.sandbox.conformance import SandboxBackendConformance
-from bernstein.core.sandbox.manifest import FileEntry, WorkspaceManifest
+from bernstein.core.sandbox.manifest import FileEntry, GitRepoEntry, WorkspaceManifest
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
     from pathlib import Path
 
 
@@ -52,8 +55,10 @@ class TestMicroVMConformance(SandboxBackendConformance):
         return WorkspaceManifest(root="/workspace", env={"LC_ALL": "C"}, timeout_seconds=60)
 
 
-def test_backend_declares_hardware_boundary_capabilities() -> None:
-    backend = MicroVMSandboxBackend()
+def test_backend_declares_hardware_boundary_capabilities(tmp_path: Path) -> None:
+    # Inject a tmp_path-rooted CAS so the test never creates a repo-local
+    # .sdd/cas directory as a side effect of constructing the backend.
+    backend = MicroVMSandboxBackend(cas=CASStore(tmp_path / "cas"))
     assert backend.capabilities == frozenset(
         {
             SandboxCapability.FILE_RW,
@@ -103,6 +108,80 @@ async def test_resume_unknown_digest_raises(tmp_path: Path) -> None:
     backend = _backend(tmp_path)
     with pytest.raises(KeyError):
         await backend.resume("0" * 64)
+
+
+class _CloneFailsMonitor:
+    """A VMMonitor stub whose ``git clone`` fails, to exercise create() cleanup.
+
+    Structurally satisfies the (runtime-checkable) ``VMMonitor`` protocol; only
+    the methods create() touches are meaningful. Records ``shutdown`` calls so a
+    test can assert the guest is always torn down on a provisioning failure.
+    """
+
+    def __init__(self, root: str) -> None:
+        self._root = root
+        self.shutdown_calls = 0
+
+    @property
+    def workdir(self) -> str:
+        return self._root
+
+    async def boot(self, *, base_env: Mapping[str, str]) -> None:
+        return None
+
+    async def exec(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
+        stdin: bytes | None = None,
+    ) -> ExecResult:
+        return ExecResult(exit_code=1, stdout=b"", stderr=b"fatal: repo not found", duration_seconds=0.0)
+
+    async def write_file(self, path: str, data: bytes, *, mode: int = 0o644) -> None:
+        return None
+
+    async def read_file(self, path: str) -> bytes:
+        return b""
+
+    async def ls(self, path: str) -> list[str]:
+        return []
+
+    async def freeze_image(self) -> bytes:
+        return b""
+
+    async def restore_image(self, image: bytes) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_create_tears_down_guest_when_clone_fails(tmp_path: Path) -> None:
+    """A non-zero ``git clone`` fails loudly and never leaks the booted monitor."""
+    monitors: list[_CloneFailsMonitor] = []
+
+    def factory(root: str) -> _CloneFailsMonitor:
+        monitor = _CloneFailsMonitor(root)
+        monitors.append(monitor)
+        return monitor
+
+    backend = MicroVMSandboxBackend(monitor_factory=factory, cas=CASStore(tmp_path / "cas"))
+    manifest = WorkspaceManifest(
+        root="/workspace",
+        repo=GitRepoEntry(src_path=str(tmp_path / "missing-repo"), branch="main"),
+    )
+
+    with pytest.raises(MicroVMProvisioningError):
+        await backend.create(manifest)
+
+    assert monitors, "monitor factory was never invoked"
+    assert monitors[0].shutdown_calls == 1
+    # A failed create must not register a session in the tracking table.
+    assert backend._sessions == {}
 
 
 @pytest.mark.asyncio

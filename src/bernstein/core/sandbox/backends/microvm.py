@@ -46,6 +46,7 @@ error on an unsupported host instead of a surprise worktree.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,9 +72,30 @@ if TYPE_CHECKING:
 _DEFAULT_CAS_DIR = Path(".sdd/cas")
 
 
+class MicroVMProvisioningError(RuntimeError):
+    """Raised when a booted guest cannot be provisioned into a usable state.
+
+    Distinct from
+    :class:`~bernstein.core.sandbox.backends._vmmonitor.MicroVMUnavailableError`
+    (the *host* cannot run a microVM at all): here the guest booted but a
+    provisioning step - a ``git clone``/``checkout`` returning non-zero, a
+    file write failing - left the workspace invalid. The guest is always torn
+    down before this propagates, so a failed :meth:`MicroVMSandboxBackend.create`
+    never leaks a running monitor.
+    """
+
+
 def _default_monitor_factory(root: str) -> VMMonitor:
     """Production factory: a real Firecracker monitor (preflighted on boot)."""
     return FirecrackerMonitor(root=root)
+
+
+def _require_ok(result: ExecResult, what: str, session_id: str) -> None:
+    """Raise :class:`MicroVMProvisioningError` when a provisioning step failed."""
+    if result.exit_code != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        msg = f"{what} failed (exit {result.exit_code}) provisioning microVM session {session_id!r}: {stderr}"
+        raise MicroVMProvisioningError(msg)
 
 
 class MicroVMSandboxSession(SandboxSession):
@@ -207,15 +229,26 @@ class MicroVMSandboxBackend:
         monitor = self._monitor_factory(manifest.root)
         await monitor.boot(base_env=manifest.env)
 
-        if manifest.repo is not None:
-            repo = manifest.repo
-            await monitor.exec(
-                ["git", "clone", "--no-hardlinks", "--quiet", repo.src_path, "."],
-            )
-            await monitor.exec(["git", "checkout", "--quiet", repo.branch])
+        # Any post-boot provisioning failure must tear the guest down - a
+        # half-provisioned monitor left running is a resource leak, and a
+        # silently-ignored non-zero git exit would hand back a session over an
+        # invalid repository. BaseException so a cancellation also cleans up.
+        try:
+            if manifest.repo is not None:
+                repo = manifest.repo
+                clone = await monitor.exec(
+                    ["git", "clone", "--no-hardlinks", "--quiet", repo.src_path, "."],
+                )
+                _require_ok(clone, f"git clone {repo.src_path!r}", session_id)
+                checkout = await monitor.exec(["git", "checkout", "--quiet", repo.branch])
+                _require_ok(checkout, f"git checkout {repo.branch!r}", session_id)
 
-        for entry in manifest.files:
-            await monitor.write_file(entry.path, entry.content, mode=entry.mode)
+            for entry in manifest.files:
+                await monitor.write_file(entry.path, entry.content, mode=entry.mode)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await monitor.shutdown()
+            raise
 
         session = MicroVMSandboxSession(
             session_id=session_id,
@@ -245,7 +278,14 @@ class MicroVMSandboxBackend:
 
         monitor = self._monitor_factory("/workspace")
         await monitor.boot(base_env={})
-        await monitor.restore_image(image)
+        # A restore that raises (e.g. an unsafe member in the image) must not
+        # leave the just-booted guest running.
+        try:
+            await monitor.restore_image(image)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await monitor.shutdown()
+            raise
 
         session_id = f"microvm-resume-{snapshot_id[:12]}-{uuid.uuid4().hex[:8]}"
         session = MicroVMSandboxSession(
@@ -263,6 +303,7 @@ class MicroVMSandboxBackend:
 
 
 __all__ = [
+    "MicroVMProvisioningError",
     "MicroVMSandboxBackend",
     "MicroVMSandboxSession",
 ]

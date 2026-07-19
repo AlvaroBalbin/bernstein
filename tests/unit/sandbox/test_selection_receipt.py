@@ -16,6 +16,7 @@ from bernstein.core.sandbox.selection_receipt import (
     SelectionReceiptError,
     build_selection_receipt,
     canonical_receipt_bytes,
+    keyid_for,
     load_or_create_signing_key,
     read_receipt_file,
     receipt_from_dict,
@@ -64,6 +65,26 @@ def test_signed_receipt_verifies() -> None:
     signed = _build_signed(key)
     result = verify_receipt(signed)
     assert result.ok, result.errors
+
+
+def test_verify_receipt_expected_keyid_binds_to_trusted_signer() -> None:
+    """``expected_keyid`` rejects a validly-signed, self-consistent receipt
+    that was signed by anyone other than the named trusted signer."""
+    key = Ed25519PrivateKey.generate()
+    signed = _build_signed(key)
+
+    # The correct trusted keyid still accepts.
+    assert verify_receipt(signed, expected_keyid=signed.keyid).ok
+
+    # A receipt re-signed under a *different* key is self-consistent (its own
+    # keyid matches its own embedded key) yet must be rejected against the
+    # trusted keyid - this is the attack the check closes.
+    attacker = Ed25519PrivateKey.generate()
+    forged = _build_signed(attacker)
+    assert verify_receipt(forged).ok  # self-consistent on its own
+    result = verify_receipt(forged, expected_keyid=keyid_for(key.public_key()))
+    assert not result.ok
+    assert any("trusted signer" in e for e in result.errors)
 
 
 def test_receipt_is_byte_identical_across_builds_with_same_key() -> None:

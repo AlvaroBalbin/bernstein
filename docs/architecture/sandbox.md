@@ -11,7 +11,7 @@ This document covers:
 
 - The `SandboxBackend` / `SandboxSession` protocol and the
   `WorkspaceManifest` / `SandboxCapability` value objects
-- The eight first-party backends (`worktree`, `docker`, `e2b`, `modal`, `daytona`, `blaxel`, `runloop`, `vercel`)
+- The nine first-party backends (`worktree`, `docker`, `e2b`, `modal`, `daytona`, `blaxel`, `runloop`, `vercel`, `microvm`)
 - The `bernstein.sandbox_backends` entry-point group for third-party
   backends
 
@@ -109,7 +109,7 @@ work.
   `docker` provides cgroup + namespace isolation but shares the
   kernel; `e2b` runs in a fresh Firecracker microVM per session;
   `modal` runs in dedicated serverless containers.
-- **Capabilities.** `e2b`, `modal`, `daytona`, `runloop`, and `vercel` support snapshot/resume (as does the local `worktree`);
+- **Capabilities.** `e2b`, `modal`, `daytona`, `runloop`, `vercel`, and `microvm` support snapshot/resume (as does the local `worktree`);
   only `modal` exposes GPU today.
 - **Supported exec semantics.** All four backends handle argv-based
   exec with exit-code, stdout, and stderr capture.

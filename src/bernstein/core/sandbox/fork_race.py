@@ -200,8 +200,19 @@ async def fork_race(
         return result, terminal_digest
 
     # Race the candidates concurrently; the barrier here is intentional -
-    # ranking and the single audit append need the full result set.
-    outcomes = await asyncio.gather(*[_one(i) for i in range(k)])
+    # ranking and the single audit append need the full result set. If any
+    # candidate raises, gather surfaces the first error but leaves its siblings
+    # running in the (persistent) event loop - explicitly cancel and drain them
+    # so no in-flight candidate outlives the race and every _one finally-block
+    # (which destroys its session) still runs.
+    tasks = [asyncio.ensure_future(_one(i)) for i in range(k)]
+    try:
+        outcomes = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     # D2: fix candidate order BEFORE ranking so the TOPSIS matrix (and its
     # float sums) is identical across runs - not merely before serialising.

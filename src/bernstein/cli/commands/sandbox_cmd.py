@@ -240,6 +240,12 @@ def fork_race_cmd(
     from bernstein.core.security.audit import AuditLog
 
     cas = CASStore(cas_dir)
+    # Validate the base digest through CAS *before* any side-effectful state:
+    # a malformed/unknown --base must fail without minting a signing key,
+    # creating the audit directory, or booting a candidate. (Also turns the
+    # otherwise-uncaught KeyError from resume() into a clean CLI error.)
+    if not cas.has(base_digest):
+        raise click.ClickException(f"base snapshot digest not found in CAS ({cas_dir}): {base_digest}")
     backend = MicroVMSandboxBackend(cas=cas)
     signing_key = load_or_create_signing_key(key_path)
     audit_log = AuditLog(audit_dir)
@@ -285,13 +291,25 @@ def receipt_group() -> None:
     type=click.Path(file_okay=False, path_type=Path),
     show_default=True,
 )
-def receipt_verify_cmd(receipt_path: Path, cas_dir: Path) -> None:
+@click.option(
+    "--expected-keyid",
+    "expected_keyid",
+    default=None,
+    help=(
+        "Require the receipt to be signed by this trusted keyid (sha256 of the "
+        "signer's DER public key). Without it, any self-consistent receipt "
+        "verifies - including one re-signed under an attacker's own key."
+    ),
+)
+def receipt_verify_cmd(receipt_path: Path, cas_dir: Path, expected_keyid: str | None) -> None:
     """Verify a receipt's signature and re-hash every snapshot blob in CAS.
 
     Proves the receipt is *properly signed and internally consistent* and
     that every snapshot it names (base + winner + every loser) still exists
-    and re-hashes correctly in CAS. It does NOT prove the receipt was
-    appended to the audit chain - that is the audit log's own ``verify``.
+    and re-hashes correctly in CAS. With ``--expected-keyid`` it additionally
+    proves the receipt was signed by that trusted signer. It does NOT prove
+    the receipt was appended to the audit chain - that is the audit log's own
+    ``verify``.
     """
     from bernstein.core.persistence.cas_store import CASIntegrityError, CASStore
     from bernstein.core.sandbox.selection_receipt import (
@@ -304,7 +322,7 @@ def receipt_verify_cmd(receipt_path: Path, cas_dir: Path) -> None:
     if receipt is None:
         raise click.ClickException(f"Could not read a selection receipt from {receipt_path}")
 
-    verification = verify_receipt(receipt)
+    verification = verify_receipt(receipt, expected_keyid=expected_keyid)
     for err in verification.errors:
         console.print(f"[red]signature/consistency:[/red] {err}")
 

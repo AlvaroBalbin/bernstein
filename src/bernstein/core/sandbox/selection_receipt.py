@@ -50,7 +50,7 @@ import base64
 import binascii
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from cryptography.exceptions import InvalidSignature
@@ -314,37 +314,16 @@ def build_selection_receipt(
 
 
 def _with_digest(receipt: SelectionReceipt, digest: str) -> SelectionReceipt:
-    return SelectionReceipt(
-        schema_version=receipt.schema_version,
-        base_snapshot_digest=receipt.base_snapshot_digest,
-        candidates=receipt.candidates,
-        winner_task_id=receipt.winner_task_id,
-        winner_snapshot_digest=receipt.winner_snapshot_digest,
-        ranker_profile=receipt.ranker_profile,
-        loser_snapshot_digests=receipt.loser_snapshot_digests,
-        public_key_pem=receipt.public_key_pem,
-        keyid=receipt.keyid,
-        payload_digest=digest,
-        signature_b64=receipt.signature_b64,
-    )
+    # replace() copies every other field verbatim, so a newly-added field can
+    # never be silently dropped from the signing path (the risk of hand-listing
+    # each field in a security-sensitive dataclass).
+    return replace(receipt, payload_digest=digest)
 
 
 def sign_receipt(receipt: SelectionReceipt, *, private_key: Ed25519PrivateKey) -> SelectionReceipt:
     """Attach an Ed25519 signature. Ed25519 is deterministic (RFC 8032)."""
     sig = private_key.sign(canonical_receipt_bytes(receipt))
-    return SelectionReceipt(
-        schema_version=receipt.schema_version,
-        base_snapshot_digest=receipt.base_snapshot_digest,
-        candidates=receipt.candidates,
-        winner_task_id=receipt.winner_task_id,
-        winner_snapshot_digest=receipt.winner_snapshot_digest,
-        ranker_profile=receipt.ranker_profile,
-        loser_snapshot_digests=receipt.loser_snapshot_digests,
-        public_key_pem=receipt.public_key_pem,
-        keyid=receipt.keyid,
-        payload_digest=receipt.payload_digest,
-        signature_b64=base64.b64encode(sig).decode("ascii"),
-    )
+    return replace(receipt, signature_b64=base64.b64encode(sig).decode("ascii"))
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +339,11 @@ def _candidate_digest_map(receipt: SelectionReceipt) -> dict[str, str]:
     return out
 
 
-def verify_receipt(receipt: SelectionReceipt) -> ReceiptVerification:
+def verify_receipt(
+    receipt: SelectionReceipt,
+    *,
+    expected_keyid: str | None = None,
+) -> ReceiptVerification:
     """Verify a receipt offline using nothing but the receipt itself.
 
     Checks, in order: payload-digest recomputation, winner presence +
@@ -369,6 +352,18 @@ def verify_receipt(receipt: SelectionReceipt) -> ReceiptVerification:
     the signed body trips at least one check. CAS blob existence/integrity
     is intentionally *not* checked here - that needs the store and is the
     ``sandbox receipt verify`` CLI's job.
+
+    Args:
+        receipt: The receipt to verify.
+        expected_keyid: When supplied, the receipt must have been signed by
+            exactly this trusted signer (its ``keyid`` must equal this value).
+            A self-consistent receipt only proves it was signed by *the key it
+            carries*; without this an attacker can re-sign a forged body under
+            their own key and it still verifies. Pass the trusted signer's
+            keyid to bind acceptance to a known key (mirrors
+            :func:`bernstein.core.sandbox.pool_enrolment.verify_claim_receipt`'s
+            ``enrolled_keyid``). ``None`` preserves the self-consistency-only
+            behaviour.
     """
     errors: list[str] = []
 
@@ -376,6 +371,11 @@ def verify_receipt(receipt: SelectionReceipt) -> ReceiptVerification:
     if expected_digest != receipt.payload_digest:
         errors.append(
             f"payload_digest mismatch (expected {expected_digest[:16]}..., got {receipt.payload_digest[:16]}...)",
+        )
+
+    if expected_keyid is not None and receipt.keyid != expected_keyid:
+        errors.append(
+            f"keyid {receipt.keyid[:16]}... is not the trusted signer {expected_keyid[:16]}...",
         )
 
     digest_by_id = _candidate_digest_map(receipt)
