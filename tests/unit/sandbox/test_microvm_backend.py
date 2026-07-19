@@ -255,6 +255,25 @@ def test_extract_rejects_symlink_then_child_traversal(tmp_path: Path) -> None:
     assert not (outside / "pwned.txt").exists()
 
 
+def test_extract_refuses_on_unpatched_cpython(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Extraction is refused when the tarfile 'data' filter predates its CVE fix.
+
+    The ``data`` filter is the only defence for an untrusted guest image, so on
+    a build where it can be bypassed the backend must refuse rather than extract
+    behind a broken guarantee.
+    """
+    from bernstein.core.sandbox.backends import _vmmonitor
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_bytes(b"hi")
+    image = canonical_workspace_image(src)
+
+    monkeypatch.setattr(_vmmonitor, "_tarfile_data_filter_is_patched", lambda: False)
+    with pytest.raises(MicroVMUnavailableError, match="CVE-2025-4517"):
+        extract_workspace_image(image, tmp_path / "dest-unpatched")
+
+
 def test_extract_rejects_absolute_symlink(tmp_path: Path) -> None:
     """A symlink whose target is an absolute path outside root is refused."""
     import io

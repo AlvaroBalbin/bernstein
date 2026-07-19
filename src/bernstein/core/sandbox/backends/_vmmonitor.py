@@ -71,6 +71,26 @@ class MicroVMUnavailableError(RuntimeError):
 SNAPSHOT_CONTENT_TYPE = "application/x-bernstein-vm-snapshot+tar"
 
 
+def _tarfile_data_filter_is_patched() -> bool:
+    """Whether this interpreter's tarfile ``data`` filter includes the June-2025 fix.
+
+    The stdlib ``data`` filter (:func:`extract_workspace_image`'s only defence
+    against a hostile image) had a family of extraction-escape bypasses
+    (CVE-2024-12718 / CVE-2025-4138 / CVE-2025-4330 / CVE-2025-4435 /
+    CVE-2025-4517) fixed in CPython 3.12.11, 3.13.4, and every 3.14+ release.
+    On an unpatched build the filter can be circumvented, so relying on it there
+    is a false sense of safety. The project floor is ``>=3.12``, which still
+    admits vulnerable 3.12.0-3.12.10 / 3.13.0-3.13.3 builds - hence this
+    runtime check rather than a project-wide ``requires-python`` bump.
+    """
+    v = sys.version_info
+    if v[:2] == (3, 12):
+        return v >= (3, 12, 11)
+    if v[:2] == (3, 13):
+        return v >= (3, 13, 4)
+    return v >= (3, 14)
+
+
 def canonical_workspace_image(root: Path) -> bytes:
     """Freeze the directory tree at *root* into deterministic tar bytes.
 
@@ -166,6 +186,19 @@ def extract_workspace_image(image: bytes, root: Path) -> None:
                 child.unlink()
     else:
         root.mkdir(parents=True, exist_ok=True)
+
+    # The stdlib ``data`` filter is the *only* thing standing between this
+    # untrusted, guest-derived image and an extraction escape. On a CPython
+    # build predating the CVE-2025-4517-family fix that filter can be bypassed,
+    # so refuse rather than extract behind a defence that does not hold.
+    if not _tarfile_data_filter_is_patched():
+        version = ".".join(str(part) for part in sys.version_info[:3])
+        msg = (
+            f"Refusing to extract an untrusted snapshot image on CPython {version}: "
+            "its tarfile 'data' filter predates the CVE-2025-4517-family fix "
+            "(upgrade to >=3.12.11 / >=3.13.4)."
+        )
+        raise MicroVMUnavailableError(msg)
 
     # The stdlib ``data`` filter (PEP 706, py3.12+) does the right
     # member-by-member checks *at extraction time*: it refuses absolute paths,
