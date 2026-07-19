@@ -247,20 +247,31 @@ async def fork_race(
     if audit_log is not None:
         from bernstein.core.sandbox.selection_receipt import receipt_to_dict
 
-        with _cross_process_audit_lock(audit_lock_path):
-            audit_log.log(
-                FORK_RACE_EVENT_TYPE,
-                actor,
-                "sandbox_selection_receipt",
-                signed.payload_digest,
-                {
-                    "base_snapshot_digest": signed.base_snapshot_digest,
-                    "winner_task_id": signed.winner_task_id,
-                    "winner_snapshot_digest": signed.winner_snapshot_digest,
-                    "keyid": signed.keyid,
-                    "receipt": receipt_to_dict(signed),
-                },
-            )
+        # The cross-process flock can block on contention from another fork-race
+        # process, and audit_log.log does a synchronous file write - both would
+        # stall the caller's event loop (fork_race is a library coroutine that
+        # may be awaited alongside other tasks). Offload the lock+append to a
+        # worker thread. It is still awaited before returning, so the crash-safe
+        # ordering (CAS blobs -> sign -> audit -> receipt file) holds, and lock
+        # and append stay together in one call, so the chain's prev_hmac is
+        # still written under exclusive serialisation.
+        def _append() -> None:
+            with _cross_process_audit_lock(audit_lock_path):
+                audit_log.log(
+                    FORK_RACE_EVENT_TYPE,
+                    actor,
+                    "sandbox_selection_receipt",
+                    signed.payload_digest,
+                    {
+                        "base_snapshot_digest": signed.base_snapshot_digest,
+                        "winner_task_id": signed.winner_task_id,
+                        "winner_snapshot_digest": signed.winner_snapshot_digest,
+                        "keyid": signed.keyid,
+                        "receipt": receipt_to_dict(signed),
+                    },
+                )
+
+        await asyncio.to_thread(_append)
 
     return signed
 

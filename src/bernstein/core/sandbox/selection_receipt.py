@@ -374,8 +374,12 @@ def verify_receipt(
         )
 
     if expected_keyid is not None and receipt.keyid != expected_keyid:
+        # receipt.keyid is typed str but a hand-built/deserialised receipt could
+        # carry None; guard the slice so verification reports a mismatch rather
+        # than raising TypeError.
+        got = (receipt.keyid or "")[:16]
         errors.append(
-            f"keyid {receipt.keyid[:16]}... is not the trusted signer {expected_keyid[:16]}...",
+            f"keyid {got}... is not the trusted signer {expected_keyid[:16]}...",
         )
 
     digest_by_id = _candidate_digest_map(receipt)

@@ -274,6 +274,56 @@ def test_extract_refuses_on_unpatched_cpython(tmp_path: Path, monkeypatch: pytes
         extract_workspace_image(image, tmp_path / "dest-unpatched")
 
 
+def test_extract_guard_runs_before_clearing_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """On an unpatched interpreter the refusal fires before *root* is emptied.
+
+    A doomed extraction must never destroy an already-populated destination -
+    the guard is checked before any filesystem mutation.
+    """
+    from bernstein.core.sandbox.backends import _vmmonitor
+
+    dest = tmp_path / "populated"
+    dest.mkdir()
+    (dest / "keep.txt").write_bytes(b"precious")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_bytes(b"hi")
+    image = canonical_workspace_image(src)
+
+    monkeypatch.setattr(_vmmonitor, "_tarfile_data_filter_is_patched", lambda: False)
+    with pytest.raises(MicroVMUnavailableError, match="CVE-2025-4517"):
+        extract_workspace_image(image, dest)
+    assert (dest / "keep.txt").read_bytes() == b"precious"
+
+
+@pytest.mark.raw_tarfile_filter
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ((3, 11, 13, "final", 0), False),  # below the >=3.12 project floor -> refuse
+        ((3, 12, 10, "final", 0), False),
+        ((3, 12, 11, "final", 0), True),
+        ((3, 13, 3, "final", 0), False),
+        ((3, 13, 4, "final", 0), True),
+        ((3, 14, 0, "alpha", 7), False),  # 3.14 fix did not land until b3
+        ((3, 14, 0, "beta", 2), False),
+        ((3, 14, 0, "beta", 3), True),
+        ((3, 14, 0, "final", 0), True),
+        ((3, 15, 0, "final", 0), True),
+    ],
+)
+def test_tarfile_data_filter_version_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int | str, ...],
+    expected: bool,
+) -> None:
+    from bernstein.core.sandbox.backends import _vmmonitor
+
+    monkeypatch.setattr(_vmmonitor.sys, "version_info", version)
+    assert _vmmonitor._tarfile_data_filter_is_patched() is expected
+
+
 def test_extract_rejects_absolute_symlink(tmp_path: Path) -> None:
     """A symlink whose target is an absolute path outside root is refused."""
     import io

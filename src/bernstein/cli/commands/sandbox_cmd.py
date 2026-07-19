@@ -252,7 +252,6 @@ def fork_race_cmd(
         raise click.ClickException(f"invalid base snapshot digest {base_digest!r}: {exc}") from exc
     if not base_present:
         raise click.ClickException(f"base snapshot digest not found in CAS ({cas_dir}): {base_digest}")
-    backend = MicroVMSandboxBackend(cas=cas)
     signing_key = load_or_create_signing_key(key_path)
     audit_log = AuditLog(audit_dir)
 
@@ -264,6 +263,9 @@ def fork_race_cmd(
         return CandidateResult(task_id=f"candidate-{index}", tests_passing=result.exit_code == 0)
 
     try:
+        # Constructed inside the try so any future preflight in the backend
+        # constructor surfaces as a clean ClickException, not a raw traceback.
+        backend = MicroVMSandboxBackend(cas=cas)
         receipt = asyncio.run(
             fork_race(
                 backend=backend,

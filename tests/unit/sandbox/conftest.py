@@ -22,6 +22,19 @@ import pytest
 from bernstein.core.sandbox.backends import _vmmonitor
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "raw_tarfile_filter: do not auto-patch _tarfile_data_filter_is_patched "
+        "(for tests exercising the real version-matrix logic)",
+    )
+
+
 @pytest.fixture(autouse=True)
-def _assume_patched_tarfile_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+def _assume_patched_tarfile_filter(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Tests that exercise the real version matrix opt out via the marker;
+    # everything else gets the check pinned to True so round-trip / correctness
+    # tests are independent of the host's CPython patch level.
+    if request.node.get_closest_marker("raw_tarfile_filter"):
+        return
     monkeypatch.setattr(_vmmonitor, "_tarfile_data_filter_is_patched", lambda: True)

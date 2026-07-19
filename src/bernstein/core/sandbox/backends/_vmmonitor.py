@@ -77,7 +77,8 @@ def _tarfile_data_filter_is_patched() -> bool:
     The stdlib ``data`` filter (:func:`extract_workspace_image`'s only defence
     against a hostile image) had a family of extraction-escape bypasses
     (CVE-2024-12718 / CVE-2025-4138 / CVE-2025-4330 / CVE-2025-4435 /
-    CVE-2025-4517) fixed in CPython 3.12.11, 3.13.4, and every 3.14+ release.
+    CVE-2025-4517) fixed in CPython 3.12.11, 3.13.4, and 3.14.0b3 (the 3.14
+    fix did not land until beta 3, so 3.14.0a* / b1 / b2 are still vulnerable).
     On an unpatched build the filter can be circumvented, so relying on it there
     is a false sense of safety. The project floor is ``>=3.12``, which still
     admits vulnerable 3.12.0-3.12.10 / 3.13.0-3.13.3 builds - hence this
@@ -88,7 +89,11 @@ def _tarfile_data_filter_is_patched() -> bool:
         return v >= (3, 12, 11)
     if v[:2] == (3, 13):
         return v >= (3, 13, 4)
-    return v >= (3, 14)
+    if v[:2] == (3, 14):
+        # version_info compares releaselevel lexically (alpha < beta <
+        # candidate < final), so this admits 3.14.0b3+ and every final/rc.
+        return v >= (3, 14, 0, "beta", 3)
+    return v[:2] > (3, 14)
 
 
 def canonical_workspace_image(root: Path) -> bytes:
@@ -178,19 +183,13 @@ def extract_workspace_image(image: bytes, root: Path) -> None:
             ``..`` traversal, or a sym/hardlink escaping *root*).
     """
     root = root.resolve()
-    if root.exists():
-        for child in root.iterdir():
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-    else:
-        root.mkdir(parents=True, exist_ok=True)
 
-    # The stdlib ``data`` filter is the *only* thing standing between this
-    # untrusted, guest-derived image and an extraction escape. On a CPython
-    # build predating the CVE-2025-4517-family fix that filter can be bypassed,
-    # so refuse rather than extract behind a defence that does not hold.
+    # Refuse BEFORE any filesystem mutation. The stdlib ``data`` filter is the
+    # *only* thing standing between this untrusted, guest-derived image and an
+    # extraction escape, and on a CPython build predating the CVE-2025-4517-
+    # family fix it can be bypassed - so refuse rather than extract behind a
+    # defence that does not hold. Checking here (not after clearing *root*)
+    # means a doomed extraction never destroys an already-populated workspace.
     if not _tarfile_data_filter_is_patched():
         version = ".".join(str(part) for part in sys.version_info[:3])
         msg = (
@@ -199,6 +198,15 @@ def extract_workspace_image(image: bytes, root: Path) -> None:
             "(upgrade to >=3.12.11 / >=3.13.4)."
         )
         raise MicroVMUnavailableError(msg)
+
+    if root.exists():
+        for child in root.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    else:
+        root.mkdir(parents=True, exist_ok=True)
 
     # The stdlib ``data`` filter (PEP 706, py3.12+) does the right
     # member-by-member checks *at extraction time*: it refuses absolute paths,

@@ -87,6 +87,18 @@ def test_verify_receipt_expected_keyid_binds_to_trusted_signer() -> None:
     assert any("trusted signer" in e for e in result.errors)
 
 
+def test_verify_receipt_expected_keyid_tolerates_none_keyid() -> None:
+    """A receipt carrying a ``None`` keyid must report a mismatch, not TypeError."""
+    import dataclasses
+
+    key = Ed25519PrivateKey.generate()
+    signed = _build_signed(key)
+    forged = dataclasses.replace(signed, keyid=None)  # type: ignore[arg-type]
+    result = verify_receipt(forged, expected_keyid="deadbeef")
+    assert not result.ok
+    assert any("trusted signer" in e for e in result.errors)
+
+
 def test_receipt_is_byte_identical_across_builds_with_same_key() -> None:
     key = Ed25519PrivateKey.generate()
     a = _build_signed(key)
