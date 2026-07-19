@@ -31,6 +31,7 @@ from bernstein.core.sandbox.playwright_runner import (
 )
 
 if TYPE_CHECKING:
+    from bernstein.core.sandbox.backend import SandboxSession
     from bernstein.core.sandbox.playwright_runner import PlaywrightRunResult
 
 logger = logging.getLogger(__name__)
@@ -168,4 +169,172 @@ def web_test(
         raise click.exceptions.Exit(code=1)
 
 
-__all__ = ["sandbox_group", "web_test"]
+# ---------------------------------------------------------------------------
+# fork-and-race (#2613)
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_CAS_DIR = Path(".sdd/cas")
+_DEFAULT_SELECTION_KEY = Path(".sdd/keys/selection.key")
+_DEFAULT_AUDIT_DIR = Path(".sdd/audit")
+
+
+@sandbox_group.command("fork-race")
+@click.option("--base", "base_digest", required=True, help="Base snapshot SHA-256 digest to fork every candidate from.")
+@click.option("--k", "k", type=click.IntRange(min=1), default=3, show_default=True, help="Number of candidates.")
+@click.option(
+    "--cmd", "cmd", required=True, help="Shell command run as each candidate (reads $BERNSTEIN_CANDIDATE_INDEX)."
+)
+@click.option(
+    "--out",
+    "out_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Where to write the signed receipt JSON.",
+)
+@click.option(
+    "--cas-dir",
+    "cas_dir",
+    default=_DEFAULT_CAS_DIR,
+    type=click.Path(file_okay=False, path_type=Path),
+    show_default=True,
+)
+@click.option(
+    "--key",
+    "key_path",
+    default=_DEFAULT_SELECTION_KEY,
+    type=click.Path(dir_okay=False, path_type=Path),
+    show_default=True,
+    help="Ed25519 signing key (created 0600 on first use).",
+)
+@click.option(
+    "--audit-dir",
+    "audit_dir",
+    default=_DEFAULT_AUDIT_DIR,
+    type=click.Path(file_okay=False, path_type=Path),
+    show_default=True,
+)
+def fork_race_cmd(
+    base_digest: str,
+    k: int,
+    cmd: str,
+    out_path: Path,
+    cas_dir: Path,
+    key_path: Path,
+    audit_dir: Path,
+) -> None:
+    """Fork K microVM candidates from one base snapshot and emit a signed receipt.
+
+    Requires a microVM-capable host (KVM + kernel/rootfs); on an unsupported
+    host it fails loudly rather than degrading isolation.
+    """
+    from bernstein.core.orchestration.best_of_n import CandidateResult
+    from bernstein.core.persistence.cas_store import CASStore
+    from bernstein.core.sandbox.backends._vmmonitor import MicroVMUnavailableError
+    from bernstein.core.sandbox.backends.microvm import MicroVMSandboxBackend
+    from bernstein.core.sandbox.fork_race import fork_race
+    from bernstein.core.sandbox.selection_receipt import (
+        load_or_create_signing_key,
+        write_receipt,
+    )
+    from bernstein.core.security.audit import AuditLog
+
+    cas = CASStore(cas_dir)
+    backend = MicroVMSandboxBackend(cas=cas)
+    signing_key = load_or_create_signing_key(key_path)
+    audit_log = AuditLog(audit_dir)
+
+    async def run_candidate(session: SandboxSession, index: int) -> CandidateResult:
+        result = await session.exec(
+            ["sh", "-lc", cmd],
+            env={"BERNSTEIN_CANDIDATE_INDEX": str(index)},
+        )
+        return CandidateResult(task_id=f"candidate-{index}", tests_passing=result.exit_code == 0)
+
+    try:
+        receipt = asyncio.run(
+            fork_race(
+                backend=backend,
+                base_snapshot_digest=base_digest,
+                run_candidate=run_candidate,
+                k=k,
+                signing_key=signing_key,
+                audit_log=audit_log,
+                audit_lock_path=audit_dir / ".fork_race.lock",
+            ),
+        )
+    except MicroVMUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    write_receipt(out_path, receipt)
+    console.print(f"[green]winner:[/green] {receipt.winner_task_id} ({receipt.winner_snapshot_digest[:12]})")
+    console.print(f"[dim]receipt: {out_path}[/dim]")
+
+
+@sandbox_group.group("receipt")
+def receipt_group() -> None:
+    """Inspect and verify fork-race selection receipts."""
+
+
+@receipt_group.command("verify")
+@click.argument("receipt_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--cas-dir",
+    "cas_dir",
+    default=_DEFAULT_CAS_DIR,
+    type=click.Path(file_okay=False, path_type=Path),
+    show_default=True,
+)
+def receipt_verify_cmd(receipt_path: Path, cas_dir: Path) -> None:
+    """Verify a receipt's signature and re-hash every snapshot blob in CAS.
+
+    Proves the receipt is *properly signed and internally consistent* and
+    that every snapshot it names (base + winner + every loser) still exists
+    and re-hashes correctly in CAS. It does NOT prove the receipt was
+    appended to the audit chain - that is the audit log's own ``verify``.
+    """
+    from bernstein.core.persistence.cas_store import CASIntegrityError, CASStore
+    from bernstein.core.sandbox.selection_receipt import (
+        read_receipt_file,
+        snapshot_digests,
+        verify_receipt,
+    )
+
+    receipt = read_receipt_file(receipt_path)
+    if receipt is None:
+        raise click.ClickException(f"Could not read a selection receipt from {receipt_path}")
+
+    verification = verify_receipt(receipt)
+    for err in verification.errors:
+        console.print(f"[red]signature/consistency:[/red] {err}")
+
+    cas = CASStore(cas_dir)
+    cas_errors: list[str] = []
+    for digest in snapshot_digests(receipt):
+        try:
+            blob = cas.get(digest, verify=True)
+        except CASIntegrityError as exc:
+            cas_errors.append(str(exc))
+            continue
+        if blob is None:
+            cas_errors.append(f"snapshot blob absent from CAS: {digest}")
+    for err in cas_errors:
+        console.print(f"[red]cas:[/red] {err}")
+
+    ok = verification.ok and not cas_errors
+    if ok:
+        console.print(
+            f"[green]OK[/green] receipt signed + all {len(snapshot_digests(receipt))} snapshot digests intact "
+            "(proves signed + CAS-intact; not chain-appended).",
+        )
+        return
+    raise click.exceptions.Exit(code=1)
+
+
+__all__ = [
+    "fork_race_cmd",
+    "receipt_group",
+    "receipt_verify_cmd",
+    "sandbox_group",
+    "web_test",
+]
