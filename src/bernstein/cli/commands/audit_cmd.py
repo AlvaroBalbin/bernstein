@@ -744,15 +744,35 @@ def _verify_clearance_gates() -> bool:
     Reconstructs, from the ``signal.gate_projection`` chain entries alone, that
     (a) every recorded ``graph_delta_hash`` recomputes byte-identically from the
     projection's recorded inputs, and (b) no ``task.claim_receipt`` granted a
-    scoped dependent while its clearance gate was still open (#2556, AC4). When
-    no gates were recorded the check is a silent no-op.
+    scoped dependent while its clearance gate was still open (#2556, AC4).
+
+    The HMAC chain is verified first: the semantic replay is only meaningful on
+    authenticated rows, so a tampered chain aborts the pass instead of feeding
+    forged details into the gate reconstruction (#2648). When no gates were
+    recorded and nothing failed, the check is a silent no-op.
     """
     from bernstein.core.communication.signal_actions import verify_clearance_gates
     from bernstein.core.security.audit import AuditLog
 
-    events = AuditLog(AUDIT_DIR).query()
+    log = AuditLog(AUDIT_DIR)
+    chain_ok, chain_errors = log.verify()
+    if not chain_ok:
+        console.print()
+        console.print(
+            Panel("[bold red]Clearance Gate Verification FAILED[/bold red]", border_style="red", expand=False)
+        )
+        console.print("  [red]![/red] audit chain HMAC verification failed; gate replay not attempted")
+        for err in chain_errors:
+            console.print(f"  [red]![/red] {err}")
+        return False
+
+    # Read the same segments verify() authenticated. Without
+    # ``include_archived`` a query covers live files only, so after retention
+    # archiving it would hide archived gates and every claim of their
+    # dependents from the replay (#2648).
+    events = log.query(include_archived=True)
     result = verify_clearance_gates(events)
-    if result.gate_count == 0:
+    if result.gate_count == 0 and result.ok:
         return True  # no clearance gates recorded; nothing to verify
 
     console.print()
