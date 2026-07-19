@@ -159,6 +159,99 @@ class _CloneFailsMonitor:
         self.shutdown_calls += 1
 
 
+class _BootFailsMonitor:
+    """A VMMonitor stub that 'allocates' during boot and then raises.
+
+    Mirrors a real monitor that starts a process/socket/tap device and then
+    fails partway through boot - the partially-started guest must still be torn
+    down. Records ``shutdown`` calls.
+    """
+
+    def __init__(self, root: str) -> None:
+        self._root = root
+        self.shutdown_calls = 0
+
+    @property
+    def workdir(self) -> str:
+        return self._root
+
+    async def boot(self, *, base_env: Mapping[str, str]) -> None:
+        raise RuntimeError("boot exploded after allocating")
+
+    async def exec(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
+        stdin: bytes | None = None,
+    ) -> ExecResult:
+        raise AssertionError("unreachable: boot failed first")
+
+    async def write_file(self, path: str, data: bytes, *, mode: int = 0o644) -> None:
+        return None
+
+    async def read_file(self, path: str) -> bytes:
+        return b""
+
+    async def ls(self, path: str) -> list[str]:
+        return []
+
+    async def freeze_image(self) -> bytes:
+        return b""
+
+    async def restore_image(self, image: bytes) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_create_tears_down_guest_when_boot_fails(tmp_path: Path) -> None:
+    """A boot that raises after allocating must be shut down and register no session."""
+    monitors: list[_BootFailsMonitor] = []
+
+    def factory(root: str) -> _BootFailsMonitor:
+        monitor = _BootFailsMonitor(root)
+        monitors.append(monitor)
+        return monitor
+
+    backend = MicroVMSandboxBackend(monitor_factory=factory, cas=CASStore(tmp_path / "cas"))
+    with pytest.raises(RuntimeError, match="boot exploded"):
+        await backend.create(WorkspaceManifest(root="/workspace"))
+
+    assert monitors and monitors[0].shutdown_calls == 1
+    assert backend._sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_resume_tears_down_guest_when_boot_fails(tmp_path: Path) -> None:
+    """resume() likewise tears down a guest whose boot fails after allocating."""
+    cas = CASStore(tmp_path / "cas")
+    # Produce a real snapshot so resume() gets past its CAS lookup.
+    good = MicroVMSandboxBackend(monitor_factory=lambda root: FakeMonitor(root=root), cas=cas)
+    session = await good.create(WorkspaceManifest(root="/workspace"))
+    await session.write("x.txt", b"data")
+    digest = await session.snapshot()
+    await good.destroy(session)
+
+    monitors: list[_BootFailsMonitor] = []
+
+    def factory(root: str) -> _BootFailsMonitor:
+        monitor = _BootFailsMonitor(root)
+        monitors.append(monitor)
+        return monitor
+
+    backend = MicroVMSandboxBackend(monitor_factory=factory, cas=cas)
+    with pytest.raises(RuntimeError, match="boot exploded"):
+        await backend.resume(digest)
+
+    assert monitors and monitors[0].shutdown_calls == 1
+    assert backend._sessions == {}
+
+
 @pytest.mark.asyncio
 async def test_create_tears_down_guest_when_clone_fails(tmp_path: Path) -> None:
     """A non-zero ``git clone`` fails loudly and never leaks the booted monitor."""

@@ -227,13 +227,16 @@ class MicroVMSandboxBackend:
         opts = options or {}
         session_id = str(opts.get("session_id") or f"microvm-{uuid.uuid4().hex}")
         monitor = self._monitor_factory(manifest.root)
-        await monitor.boot(base_env=manifest.env)
 
-        # Any post-boot provisioning failure must tear the guest down - a
-        # half-provisioned monitor left running is a resource leak, and a
-        # silently-ignored non-zero git exit would hand back a session over an
-        # invalid repository. BaseException so a cancellation also cleans up.
+        # boot() is inside the guard: a real monitor can allocate a process,
+        # socket, or tap device and then raise partway through boot, and that
+        # partially-started guest must still be torn down. Any post-boot
+        # provisioning failure likewise tears the guest down - a half-
+        # provisioned monitor is a resource leak, and a silently-ignored
+        # non-zero git exit would hand back a session over an invalid
+        # repository. BaseException so a cancellation also cleans up.
         try:
+            await monitor.boot(base_env=manifest.env)
             if manifest.repo is not None:
                 repo = manifest.repo
                 clone = await monitor.exec(
@@ -277,10 +280,11 @@ class MicroVMSandboxBackend:
             raise KeyError(msg)
 
         monitor = self._monitor_factory("/workspace")
-        await monitor.boot(base_env={})
-        # A restore that raises (e.g. an unsafe member in the image) must not
-        # leave the just-booted guest running.
+        # boot() and restore are both inside the guard: a boot that partially
+        # allocates then raises, or a restore that raises (e.g. an unsafe member
+        # in the image), must not leave the guest running.
         try:
+            await monitor.boot(base_env={})
             await monitor.restore_image(image)
         except BaseException:
             with contextlib.suppress(Exception):

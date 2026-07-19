@@ -11,6 +11,7 @@ is removed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING
 
@@ -133,6 +134,68 @@ async def test_fork_race_appends_exactly_one_audit_entry(tmp_path: Path) -> None
     # The chain still verifies after the append.
     ok, errors = audit_log.verify()
     assert ok, errors
+
+
+@pytest.mark.asyncio
+async def test_candidate_failure_is_not_masked_by_destroy_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a candidate fails AND its session teardown also fails, the ORIGINAL
+    candidate exception must propagate - not the cleanup error."""
+    backend = _backend(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    base = await _base_snapshot(backend)
+
+    async def boom_candidate(session: object, index: int) -> CandidateResult:
+        raise ValueError(f"candidate {index} boom")
+
+    async def boom_destroy(session: object) -> None:
+        raise RuntimeError("destroy boom")
+
+    monkeypatch.setattr(backend, "destroy", boom_destroy)
+
+    with pytest.raises(ValueError, match="candidate .* boom"):
+        await fork_race(
+            backend=backend,
+            base_snapshot_digest=base,
+            run_candidate=boom_candidate,
+            k=2,
+            signing_key=key,
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fork_races_do_not_fork_audit_chain(tmp_path: Path) -> None:
+    """Concurrent fork_race() calls sharing one AuditLog with no lock path must
+    still serialise their (now off-loop, threaded) appends - the HMAC chain must
+    remain single and verifiable, not forked on a shared prev_hmac."""
+    key = Ed25519PrivateKey.generate()
+    audit_dir = tmp_path / "audit"
+    audit_log = AuditLog(audit_dir, key=_AUDIT_KEY)
+    n = 4
+
+    async def one_race(i: int) -> None:
+        backend = _backend(tmp_path / f"race{i}")
+        base = await _base_snapshot(backend)
+        await fork_race(
+            backend=backend,
+            base_snapshot_digest=base,
+            run_candidate=_run_candidate,
+            k=3,
+            signing_key=key,
+            audit_log=audit_log,  # shared; audit_lock_path deliberately None
+        )
+
+    await asyncio.gather(*(one_race(i) for i in range(n)))
+
+    entries = [
+        json.loads(line) for path in audit_dir.glob("*.jsonl") for line in path.read_text().splitlines() if line.strip()
+    ]
+    fork_entries = [e for e in entries if e.get("event_type") == FORK_RACE_EVENT_TYPE]
+    assert len(fork_entries) == n  # every append landed, none lost to a race
+    ok, errors = audit_log.verify()
+    assert ok, errors  # chain not forked
 
 
 @pytest.mark.asyncio

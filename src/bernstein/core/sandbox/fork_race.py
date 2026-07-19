@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import threading
 from typing import TYPE_CHECKING, Any, Protocol
 
 from bernstein.core.orchestration.best_of_n import CandidateResult, select_winner
@@ -74,16 +75,26 @@ DETERMINISTIC_PROFILE: CriterionProfile = build_criterion_profile(
 #: Audit event-type for a completed fork-race selection.
 FORK_RACE_EVENT_TYPE = "sandbox.fork_race"
 
+#: Serialises concurrent same-process audit appends. ``AuditLog`` has no
+#: internal lock, and offloading the append to ``asyncio.to_thread`` means two
+#: concurrent ``fork_race()`` calls sharing one ``AuditLog`` would run
+#: ``AuditLog.log`` in parallel worker threads - both reading the same
+#: ``prev_hmac`` and forking the chain. The cross-process flock only guards
+#: *separate processes* (and is a no-op when ``audit_lock_path`` is ``None``),
+#: so an in-process lock is also required now that the append runs off-loop.
+_AUDIT_APPEND_LOCK = threading.Lock()
+
 
 @contextlib.contextmanager
 def _cross_process_audit_lock(lock_path: Path | None) -> Iterator[None]:
     """Serialise the single audit append across concurrent fork-race *processes*.
 
-    Within one event loop the append is a synchronous ``AuditLog.log`` call
-    that cannot interleave with another coroutine, so the in-process case is
-    already safe. This guards the remaining window: two *separate processes*
-    running a fork-race against the same audit directory, where ``AuditLog``
-    has no lock of its own and both could read the same ``prev_hmac`` and fork
+    In-process concurrency is handled separately by :data:`_AUDIT_APPEND_LOCK`
+    (needed because the append now runs in a worker thread via
+    ``asyncio.to_thread``). This guards the remaining window: two *separate
+    processes* running a fork-race against the same audit directory, where
+    ``AuditLog`` has no lock of its own and both could read the same
+    ``prev_hmac`` and fork
     the chain. A no-op when *lock_path* is ``None`` or on a platform without
     ``fcntl`` (e.g. Windows).
     """
@@ -195,8 +206,17 @@ async def fork_race(
         try:
             result = await run_candidate(session, index)
             terminal_digest = await session.snapshot()
-        finally:
-            await backend.destroy(session)
+        except BaseException:
+            # Cleanup must never mask the original candidate failure: a destroy()
+            # error on this path is suppressed rather than replacing the in-flight
+            # exception the outer drain re-raises verbatim (so the winner's failure
+            # is never mis-attributed to teardown, including while draining
+            # cancelled siblings).
+            with contextlib.suppress(Exception):
+                await backend.destroy(session)
+            raise
+        # Success path: a destroy() failure here IS the error worth surfacing.
+        await backend.destroy(session)
         return result, terminal_digest
 
     # Race the candidates concurrently; the barrier here is intentional -
@@ -256,7 +276,7 @@ async def fork_race(
         # and append stay together in one call, so the chain's prev_hmac is
         # still written under exclusive serialisation.
         def _append() -> None:
-            with _cross_process_audit_lock(audit_lock_path):
+            with _AUDIT_APPEND_LOCK, _cross_process_audit_lock(audit_lock_path):
                 audit_log.log(
                     FORK_RACE_EVENT_TYPE,
                     actor,
