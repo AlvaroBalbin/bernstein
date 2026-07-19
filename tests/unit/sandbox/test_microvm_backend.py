@@ -417,6 +417,30 @@ def test_tarfile_data_filter_version_matrix(
     assert _vmmonitor._tarfile_data_filter_is_patched() is expected
 
 
+def test_snapshot_digest_is_host_home_agnostic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The canonical image is a pure function of workspace CONTENT - it must not
+    change with host state like ``$HOME``.
+
+    Guards against the v3.7.1-class bug where a receipt hash silently depended on
+    ``$HOME`` through a redaction helper, so an honest ledger verified on one
+    host and failed on another.
+    """
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "b.txt").write_bytes(b"nested")
+    (src / "a.txt").write_bytes(b"deliverable")
+
+    monkeypatch.setenv("HOME", "/home/alice")
+    monkeypatch.setenv("USER", "alice")
+    image_alice = canonical_workspace_image(src)
+
+    monkeypatch.setenv("HOME", "/home/bob")
+    monkeypatch.setenv("USER", "bob")
+    image_bob = canonical_workspace_image(src)
+
+    assert image_alice == image_bob  # same content -> same bytes -> same digest
+
+
 def test_extract_rejects_absolute_symlink(tmp_path: Path) -> None:
     """A symlink whose target is an absolute path outside root is refused."""
     import io

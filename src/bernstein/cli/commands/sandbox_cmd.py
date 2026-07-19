@@ -318,6 +318,15 @@ def receipt_verify_cmd(receipt_path: Path, cas_dir: Path, expected_keyid: str | 
     proves the receipt was signed by that trusted signer. It does NOT prove
     the receipt was appended to the audit chain - that is the audit log's own
     ``verify``.
+
+    Exit codes give three distinct answers (an absent blob is an operational
+    event, not proof of tampering, and must not read as one):
+
+    * ``0`` - signed, consistent, and every named blob re-hashed intact.
+    * ``1`` - invalid signature/consistency, or a blob is **tampered**
+      (present but hash-mismatched).
+    * ``2`` - authentic and untampered, but a blob is **absent** from CAS, so
+      the content re-hash could not be completed (verification incomplete).
     """
     from bernstein.core.persistence.cas_store import CASIntegrityError, CASStore
     from bernstein.core.sandbox.selection_receipt import (
@@ -335,26 +344,48 @@ def receipt_verify_cmd(receipt_path: Path, cas_dir: Path, expected_keyid: str | 
         console.print(f"[red]signature/consistency:[/red] {err}")
 
     cas = CASStore(cas_dir)
-    cas_errors: list[str] = []
-    for digest in snapshot_digests(receipt):
+    # Distinguish two very different CAS outcomes (a hard lesson from the v3.7.1
+    # hardening wave): a blob that is *present but hash-mismatched* is tampering,
+    # while a blob that is simply *absent* is an ordinary operational event (GC,
+    # log retention, a restart). Conflating them turns a retry into a permanent
+    # "tampered" verdict on an append-only chain, so they get different answers.
+    tampered: list[str] = []
+    absent: list[str] = []
+    digests = snapshot_digests(receipt)
+    for digest in digests:
         try:
             blob = cas.get(digest, verify=True)
         except CASIntegrityError as exc:
-            cas_errors.append(str(exc))
+            tampered.append(str(exc))
             continue
         if blob is None:
-            cas_errors.append(f"snapshot blob absent from CAS: {digest}")
-    for err in cas_errors:
-        console.print(f"[red]cas:[/red] {err}")
+            absent.append(digest)
 
-    ok = verification.ok and not cas_errors
-    if ok:
+    for err in verification.errors:
+        console.print(f"[red]signature/consistency:[/red] {err}")
+    for err in tampered:
+        console.print(f"[red]tampered:[/red] {err}")
+    for digest in absent:
         console.print(
-            f"[green]OK[/green] receipt signed + all {len(snapshot_digests(receipt))} snapshot digests intact "
-            "(proves signed + CAS-intact; not chain-appended).",
+            f"[yellow]cannot-verify:[/yellow] snapshot blob absent from CAS: {digest} "
+            "(absent != tampered - likely GC / retention / restart)",
         )
-        return
-    raise click.exceptions.Exit(code=1)
+
+    # Three answers, three exit codes (see the command docstring).
+    if not verification.ok or tampered:
+        console.print("[red]FAILED[/red] receipt is invalid or a snapshot blob is tampered.")
+        raise click.exceptions.Exit(code=1)
+    if absent:
+        console.print(
+            f"[yellow]INCOMPLETE[/yellow] receipt is authentic and consistent, but "
+            f"{len(absent)} of {len(digests)} snapshot blob(s) are absent from CAS; "
+            "content re-hash could not be completed (this is not tampering).",
+        )
+        raise click.exceptions.Exit(code=2)
+    console.print(
+        f"[green]OK[/green] receipt signed + all {len(digests)} snapshot digests intact "
+        "(proves signed + CAS-intact; not chain-appended).",
+    )
 
 
 __all__ = [

@@ -46,7 +46,7 @@ error on an unsupported host instead of a surprise worktree.
 
 from __future__ import annotations
 
-import contextlib
+import logging
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from bernstein.core.sandbox.manifest import WorkspaceManifest
+
+_logger = logging.getLogger(__name__)
 
 #: Default location of the content-addressed store for VM snapshots.
 _DEFAULT_CAS_DIR = Path(".sdd/cas")
@@ -249,8 +251,17 @@ class MicroVMSandboxBackend:
             for entry in manifest.files:
                 await monitor.write_file(entry.path, entry.content, mode=entry.mode)
         except BaseException:
-            with contextlib.suppress(Exception):
+            # Tear the guest down, but never let a cleanup error mask the
+            # original provisioning failure - log it so a genuine leaked guest
+            # (process/socket/tap device) leaves a trace instead of vanishing.
+            try:
                 await monitor.shutdown()
+            except Exception:
+                _logger.warning(
+                    "microVM shutdown failed during create() cleanup; a guest resource may have leaked (session %s)",
+                    session_id,
+                    exc_info=True,
+                )
             raise
 
         session = MicroVMSandboxSession(
@@ -287,8 +298,14 @@ class MicroVMSandboxBackend:
             await monitor.boot(base_env={})
             await monitor.restore_image(image)
         except BaseException:
-            with contextlib.suppress(Exception):
+            try:
                 await monitor.shutdown()
+            except Exception:
+                _logger.warning(
+                    "microVM shutdown failed during resume() cleanup; a guest resource may have leaked (snapshot %s)",
+                    snapshot_id,
+                    exc_info=True,
+                )
             raise
 
         session_id = f"microvm-resume-{snapshot_id[:12]}-{uuid.uuid4().hex[:8]}"

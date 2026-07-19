@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import threading
 from typing import TYPE_CHECKING, Any, Protocol
@@ -71,6 +72,8 @@ if TYPE_CHECKING:
 DETERMINISTIC_PROFILE: CriterionProfile = build_criterion_profile(
     ["correctness", "cost", "reversibility"],
 )
+
+_logger = logging.getLogger(__name__)
 
 #: Audit event-type for a completed fork-race selection.
 FORK_RACE_EVENT_TYPE = "sandbox.fork_race"
@@ -227,13 +230,19 @@ async def fork_race(
             result = await run_candidate(session, index)
             terminal_digest = await session.snapshot()
         except BaseException:
-            # Cleanup must never mask the original candidate failure: a destroy()
-            # error on this path is suppressed rather than replacing the in-flight
-            # exception the outer drain re-raises verbatim (so the winner's failure
-            # is never mis-attributed to teardown, including while draining
-            # cancelled siblings).
-            with contextlib.suppress(Exception):
+            # Cleanup must never mask the original candidate failure, so a
+            # destroy() error here does not replace the in-flight exception the
+            # outer drain re-raises verbatim - but log it so a genuine teardown
+            # failure (leaked guest) leaves a trace instead of vanishing.
+            try:
                 await backend.destroy(session)
+            except Exception:
+                _logger.warning(
+                    "candidate session teardown failed during fork_race cleanup; "
+                    "a guest resource may have leaked (candidate index %d)",
+                    index,
+                    exc_info=True,
+                )
             raise
         # Success path: a destroy() failure here IS the error worth surfacing.
         await backend.destroy(session)
