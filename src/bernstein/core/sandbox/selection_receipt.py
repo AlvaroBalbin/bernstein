@@ -99,7 +99,11 @@ class RaceCandidate:
 
     def to_dict(self) -> dict[str, Any]:
         # Sort the score vector's own keys so serialisation is stable even
-        # if the mapping was built in a different insertion order.
+        # if the mapping was built in a different insertion order. The
+        # float() coercion is deliberate (not redundant): it pins the JSON
+        # form to `1.0` regardless of whether an int/np-float was stored, so
+        # the signed payload digest can never depend on the source numeric
+        # type. Removing it would make the receipt digest input-type sensitive.
         return {
             "task_id": self.task_id,
             "terminal_snapshot_digest": self.terminal_snapshot_digest,

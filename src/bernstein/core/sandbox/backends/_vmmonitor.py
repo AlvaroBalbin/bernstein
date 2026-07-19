@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import operator
 import os
 import shutil
 import sys
@@ -133,7 +134,7 @@ def canonical_workspace_image(root: Path) -> bytes:
             full = base / name
             arc = full.relative_to(root).as_posix()
             entries.append((arc, full))
-    entries.sort(key=lambda pair: pair[0])
+    entries.sort(key=operator.itemgetter(0))
 
     buf = io.BytesIO()
     # Fixed format + no compression: gzip would embed an mtime and OS byte.
@@ -322,7 +323,7 @@ class FakeMonitor:
     def _resolve(self, path: str) -> Path:
         """Map a guest path to a host path pinned under the temp dir."""
         rel = path
-        if os.path.isabs(path):
+        if Path(path).is_absolute():
             # Treat the logical root as the guest FS root for absolute paths.
             rel = os.path.relpath(path, self._logical_root)
         target = (self._host_dir / rel).resolve()
@@ -346,7 +347,7 @@ class FakeMonitor:
         timeout: int | None = None,
         stdin: bytes | None = None,
     ) -> ExecResult:
-        run_env = dict(os.environ)
+        run_env = os.environ.copy()
         run_env.update(self._base_env)
         if env:
             run_env.update(env)
@@ -375,8 +376,8 @@ class FakeMonitor:
         duration = loop.time() - start
         return ExecResult(
             exit_code=proc.returncode if proc.returncode is not None else -1,
-            stdout=stdout or b"",
-            stderr=stderr or b"",
+            stdout=stdout,
+            stderr=stderr,
             duration_seconds=duration,
         )
 
