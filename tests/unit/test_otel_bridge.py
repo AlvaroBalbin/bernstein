@@ -495,6 +495,55 @@ def test_live_processor_failure_never_falls_back_to_sync_export(monkeypatch) -> 
     assert not bridge.enabled
 
 
+def test_export_batch_surfaces_exporter_failure_result(tmp_path) -> None:
+    """A FAILURE result raises instead of being reported as a successful export.
+
+    The OTLP exporter returns ``SpanExportResult.FAILURE`` (it does not
+    raise) when the collector is unreachable, so a bridge that ignored the
+    return value would count undelivered spans as exported.
+    """
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    from bernstein.core.observability.otel_bridge import OTLPExportError
+
+    class _FailingExporter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def export(self, spans):
+            self.calls += 1
+            return SpanExportResult.FAILURE
+
+        def shutdown(self) -> None:
+            pass
+
+    events = _events(tmp_path)
+    projection = project_spans(events, run_id=_RUN_ID)
+    exporter = _FailingExporter()
+    bridge = JournalOTLPBridge(span_exporter=exporter, batch=False)
+
+    with pytest.raises(OTLPExportError):
+        bridge.export_projection(projection, events)
+    assert exporter.calls == 1
+
+
+def test_export_batch_returns_count_on_success_result(tmp_path) -> None:
+    """A SUCCESS result returns the delivered span count as before."""
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    class _OkExporter:
+        def export(self, spans):
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self) -> None:
+            pass
+
+    events = _events(tmp_path)
+    projection = project_spans(events, run_id=_RUN_ID)
+    bridge = JournalOTLPBridge(span_exporter=_OkExporter(), batch=False)
+    assert bridge.export_projection(projection, events) == len(projection.spans)
+
+
 # ---------------------------------------------------------------------------
 # Determinism guards
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ tests against the ``status`` command.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -396,6 +397,7 @@ def telemetry_export_otel(
     """
     from bernstein.core.observability.otel_bridge import (
         JournalOTLPBridge,
+        OTLPExportError,
         projection_to_otlp_json_spans,
         record_projection_audit_event,
     )
@@ -446,7 +448,10 @@ def telemetry_export_otel(
         return
 
     base = OTLPExporterConfig.from_env()
-    config = base if endpoint is None else OTLPExporterConfig(endpoint=endpoint, service_name=base.service_name)
+    # Preserve every env-derived field (headers/auth, insecure/TLS,
+    # resource attributes); only the endpoint is overridden. Rebuilding a
+    # fresh config would silently drop those.
+    config = base if endpoint is None else dataclasses.replace(base, endpoint=endpoint)
     if config.endpoint is None:
         raise click.ClickException(
             "no OTLP endpoint configured; set BERNSTEIN_OTEL_ENDPOINT or pass --endpoint (or use --dry-run)",
@@ -456,8 +461,17 @@ def telemetry_export_otel(
         raise click.ClickException(
             "OTLP exporter unavailable; install 'bernstein[otel]' for opentelemetry-exporter-otlp-proto-grpc",
         )
-    count = bridge.export_projection(signed, events)
-    bridge.shutdown()
+    try:
+        count = bridge.export_projection(signed, events)
+    except OTLPExportError as exc:
+        # The collector returned FAILURE (unreachable / rejected): do not
+        # report success and do not record an audit event for undelivered
+        # spans. Exit nonzero so scripts can detect the failed export.
+        raise click.ClickException(
+            f"OTLP export failed; no spans delivered and no audit event recorded: {sanitize_log(str(exc))}",
+        ) from exc
+    finally:
+        bridge.shutdown()
 
     try:
         record_projection_audit_event(

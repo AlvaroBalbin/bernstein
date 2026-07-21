@@ -26,24 +26,31 @@ ordering. Completed runs use the same bridge through
 
 **What leaves the process.** A wire span carries only projection metadata:
 the span name (`gen_ai.<operation>`), the GenAI operation label, journal
-entry hashes (SHA-256 values -- preimage-resistant, they reveal nothing
-about payload content), the run id, the journal index, and the row's
-recorded timestamp. Prompts, agent output, diffs, file paths, and journal
-payload fields never reach the wire; the projection maps event *types*,
-not event bodies. No signature or key material is exported: the Ed25519
-signature and the projection SHA-256 land only in the local audit chain.
+entry hashes (SHA-256 values over the chained entries -- the payload bytes
+themselves are not exported, though a holder can still test a guessed
+payload for equality or brute-force a low-entropy field), the run id, the
+journal index, and the row's recorded timestamp. Prompts, agent output,
+diffs, file paths, and journal payload fields never reach the wire; the
+projection maps event *types*, not event bodies. No signature or key
+material is exported: the Ed25519 signature and the projection SHA-256 land
+only in the local audit chain.
 
 **Collector trust.** `BERNSTEIN_OTEL_ENDPOINT` names an
 operator-controlled collector; the bridge treats it as a *sink*, never a
 source of truth. A compromised or hostile collector can drop, delay, or
-mutate its stored copy of the spans, but it cannot mint spans that
-verify: span ids recompute only from journal entry hashes the attacker
-does not hold, and the `otel.projection` audit event pins the genuine
-trace id and journal head locally. Note the gRPC channel defaults to
-`insecure=True` (matching the existing raw exporter); point the endpoint
-at a collector on a trusted network or terminate TLS in front of it, and
-treat span metadata (run ids, event-type activity timing) as visible to
-whoever operates the sink.
+mutate its stored copy of the spans, and it can mint look-alike spans:
+every exported span carries its `bernstein.journal.entry_hash`, so the
+collector holds those hashes by construction and can recompute the bare
+span id from them. Authenticity therefore does not rest on the entry hash
+being secret. A span is trusted only when the hash it carries is verified
+against the local journal chain and the `otel.projection` audit event,
+which pin the genuine trace id and final journal head locally; a span
+whose entry hash is absent from the local chain, or whose trace id does
+not match the audit event, is rejected however cleanly its id recomputes.
+Note the gRPC channel defaults to `insecure=True` (matching the existing
+raw exporter); point the endpoint at a collector on a trusted network or
+terminate TLS in front of it, and treat span metadata (run ids, event-type
+activity timing) as visible to whoever operates the sink.
 
 **Install-key handling.** Run finalization signs the canonical projection
 with the install identity key via `core/security/install_key.py` -- the
@@ -66,9 +73,12 @@ before any exporter class is imported -- zero initialization, zero network
 attempts, journal untouched (test-enforced). Beyond that:
 
 - The bridge holds no state and performs no migration: disabling it
-  requires no cleanup, and the journal, audit chain, and offline
-  `projection.otel.json` artifact behave byte-identically with the bridge
-  on, off, or absent.
+  requires no cleanup. The run journal and the offline
+  `projection.otel.json` artifact are byte-identical with the bridge on,
+  off, or absent (both are pure functions of the run). The audit chain is
+  the one exception: an enabled run appends a single `otel.projection`
+  audit event at finalization, so a run executed with export enabled
+  carries that extra event while a disabled or bridge-absent run does not.
 - To hard-remove the wire dependency, also drop the optional
   `bernstein[otel]` extra; with the package missing the bridge disables
   itself with one logged warning.

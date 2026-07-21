@@ -1,7 +1,7 @@
 # Live OTLP export of journal-anchored spans
 
 Bernstein streams its orchestrator spans to any standard OpenTelemetry
-pipeline over OTLP/gRPC — and every span on the wire is checkable evidence
+pipeline over OTLP/gRPC - and every span on the wire is checkable evidence
 against the run journal, not free-standing telemetry (issue #2526).
 
 ## Why these spans are different
@@ -47,8 +47,8 @@ pip install 'bernstein[otel]'                                  # gRPC exporter e
 With the endpoint set, every run streams its journal-anchored spans as
 journal entries append (batched off the orchestrator's hot path). At run
 completion Bernstein records an `otel.projection` audit event binding the
-exported trace — its trace id, span count, and the SHA-256 of the signed
-canonical span set — to the audit chain.
+exported trace - its trace id, span count, and the SHA-256 of the signed
+canonical span set - to the audit chain.
 
 ### Example collector config
 
@@ -79,7 +79,7 @@ bernstein telemetry export-otel --run <run_id> --dry-run       # print OTLP/JSON
 ```
 
 Because the projection is a pure function of the journal, backfilling a
-run exports byte-identical spans to what the live stream emitted — same
+run exports byte-identical spans to what the live stream emitted - same
 ids, same attributes, same timestamps. `--dry-run` prints the spans as
 OTLP/JSON and records nothing.
 

@@ -84,12 +84,27 @@ __all__ = [
     "IncrementalSpanProjector",
     "JournalOTLPBridge",
     "LiveJournalSpanStream",
+    "OTLPExportError",
     "attach_live_export",
     "build_bridge_from_env",
     "projection_to_otlp_json_spans",
     "projection_to_readable_spans",
     "record_projection_audit_event",
 ]
+
+
+class OTLPExportError(RuntimeError):
+    """Raised when the OTLP exporter reports a failed batch export.
+
+    The OTLP/gRPC ``SpanExporter`` signals an unreachable or rejecting
+    collector by *returning* ``SpanExportResult.FAILURE`` -- it does not
+    raise. A caller that ignores the return value would report a successful
+    export (and record the ``otel.projection`` audit event) for spans that
+    never reached the collector. :meth:`JournalOTLPBridge.export_batch`
+    turns that ``FAILURE`` into this exception so the synchronous backfill
+    path fails loudly instead of falsely reporting delivery.
+    """
+
 
 #: Stable projection anchor carried on the wire: the first journal entry hash
 #: from which the trace id is derived. The completed ``otel.projection`` audit
@@ -118,6 +133,21 @@ def _ts_to_ns(ts: Any) -> int:
         return round(float(ts) * 1e9)
     except (TypeError, ValueError):
         return 0
+
+
+def _is_export_failure(result: Any) -> bool:
+    """Return ``True`` only when ``result`` is an explicit ``FAILURE``.
+
+    ``SpanExporter.export`` returns a ``SpanExportResult`` enum
+    (``SUCCESS`` / ``FAILURE``); some thin exporters return ``None`` to mean
+    success. Only a concrete ``SpanExportResult.FAILURE`` is treated as a
+    failure so success and legacy ``None`` returns both pass through.
+    """
+    try:
+        from opentelemetry.sdk.trace.export import SpanExportResult
+    except ImportError:  # pragma: no cover - otel extra present wherever export runs
+        return False
+    return result is SpanExportResult.FAILURE
 
 
 def _genai_stability_from_env(env: Mapping[str, str] | None = None) -> bool:
@@ -338,11 +368,25 @@ class JournalOTLPBridge:
         self._exporter.export((readable_span,))
 
     def export_batch(self, readable_spans: Sequence[Any]) -> int:
-        """Synchronously export ``readable_spans``; returns the count."""
+        """Synchronously export ``readable_spans``; returns the count.
+
+        Raises:
+            OTLPExportError: when the exporter returns
+                ``SpanExportResult.FAILURE`` (an unreachable or rejecting
+                collector is reported by return value, not by raising). The
+                span count is only returned on a delivered batch, so callers
+                never report success for spans the collector refused.
+        """
         if self._exporter is None or not readable_spans:
             return 0
-        self._exporter.export(tuple(readable_spans))
-        return len(readable_spans)
+        spans = tuple(readable_spans)
+        result = self._exporter.export(spans)
+        if _is_export_failure(result):
+            raise OTLPExportError(
+                f"OTLP exporter reported {getattr(result, 'name', result)} exporting {len(spans)} span(s); "
+                "no spans were delivered to the collector",
+            )
+        return len(spans)
 
     def export_projection(
         self,
