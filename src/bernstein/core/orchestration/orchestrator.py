@@ -596,6 +596,16 @@ class Orchestrator:
         # gate.
         self._recorder = EventJournal(run_id=run_id, sdd_dir=workdir / ".sdd")
 
+        # Live OTLP export of the journal projection : each
+        # appended journal entry streams its journal-anchored span to the
+        # operator's collector. Default off -- attach_live_export returns
+        # None (constructing nothing, touching no network) unless
+        # BERNSTEIN_OTEL_ENDPOINT is set. Finalized in the stop path so
+        # the run's otel.projection audit event anchors the live trace.
+        from bernstein.core.observability.otel_bridge import attach_live_export
+
+        self._otel_stream = attach_live_export(self._recorder, workdir=workdir)
+
         # Providers whose mutation-observability capability has been
         # recorded into the journal this run (issue #2507). One
         # ``provider_state_capability`` entry per provider per run keeps an
@@ -2516,6 +2526,8 @@ class Orchestrator:
             fingerprint=self._recorder.fingerprint(),
         )
         self._seal_journal_into_lineage_spine()
+        if self._otel_stream is not None:
+            self._otel_stream.finalize()
         logger.info(
             "Orchestrator stopped (replay: %s, fingerprint: %s)",
             self._recorder.path,
