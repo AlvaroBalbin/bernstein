@@ -24,6 +24,7 @@ from bernstein.cli.helpers import (
     auth_headers,
     console,
     find_seed_file,
+    persist_server_port,
     print_banner,
     print_startup_banner,
     server_get,
@@ -1875,6 +1876,7 @@ def _run_impl(
 
     workdir = Path.cwd()
     if not plan_only:
+        persist_server_port(port, workdir)
         estimate = _estimate_run_preview(
             workdir=workdir,
             plan_file=plan_file,
