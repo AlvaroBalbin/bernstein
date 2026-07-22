@@ -1876,7 +1876,6 @@ def _run_impl(
 
     workdir = Path.cwd()
     if not plan_only:
-        persist_server_port(port, workdir)
         estimate = _estimate_run_preview(
             workdir=workdir,
             plan_file=plan_file,
@@ -1928,6 +1927,7 @@ def _run_impl(
                     tasks=tasks,
                     ab_test=ab_test,
                 )
+                persist_server_port(port, workdir)
 
             _finalize_run_output(quiet=quiet)
             return
@@ -2012,6 +2012,7 @@ def _run_impl(
                     cli=cli or "auto",  # Default to "auto" if not specified
                     model=model,
                 )
+                persist_server_port(port, workdir)
         except RuntimeError as exc:
             from bernstein.cli.errors import bootstrap_failed
 
@@ -2049,6 +2050,7 @@ def _run_impl(
                 model=model,
                 worker_role=worker_role,
             )
+            persist_server_port(port, workdir)
     except SeedError as exc:
         from bernstein.cli.errors import seed_parse_error
 

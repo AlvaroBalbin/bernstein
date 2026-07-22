@@ -8,12 +8,14 @@ import sys
 import time
 from contextlib import suppress
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import click
 import httpx
 from rich.console import Console
 
+from bernstein.core.defaults import SDD_SERVER_PORT
 from bernstein.core.platform_compat import kill_process, kill_process_group
 from bernstein.core.process_utils import is_process_alive as _shared_is_process_alive
 
@@ -22,7 +24,6 @@ from bernstein.core.process_utils import is_process_alive as _shared_is_process_
 # ---------------------------------------------------------------------------
 
 SERVER_URL = os.environ.get("BERNSTEIN_SERVER_URL", "http://localhost:8052")
-SDD_SERVER_PORT = ".sdd/runtime/server.port"
 SDD_DIRS = [
     ".sdd",
     ".sdd/backlog",
@@ -128,9 +129,20 @@ def persist_server_port(port: int, workdir: Path | None = None) -> Path:
         raise ValueError(f"server port must be between 1 and 65535, got {port}")
     path = (workdir or Path.cwd()) / SDD_SERVER_PORT
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(f"{port}\n")
-    temporary.replace(path)
+    with NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        stream.write(f"{port}\n")
+        temporary = Path(stream.name)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 
