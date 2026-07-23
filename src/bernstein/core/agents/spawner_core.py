@@ -104,6 +104,7 @@ from bernstein.core.prometheus import (
 )
 from bernstein.core.router import ProviderHealthStatus, RouterError, TierAwareRouter
 from bernstein.core.sandbox import DockerSandbox, spawn_in_sandbox
+from bernstein.core.sandbox.selector import SandboxSelectionError
 from bernstein.core.team_state import TeamStateStore
 from bernstein.core.traces import AgentTrace, TraceStore, new_trace
 from bernstein.core.worktree import WorktreeError, WorktreeManager, WorktreeSetupConfig
@@ -4579,6 +4580,27 @@ class AgentSpawner:
             try:
                 sbx_session = self._provision_sandbox_session(session_id)
             except Exception as exc:
+                if self._sandbox_explicitly_requested():
+                    # Issue #2809 (second fallback): the operator explicitly
+                    # requested container isolation with ``--sandbox docker``.
+                    # A live daemon whose ``bernstein-agent:latest`` image is
+                    # missing passes the wiring-time availability probe
+                    # (SDK import + daemon ping) but fails here when
+                    # containers.run raises ImageNotFound. Falling back to a
+                    # host spawn would silently drop the isolation boundary the
+                    # operator asked for, exactly the degradation #2809 reports,
+                    # so the failure is raised instead of swallowed. Auto-
+                    # selected sandboxes still degrade gracefully below.
+                    image = self._sandbox_options.get("image") or "the configured image"
+                    raise SandboxSelectionError(
+                        f"Explicit '--sandbox docker' could not provision a sandbox for "
+                        f"agent {session_id}: {exc}. Refusing to fall back to host "
+                        f"execution because container isolation was explicitly requested "
+                        f"(is the '{image}' image built and available to the Docker "
+                        f"daemon?). Re-run without --sandbox to allow automatic fallback, "
+                        f"or build/pull the image and retry.",
+                        attempted=("docker",),
+                    ) from exc
                 logger.warning(
                     "Sandbox session provisioning failed for %s, falling back to direct spawn: %s",
                     session_id,
@@ -4707,6 +4729,21 @@ class AgentSpawner:
         session.isolation = IsolationMode.CONTAINER.value
         session.runtime_backend = handle.backend_name
         return SpawnResult(pid=0, log_path=log_path)
+
+    @staticmethod
+    def _sandbox_explicitly_requested() -> bool:
+        """Whether the operator pinned the sandbox runtime with ``--sandbox``.
+
+        ``BERNSTEIN_SANDBOX_RUNTIME`` is set only by the ``--sandbox`` CLI
+        flag (see ``run_bootstrap`` and ``orchestrator``); an auto-selected
+        sandbox never sets it. Issue #2809: this is the intent signal that
+        turns a per-spawn provisioning failure from a graceful host fallback
+        into a loud :class:`SandboxSelectionError` for the explicit-docker
+        case, while leaving auto-selection's fallback intact.
+        """
+        import os
+
+        return os.environ.get("BERNSTEIN_SANDBOX_RUNTIME", "").strip().lower() == "docker"
 
     def _provision_sandbox_session(self, session_id: str) -> SandboxSession:
         """Provision a dedicated sandbox session for one spawn (issue #2162).
