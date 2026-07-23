@@ -17,18 +17,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
-from bernstein.core.models import AgentSession, ModelConfig
+import pytest
+from bernstein.core.models import AgentSession, IsolationMode, ModelConfig
 from bernstein.core.spawner import AgentSpawner
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
 from bernstein.core.sandbox import WorkspaceManifest
 from bernstein.core.sandbox.backend import ExecResult, SandboxSession
+from bernstein.core.sandbox.selector import SandboxSelectionError
 from bernstein.core.security.audit import AuditLog
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-
-    import pytest
 
 
 class _FakeAdapter(CLIAdapter):
@@ -257,6 +257,7 @@ def _build_spawner_with_backend(
     *,
     backend: _FakeBackend,
     server_port: int | None = None,
+    image: str = "img:test",
 ) -> tuple[AgentSpawner, _FakeAdapter]:
     adapter = _FakeAdapter("claude")
     with patch("bernstein.core.agents.spawner_core.get_registry", return_value=MagicMock()):
@@ -267,7 +268,7 @@ def _build_spawner_with_backend(
             use_worktrees=False,
             sandbox_backend=backend,  # pyright: ignore[reportArgumentType]
             sandbox_manifest_factory=lambda: WorkspaceManifest(root=str(tmp_path)),
-            sandbox_options={"image": "img:test"},
+            sandbox_options={"image": image},
             sandbox_server_port=server_port,
         )
     return spawner, adapter
@@ -387,6 +388,90 @@ def test_provisioning_failure_falls_back_to_direct_spawn(tmp_path: Path) -> None
     assert result.pid == 99
     assert adapter.spawn_calls == [("fallback", tmp_path)]
     assert "S-25" not in spawner._sandbox_owned_sessions  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2809: explicit --sandbox docker must never silently degrade to host.
+#
+# The first loud-fail (explicit_attach.attach_docker_backend) only covers a
+# missing SDK / dead daemon: ensure_available() pings the daemon but does not
+# check image existence, so a LIVE daemon with a MISSING image passes wiring
+# and fails later at containers.run with ImageNotFound. That per-spawn
+# provisioning failure used to warn + fall back to a host spawn, dropping the
+# isolation boundary the operator explicitly asked for. For an explicit
+# override it must surface as SandboxSelectionError instead.
+# ---------------------------------------------------------------------------
+
+
+class _FakeImageNotFound(Exception):
+    """Stand-in for ``docker.errors.ImageNotFound`` (no SDK needed in tests)."""
+
+
+class _ImageMissingBackend(_FakeBackend):
+    """Live-daemon backend whose containers.run cannot find the agent image.
+
+    ``ensure_available`` (SDK import + daemon ping) would have succeeded for
+    this backend; the failure only manifests at ``create`` time, exactly the
+    #2809 second-fallback condition.
+    """
+
+    async def create(self, manifest: object, options: dict[str, object] | None = None) -> _FakeSession:
+        del manifest, options
+        raise _FakeImageNotFound("404 Client Error: No such image: bernstein-agent:latest")
+
+
+def test_explicit_docker_missing_image_raises_and_never_runs_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit --sandbox docker + live daemon + missing image fails loudly."""
+    monkeypatch.setenv("BERNSTEIN_SANDBOX_RUNTIME", "docker")
+    backend = _ImageMissingBackend(tmp_path)
+    spawner, adapter = _build_spawner_with_backend(tmp_path, backend=backend, image="bernstein-agent:latest")
+
+    agent_session = AgentSession(id="S-2809", role="backend")
+    with pytest.raises(SandboxSelectionError) as excinfo:
+        spawner._spawn_via_sandbox_session(  # pyright: ignore[reportPrivateUsage]
+            session_id="S-2809",
+            prompt="isolate me",
+            spawn_cwd=tmp_path,
+            model_config=ModelConfig("sonnet", "high"),
+            mcp_config=None,
+            session=agent_session,
+            adapter=adapter,
+        )
+
+    # The message names the cause so the operator can act.
+    message = str(excinfo.value)
+    assert "bernstein-agent:latest" in message
+    assert "docker" in message.lower()
+    # Isolation was NOT downgraded to a host spawn.
+    assert adapter.spawn_calls == []
+    assert agent_session.isolation != IsolationMode.WORKTREE.value
+    assert agent_session.isolation != IsolationMode.CONTAINER.value
+    assert "S-2809" not in spawner._sandbox_owned_sessions  # pyright: ignore[reportPrivateUsage]
+
+
+def test_auto_selected_docker_missing_image_falls_back_quietly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Auto-selected sandbox (no explicit --sandbox flag) still degrades gracefully."""
+    monkeypatch.delenv("BERNSTEIN_SANDBOX_RUNTIME", raising=False)
+    backend = _ImageMissingBackend(tmp_path)
+    spawner, adapter = _build_spawner_with_backend(tmp_path, backend=backend, image="bernstein-agent:latest")
+
+    agent_session = AgentSession(id="S-auto", role="backend")
+    result = spawner._spawn_via_sandbox_session(  # pyright: ignore[reportPrivateUsage]
+        session_id="S-auto",
+        prompt="isolate me",
+        spawn_cwd=tmp_path,
+        model_config=ModelConfig("sonnet", "high"),
+        mcp_config=None,
+        session=agent_session,
+        adapter=adapter,
+    )
+
+    # No raise: fell back to the direct adapter spawn on the host.
+    assert result.pid == 99
+    assert adapter.spawn_calls == [("isolate me", tmp_path)]
+    assert "S-auto" not in spawner._sandbox_owned_sessions  # pyright: ignore[reportPrivateUsage]
 
 
 def test_reachability_probe_warns_when_unreachable(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
