@@ -5696,57 +5696,49 @@ if __name__ == "__main__":
         # and concurrent agents shared one /workspace clone. Attach the
         # DockerSandboxBackend plus a manifest factory instead: the
         # spawner provisions ONE session per spawn and destroys it when
-        # the exec future resolves (issue #2162). Fully
-        # backward-compatible: without ``--sandbox docker`` this block
-        # never runs, and any wiring failure falls back to the existing
-        # legacy container path unchanged.
+        # the exec future resolves (issue #2162).
+        #
+        # BERNSTEIN_SANDBOX_RUNTIME is only ever set by an explicit
+        # ``--sandbox`` flag, so reaching this block always means the
+        # operator explicitly requested container isolation. A missing
+        # Docker SDK or dead daemon is therefore a loud failure
+        # (SandboxSelectionError) rather than a silent degrade to legacy
+        # container / host worktree execution, which would drop the
+        # isolation boundary without a console signal (issue #2809).
         _docker_sandbox_backend = None
         _docker_manifest_factory = None
         if _sandbox_runtime == "docker":
-            try:
-                import subprocess as _subprocess
+            import subprocess as _subprocess
 
-                from bernstein.core.sandbox.backends.docker import (
-                    DockerSandboxBackend,
-                    DockerUnavailableError,
-                )
-                from bernstein.core.sandbox.manifest import GitRepoEntry, WorkspaceManifest
+            from bernstein.core.sandbox.explicit_attach import attach_docker_backend
+            from bernstein.core.sandbox.manifest import GitRepoEntry, WorkspaceManifest
 
-                _branch_result = _subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=workdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                _current_branch = _branch_result.stdout.strip() or "HEAD"
+            _branch_result = _subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            _current_branch = _branch_result.stdout.strip() or "HEAD"
 
-                def _make_docker_manifest(
-                    _src: str = str(workdir), _branch: str = _current_branch
-                ) -> WorkspaceManifest:
-                    return WorkspaceManifest(
-                        root="/workspace",
-                        repo=GitRepoEntry(src_path=_src, branch=_branch),
-                    )
+            def _make_docker_manifest(_src: str = str(workdir), _branch: str = _current_branch) -> WorkspaceManifest:
+                return WorkspaceManifest(
+                    root="/workspace",
+                    repo=GitRepoEntry(src_path=_src, branch=_branch),
+                )
 
-                _docker_backend = DockerSandboxBackend()
-                # Fail fast at wiring time so a dead daemon still falls
-                # back to legacy isolation instead of failing per spawn.
-                _docker_backend.ensure_available()
-                _docker_sandbox_backend = _docker_backend
-                _docker_manifest_factory = _make_docker_manifest
-                logger.info(
-                    "Docker sandbox backend attached; one session per agent spawn (branch=%s)",
-                    _current_branch,
-                )
-            except DockerUnavailableError as exc:
-                logger.warning("Docker sandbox unavailable (%s); falling back to legacy container isolation", exc)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to attach Docker sandbox backend, falling back to legacy container isolation: %s",
-                    exc,
-                )
+            # Fail fast at wiring time so a dead daemon surfaces before
+            # any spawn. ``explicit=True`` turns an unavailable backend
+            # into a raised SandboxSelectionError instead of a silent
+            # host fallback.
+            _docker_sandbox_backend = attach_docker_backend(explicit=True)
+            _docker_manifest_factory = _make_docker_manifest
+            logger.info(
+                "Docker sandbox backend attached; one session per agent spawn (branch=%s)",
+                _current_branch,
+            )
 
         def _teardown_docker_sandbox() -> None:
             """Destroy any Docker sandbox sessions the backend still tracks.
