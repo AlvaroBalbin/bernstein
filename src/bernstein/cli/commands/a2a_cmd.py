@@ -237,17 +237,33 @@ def publish(
         version = installed_version
 
     try:
-        card = _load_or_issue_card(card_path, endpoint=endpoint)
+        card, signing_key = _load_or_issue_card(card_path, endpoint=endpoint)
     except (OSError, ValueError) as exc:
         _fail(f"could not resolve the capability card: {exc}")
         return
+
+    requested = surfaces or PUBLISH_SURFACES
+    # The AGNTCY ADS surface signs fresh provenance, so it needs the node's
+    # private key. In the normal mint-and-reuse flow the key sits beside the
+    # card; if an operator supplied a card without its key sidecar, fail loudly
+    # when the surface is asked for explicitly, and quietly drop it from the
+    # default set otherwise so the keyless surfaces still publish.
+    if "agntcy-ads" in requested and signing_key is None:
+        if surfaces:
+            _fail(
+                "publishing to 'agntcy-ads' needs the node signing key, but no key "
+                "sidecar was found beside the card; re-mint the card or omit this surface"
+            )
+            return
+        requested = tuple(s for s in requested if s != "agntcy-ads")
 
     try:
         publication = build_publication(
             card,
             endpoint=endpoint,
             version=version,
-            surfaces=surfaces or PUBLISH_SURFACES,
+            surfaces=requested,
+            signing_key_pem=signing_key,
         )
     except ValueError as exc:
         _fail(str(exc))
@@ -272,17 +288,23 @@ def publish(
         console.print(f"  {surface}: {path}")
 
 
-def _load_or_issue_card(card_path: Path, *, endpoint: str) -> SignedCapabilityCard:
-    """Return the node's capability card, minting and persisting it once.
+def _load_or_issue_card(card_path: Path, *, endpoint: str) -> tuple[SignedCapabilityCard, bytes | None]:
+    """Return the node's capability card and its private key, minting once.
 
     Reusing a persisted card keeps one stable identity across republications;
     minting a fresh card each time would hand peers a new key to trust on
-    every publish. The private key is written beside the card at ``0600``.
+    every publish. The private key is written beside the card at ``0600`` and
+    returned so provenance-signing surfaces (AGNTCY ADS) can reuse it. When an
+    operator supplied only a card file, the key is ``None`` and the caller
+    decides whether the missing-key surface is required.
     """
-    if card_path.exists():
-        return SignedCapabilityCard.from_json(card_path.read_text(encoding="utf-8"))
-
     key_path = card_path.with_suffix(card_path.suffix + ".key.pem")
+
+    if card_path.exists():
+        signed = SignedCapabilityCard.from_json(card_path.read_text(encoding="utf-8"))
+        private_key_pem = key_path.read_bytes() if key_path.exists() else None
+        return signed, private_key_pem
+
     private_key_pem = key_path.read_bytes() if key_path.exists() else None
 
     signed, private_key_pem = issue_capability_card(
@@ -299,7 +321,7 @@ def _load_or_issue_card(card_path: Path, *, endpoint: str) -> SignedCapabilityCa
     if not key_path.exists():
         key_path.write_bytes(private_key_pem)
         key_path.chmod(0o600)
-    return signed
+    return signed, private_key_pem
 
 
 __all__ = ["a2a_group", "publish", "verify"]

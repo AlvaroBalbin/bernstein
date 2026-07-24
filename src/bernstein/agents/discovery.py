@@ -18,11 +18,14 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from bernstein.core.protocols.a2a.publish import ResolvedPublication
 
 logger = logging.getLogger(__name__)
 
-DiscoverySourceType = Literal["local", "project", "github", "npm"]
+DiscoverySourceType = Literal["local", "project", "github", "npm", "a2a-registry"]
 
 _REGISTRY_PATH = Path(".sdd/agents/registry.json")
 _USER_AGENTS_DIR = Path.home() / ".bernstein" / "agents"
@@ -329,6 +332,58 @@ class AgentDiscovery:
         self.last_full_sync = _now_iso()
         self.save()
         return results
+
+    # ------------------------------------------------------------------ #
+    # Published-record resolution (A2A registry surfaces, #2609)           #
+    # ------------------------------------------------------------------ #
+
+    def resolve_published_record(
+        self,
+        record: dict[str, Any],
+        *,
+        required_capability: str | None = None,
+        register: bool = True,
+    ) -> ResolvedPublication:
+        """Resolve a published A2A registry record into a verified node.
+
+        Completes the discovery round-trip for any publish surface (A2A card,
+        MCP registry, or AGNTCY ADS / OASF descriptor): the record's provenance
+        is verified offline, the advertised capability is confirmed against the
+        node's signed card, and - only when it verifies - the node is recorded
+        as a directory entry. The registry is treated as a transport: an
+        unverifiable record is never registered.
+
+        Args:
+            record: A published record (as fetched from a registry index).
+            required_capability: Optional capability to confirm is advertised.
+            register: When ``True`` (default), a verified node is tracked as an
+                ``a2a-registry`` directory entry keyed by its endpoint.
+
+        Returns:
+            A ``ResolvedPublication`` describing the outcome.
+        """
+        from bernstein.core.protocols.a2a.publish import resolve_publication_capability
+
+        resolved = resolve_publication_capability(record, required_capability=required_capability)
+        if resolved.ok and register and resolved.endpoint:
+            self._register_resolved_node(resolved)
+        return resolved
+
+    def _register_resolved_node(self, resolved: ResolvedPublication) -> None:
+        """Record a verified A2A node as a directory entry (idempotent by URL)."""
+        for entry in self.directories:
+            if entry.source_type == "a2a-registry" and entry.url == resolved.endpoint:
+                entry.last_sync = _now_iso()
+                return
+        self.directories.append(
+            DirectoryEntry(
+                name=resolved.issuer or (resolved.endpoint or "a2a-node"),
+                source_type="a2a-registry",
+                url=resolved.endpoint,
+                agents=1,
+                last_sync=_now_iso(),
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # Metrics                                                              #
