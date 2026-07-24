@@ -327,6 +327,23 @@ USE_CASES: dict[str, AdapterUseCase] = {
         headline="Atlassian Rovo Dev CLI",
         binary="rovo",
     ),
+    # Not an adapter binary: a capability. Point an OpenAI-compatible adapter
+    # (ollama, qwen, aichat, pydantic_ai, ...) at any self-hosted endpoint and
+    # certify it. Surfaced with an empty binary so ``--installed`` never claims
+    # it is on $PATH; ``integrations_cmd`` appends it as a synthetic row.
+    "self-hosted-endpoints": AdapterUseCase(
+        headline="Certify any self-hosted OpenAI-compatible endpoint (vLLM, llama.cpp, TGI, NIM, LM Studio, Ollama)",
+        binary="",
+        details=(
+            "Point an OpenAI-compatible adapter at any server speaking the same "
+            "wire protocol via per-role base_url / api_key_env, then run "
+            "'bernstein endpoints certify --base-url ...' to seal a signed, "
+            "audit-chain-anchored certification receipt and "
+            "'bernstein endpoints verify' to re-check it offline. Merge-critical "
+            "roles are gated on a verifying receipt, not a boolean in config."
+        ),
+        docs_path="docs/operations/self-hosted-endpoints.md",
+    ),
 }
 
 
