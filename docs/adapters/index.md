@@ -62,7 +62,6 @@ For air-gap or BYO-model scenarios.
 
 - `iac` - infrastructure-as-code (Terraform / Pulumi) with plan-before-apply.
 - `clm` - sovereign LLM gateway over mTLS for regulated deployments.
-- `cloudflare` - Cloudflare Agents SDK via wrangler.
 - `openai_agents` - in-process OpenAI Agents SDK v2 (requires the
   `[openai]` extra).
 - `computer_use` - fronts a third-party autonomous browser / computer-use

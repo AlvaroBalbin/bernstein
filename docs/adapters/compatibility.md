@@ -38,7 +38,6 @@ Last updated: 2026-07-16
 | `pydantic_ai` | Multi (`<provider>:<model>`) | No | No |
 | `kiro` | AWS | No | No |
 | `kilo` | Stackblitz | No | Yes (ACP/MCP) |
-| `cloudflare` | Cloudflare | No | No |
 | `iac` | N/A (Terraform/Pulumi) | No | No |
 | `generic` | Any | Depends on CLI | No |
 
@@ -88,18 +87,21 @@ Compatibility details can vary by adapter version and local toolchain.
 
 Bernstein ships an expanded quality gate pipeline in `src/bernstein/core/quality/`:
 
-- Standard gates: lint, type-check, tests, coverage
-- Architecture conformance (`arch_conformance.py`, `arch_rules.py`)
-- Benchmark gate (`benchmark_gate.py`, `perf_benchmark_gate.py`)
-- Mutation testing (`mutation_testing.py`, `test_mutation_verify.py`)
+- Standard gates: lint, type-check, tests, coverage (`quality_gates.py`, `coverage_gate.py`)
+- Architecture conformance (`arch_conformance.py`)
+- Benchmark gate (`benchmark_gate.py`)
 - Dead code detection (`dead_code_detector.py`)
 - Dependency scanning (`dependency_scan.py`, `dep_validator.py`)
 - Flaky test detection (`flaky_detector.py`)
 - Integration test generation (`integration_test_gen.py`)
 - Cross-model verification (`cross_model_verifier.py`)
-- Consensus verification (`consensus_verifier.py`)
-- LLM judge (`llm_judge.py`)
-- Gate caching (`gate_cache.py`) and plugin system (`gate_plugins.py`)
+- Review consensus scoring (`review_consensus.py`)
+- Pipeline structure, cached incremental runner, and plugin system
+  (`gate_pipeline.py`, `gate_runner.py`, `gate_plugins.py`)
+- Serialized gate execution (`quality_gate_coalescer.py`)
+
+The LLM judge used for eval scoring lives outside this package, in
+`src/bernstein/eval/judge.py`.
 
 ---
 
@@ -118,10 +120,10 @@ Bernstein ships an expanded quality gate pipeline in `src/bernstein/core/quality
 Use environment-specific validation instead of relying on static matrices:
 
 1. Run `bernstein doctor`.
-2. Run your target CLI adapter smoke checks (`bernstein test-adapter <name>`).
+2. Run your target CLI adapter smoke checks (`bernstein test-adapter --adapter <name> --task "<prompt>"`).
 3. Validate required API endpoints (`/status`, `/tasks`, `/metrics`, protocol-specific routes).
 4. If using remote workers, validate cluster endpoints and auth paths.
-5. Generate a debug bundle (`bernstein debug`) for comprehensive triage information.
+5. Generate a debug bundle (`bernstein debug bundle`) for comprehensive triage information.
 
 ---
 
