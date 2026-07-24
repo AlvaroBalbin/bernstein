@@ -2,20 +2,17 @@
 # https://securitytxt.org/
 
 Contact: mailto:forte@bernstein.run
-
-Encryption: https://bernstein.dev/.well-known/security-pgp.asc
+Contact: https://github.com/sipyourdrink-ltd/bernstein/security/advisories/new
 
 Acknowledgments: https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/security/security-acknowledgments.md
 
 Policy: https://github.com/sipyourdrink-ltd/bernstein/blob/main/SECURITY.md
 
-Hiring: https://bernstein.dev/careers
-
 Preferred-Languages: en
 
-Canonical: https://bernstein.dev/.well-known/security.txt
+Canonical: https://bernstein.run/.well-known/security.txt
 
-# Reports older than 90 days without a fix should be disclosed responsibly.
-# We commit to responding within 72 hours and resolving criticals within 7 days.
+# Do not open public issues for vulnerabilities. Reports are triaged
+# within 72 hours; coordinated disclosure per the linked policy.
 
-Expires: 2027-01-01T00:00:00.000Z
+Expires: 2027-01-24T00:00:00.000Z
