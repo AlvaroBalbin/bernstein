@@ -40,10 +40,13 @@ Profiles come in two shapes, distinguished by
     Migration to the factory is therefore incremental and opt-in - an
     existing adapter gains a profile without changing how it spawns.
 
-Import note: this module deliberately depends only on
+Import note: at module load this depends only on
 :mod:`bernstein.adapters.base`, :mod:`bernstein.adapters._contract` and
 :mod:`bernstein.adapters.env_isolation`. It imports no sibling adapter,
 so the ``adapters-independent`` import-linter contract holds.
+:func:`route_and_record` imports the audit-chain recorder lazily, inside
+the function and only when a chain is supplied, so the module's load-time
+surface stays lean the way the conformance canary keeps its own.
 """
 
 from __future__ import annotations
@@ -636,6 +639,154 @@ def select_profile_for(
     )
 
 
+#: Namespace on a task's capability-addressing list that declares an
+#: adapter-capability requirement, as opposed to a skill address. A token
+#: outside this namespace (``"python"``, ``"testing"``) is skill addressing and
+#: is left to whatever consumes those; only ``capability:`` tokens shape the
+#: :class:`TaskCapabilityRequirements` the dispatch path checks a routed
+#: adapter's profile against.
+CAPABILITY_TOKEN_PREFIX = "capability:"
+
+
+def capability_requirements_from_tokens(
+    tokens: Iterable[str],
+) -> TaskCapabilityRequirements:
+    """Parse capability-addressing tokens into a requirement set.
+
+    Reads the ``capability:`` namespace of a task's capability-addressing list
+    (``Task.requires``) so a declared task need becomes the
+    :class:`TaskCapabilityRequirements` the dispatch path checks the routed
+    adapter's profile against. Tokens without the prefix are skill addressing
+    and are skipped, so a task that declares no capability requirement yields
+    the empty set every profile satisfies -- existing tasks route unchanged.
+
+    Grammar of the parsed suffix:
+
+    * ``capability:<axis>`` sets a boolean axis (``mcp_client``, ``vision``,
+      ``computer_use``, ...).
+    * ``capability:sandbox=<tier>`` requires at least that sandbox tier.
+    * ``capability:max_parallel_workers=<n>`` requires at least *n* workers.
+
+    Args:
+        tokens: The task's capability-addressing entries.
+
+    Returns:
+        The requirement set the tokens declare.
+
+    Raises:
+        ProfileValidationError: An axis is not a requestable requirement axis,
+            a boolean axis carries a value, or a value is malformed. Failing
+            loud keeps a mistyped requirement from silently passing an adapter
+            that does not support it -- the drift
+            :func:`_assert_capability_axes_are_requestable` guards at import,
+            applied here to the declaration side.
+    """
+    fields: dict[str, Any] = {}
+    for raw in tokens:
+        token = raw.strip()
+        if not token.startswith(CAPABILITY_TOKEN_PREFIX):
+            continue
+        axis, sep, value = token[len(CAPABILITY_TOKEN_PREFIX) :].partition("=")
+        axis = axis.strip()
+        value = value.strip()
+        if axis in BOOLEAN_CAPABILITIES:
+            if sep:
+                raise ProfileValidationError(f"boolean capability {axis!r} takes no value (got {value!r})")
+            fields[axis] = True
+        elif axis == "sandbox":
+            try:
+                fields["sandbox"] = SandboxTier(value)
+            except ValueError:
+                tiers = ", ".join(tier.value for tier in SandboxTier)
+                raise ProfileValidationError(f"unknown sandbox tier {value!r}; expected one of {tiers}") from None
+        elif axis == "max_parallel_workers":
+            try:
+                fields["max_parallel_workers"] = int(value)
+            except ValueError:
+                raise ProfileValidationError(f"max_parallel_workers requires an integer (got {value!r})") from None
+        else:
+            requestable = ", ".join(sorted(TaskCapabilityRequirements.__dataclass_fields__))
+            raise ProfileValidationError(f"unknown capability axis {axis!r}; requestable axes: {requestable}")
+    return TaskCapabilityRequirements(**fields)
+
+
+def route_and_record(
+    requirements: TaskCapabilityRequirements,
+    *,
+    profiles: Iterable[AdapterCapabilityProfile] | None = None,
+    audit_chain: Any | None = None,
+    run_id: str = "",
+) -> AdapterCapabilityProfile:
+    """Select an adapter for a task and anchor the decision in the audit chain.
+
+    Wraps :func:`select_profile_for` so a routing decision leaves a
+    replay-verifiable trace instead of being an unobservable side effect of
+    dispatch. This is the seam the spawn dispatch path
+    (:meth:`bernstein.core.agents.spawner_core.AgentSpawner.
+    _record_adapter_capability_selection`) calls once an adapter is resolved,
+    to anchor the profile it presented and refuse a task it cannot serve:
+
+    * On a match, the selected profile's content address is recorded, so replay
+      recomputes it and detects a changed declaration as a hash divergence
+      named by the adapter (profile drift becomes tamper-evident).
+    * On a mismatch, the content-addressed refusal receipt is anchored into the
+      HMAC chain *before* the :class:`CapabilityMismatchError` propagates, so
+      the refusal is a signed record rather than a silent fallback to a weaker
+      adapter.
+
+    Recording is opt-in: when ``audit_chain`` is ``None`` the function selects
+    (or refuses) exactly as :func:`select_profile_for` does, without touching a
+    chain. This keeps the function usable in contexts that have no chain -- for
+    example a dry-run capability probe -- and keeps this module's import surface
+    lean, since the chain module is imported lazily only when a chain is
+    supplied, the same way the conformance canary records its receipts.
+
+    Args:
+        requirements: What the task needs from whichever adapter runs it.
+        profiles: Candidate profiles. Defaults to the shipped catalogue,
+            enumerated in sorted name order for deterministic selection.
+        audit_chain: An ``AuditChainStore`` accepting the selection or refusal
+            record, or ``None`` to skip recording. Typed loosely to avoid a
+            module-level dependency on :mod:`bernstein.core.security`.
+        run_id: The run the routing decision is made for, recorded on the
+            anchored event.
+
+    Returns:
+        The first profile satisfying ``requirements``.
+
+    Raises:
+        CapabilityMismatchError: No candidate satisfies the task. The refusal
+            receipt it carries is anchored into ``audit_chain`` first when a
+            chain was supplied.
+    """
+    try:
+        selected = select_profile_for(requirements, profiles=profiles)
+    except CapabilityMismatchError as exc:
+        if audit_chain is not None:
+            from bernstein.core.security.audit_chain import record_capability_refusal
+
+            record_capability_refusal(
+                chain=audit_chain,
+                run_id=run_id,
+                receipt_hash=exc.receipt.receipt_hash,
+                requirements=exc.receipt.requirements,
+                candidates=[list(pair) for pair in exc.receipt.candidates],
+                unmet=list(exc.receipt.unmet),
+            )
+        raise
+    if audit_chain is not None:
+        from bernstein.core.security.audit_chain import record_capability_selection
+
+        record_capability_selection(
+            chain=audit_chain,
+            run_id=run_id,
+            adapter=selected.name,
+            profile_hash=selected.profile_hash,
+            requirements=requirements.to_canonical_dict(),
+        )
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Profile-to-contract cross-check
 # ---------------------------------------------------------------------------
@@ -1128,6 +1279,7 @@ def profile_hash_for(name: str) -> str | None:
 
 __all__ = [
     "BOOLEAN_CAPABILITIES",
+    "CAPABILITY_TOKEN_PREFIX",
     "PROFILES",
     "AdapterCapabilityProfile",
     "CapabilityMismatchError",
@@ -1143,12 +1295,14 @@ __all__ = [
     "assert_profile_backed_by_contract",
     "build_adapter_class_from_profile",
     "build_adapter_from_profile",
+    "capability_requirements_from_tokens",
     "get_profile",
     "iter_profiles",
     "profile_binary_for",
     "profile_built_adapter_classes",
     "profile_contract_discrepancies",
     "profile_hash_for",
+    "route_and_record",
     "sandbox_rank",
     "select_profile_for",
     "unmet_requirements",

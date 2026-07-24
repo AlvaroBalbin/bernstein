@@ -47,9 +47,11 @@ from bernstein.adapters.capability_profile import (
     UnknownProfileError,
     build_adapter_class_from_profile,
     build_adapter_from_profile,
+    capability_requirements_from_tokens,
     get_profile,
     profile_built_adapter_classes,
     profile_contract_discrepancies,
+    route_and_record,
     select_profile_for,
     unmet_requirements,
 )
@@ -567,3 +569,179 @@ class TestProfileContractVerification:
         )
         discrepancies = profile_contract_discrepancies(overreaching, spec)
         assert any("TOTALLY_INVENTED_SECRET" in reason for reason in discrepancies), discrepancies
+
+
+# ---------------------------------------------------------------------------
+# Capability-aware routing is anchored in the audit chain
+# ---------------------------------------------------------------------------
+
+
+def _audit_chain(tmp_path: Path) -> object:
+    """A hermetic HMAC audit-chain store for the routing tests."""
+    from bernstein.core.security.audit_chain import AuditChainStore
+
+    return AuditChainStore(tmp_path / "audit", key=b"k" * 32)
+
+
+class TestRouteAndRecord:
+    """Routing decisions leave a signed, replay-verifiable trace.
+
+    ``route_and_record`` wraps ``select_profile_for`` so that a match anchors
+    the presented profile hash and a mismatch anchors the refusal receipt --
+    the substrate coupling that makes adapter selection replay-verifiable
+    rather than an unobservable side effect of dispatch.
+    """
+
+    def test_match_returns_the_selected_profile(self, tmp_path: Path) -> None:
+        profile = _minimal_profile(mcp_client=True)
+        chain = _audit_chain(tmp_path)
+        selected = route_and_record(
+            TaskCapabilityRequirements(mcp_client=True),
+            profiles=(profile,),
+            audit_chain=chain,
+            run_id="run-1",
+        )
+        assert selected is profile
+
+    def test_match_records_the_presented_profile_hash(self, tmp_path: Path) -> None:
+        from bernstein.core.security.audit_chain import EVENT_ADAPTER_CAPABILITY_SELECTION
+
+        profile = _minimal_profile(mcp_client=True)
+        chain = _audit_chain(tmp_path)
+        route_and_record(
+            TaskCapabilityRequirements(mcp_client=True),
+            profiles=(profile,),
+            audit_chain=chain,
+            run_id="run-1",
+        )
+        events = chain.query(event_type=EVENT_ADAPTER_CAPABILITY_SELECTION)  # type: ignore[attr-defined]
+        assert len(events) == 1
+        # The hash the chain records is the profile's own content address, so
+        # replay detects a changed declaration as a divergence named here.
+        assert events[0].details["profile_hash"] == profile.profile_hash
+        assert events[0].details["adapter"] == profile.name
+        assert events[0].details["run_id"] == "run-1"
+        assert chain.verify()[0]  # type: ignore[attr-defined]
+
+    def test_mismatch_reraises_rather_than_falling_back(self, tmp_path: Path) -> None:
+        profile = _minimal_profile(vision=False)
+        chain = _audit_chain(tmp_path)
+        with pytest.raises(CapabilityMismatchError):
+            route_and_record(
+                TaskCapabilityRequirements(vision=True),
+                profiles=(profile,),
+                audit_chain=chain,
+                run_id="run-1",
+            )
+
+    def test_mismatch_records_the_refusal_receipt(self, tmp_path: Path) -> None:
+        from bernstein.core.security.audit_chain import EVENT_ADAPTER_CAPABILITY_REFUSAL
+
+        profile = _minimal_profile(vision=False)
+        chain = _audit_chain(tmp_path)
+        with pytest.raises(CapabilityMismatchError) as excinfo:
+            route_and_record(
+                TaskCapabilityRequirements(vision=True),
+                profiles=(profile,),
+                audit_chain=chain,
+                run_id="run-1",
+            )
+        events = chain.query(event_type=EVENT_ADAPTER_CAPABILITY_REFUSAL)  # type: ignore[attr-defined]
+        assert len(events) == 1
+        assert events[0].details["receipt_hash"] == excinfo.value.receipt.receipt_hash
+        assert events[0].details["unmet"] == ["vision"]
+        assert events[0].details["candidates"] == [[profile.name, profile.profile_hash]]
+        assert chain.verify()[0]  # type: ignore[attr-defined]
+
+    def test_no_chain_still_selects_without_recording(self, tmp_path: Path) -> None:
+        """A chainless call keeps working: recording is opt-in, not required."""
+        profile = _minimal_profile(mcp_client=True)
+        selected = route_and_record(
+            TaskCapabilityRequirements(mcp_client=True),
+            profiles=(profile,),
+        )
+        assert selected is profile
+
+    def test_no_chain_still_refuses(self) -> None:
+        profile = _minimal_profile(vision=False)
+        with pytest.raises(CapabilityMismatchError):
+            route_and_record(
+                TaskCapabilityRequirements(vision=True),
+                profiles=(profile,),
+            )
+
+    def test_match_records_nothing_on_refusal_channel(self, tmp_path: Path) -> None:
+        """A satisfied route must not emit a refusal event, and vice versa."""
+        from bernstein.core.security.audit_chain import (
+            EVENT_ADAPTER_CAPABILITY_REFUSAL,
+            EVENT_ADAPTER_CAPABILITY_SELECTION,
+        )
+
+        profile = _minimal_profile(mcp_client=True)
+        chain = _audit_chain(tmp_path)
+        route_and_record(
+            TaskCapabilityRequirements(mcp_client=True),
+            profiles=(profile,),
+            audit_chain=chain,
+            run_id="run-1",
+        )
+        assert chain.query(event_type=EVENT_ADAPTER_CAPABILITY_REFUSAL) == []  # type: ignore[attr-defined]
+        assert len(chain.query(event_type=EVENT_ADAPTER_CAPABILITY_SELECTION)) == 1  # type: ignore[attr-defined]
+
+
+class TestCapabilityRequirementsFromTokens:
+    """Parse a task's capability-addressing tokens into requirements.
+
+    ``Task.requires`` is a capability-addressing list. The ``capability:``
+    namespace of that list is what the dispatch path checks a routed adapter's
+    profile against, so the parser is the bridge from a declared task need to a
+    :class:`TaskCapabilityRequirements`. Non-``capability:`` tokens are skill
+    addressing and are ignored, so an existing task declares no requirement and
+    is satisfied by every profile.
+    """
+
+    def test_no_tokens_yields_empty_requirements(self) -> None:
+        assert capability_requirements_from_tokens([]) == TaskCapabilityRequirements()
+
+    def test_skill_tokens_are_ignored(self) -> None:
+        # The pre-existing capability-addressing vocabulary (skills) must not
+        # accidentally become adapter-capability requirements.
+        assert capability_requirements_from_tokens(["python", "testing"]) == TaskCapabilityRequirements()
+
+    def test_boolean_axis_token_sets_the_axis(self) -> None:
+        reqs = capability_requirements_from_tokens(["capability:mcp_client"])
+        assert reqs == TaskCapabilityRequirements(mcp_client=True)
+
+    def test_multiple_axes_union(self) -> None:
+        reqs = capability_requirements_from_tokens(["capability:vision", "python", "capability:mcp_server"])
+        assert reqs == TaskCapabilityRequirements(vision=True, mcp_server=True)
+
+    def test_sandbox_tier_token(self) -> None:
+        reqs = capability_requirements_from_tokens(["capability:sandbox=container"])
+        assert reqs == TaskCapabilityRequirements(sandbox=SandboxTier.CONTAINER)
+
+    def test_max_parallel_workers_token(self) -> None:
+        reqs = capability_requirements_from_tokens(["capability:max_parallel_workers=4"])
+        assert reqs == TaskCapabilityRequirements(max_parallel_workers=4)
+
+    def test_whitespace_is_tolerated(self) -> None:
+        reqs = capability_requirements_from_tokens(["  capability:vision  "])
+        assert reqs == TaskCapabilityRequirements(vision=True)
+
+    def test_unknown_axis_fails_loud(self) -> None:
+        # A mistyped requirement must surface, not silently pass an adapter that
+        # does not support it -- the same drift the import-time axis check guards.
+        with pytest.raises(ProfileValidationError):
+            capability_requirements_from_tokens(["capability:teleportation"])
+
+    def test_boolean_axis_with_value_is_refused(self) -> None:
+        with pytest.raises(ProfileValidationError):
+            capability_requirements_from_tokens(["capability:vision=true"])
+
+    def test_bad_sandbox_tier_is_refused(self) -> None:
+        with pytest.raises(ProfileValidationError):
+            capability_requirements_from_tokens(["capability:sandbox=moon"])
+
+    def test_non_integer_worker_count_is_refused(self) -> None:
+        with pytest.raises(ProfileValidationError):
+            capability_requirements_from_tokens(["capability:max_parallel_workers=lots"])
