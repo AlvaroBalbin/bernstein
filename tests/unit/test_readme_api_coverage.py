@@ -301,6 +301,8 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "pool",
         # Agent-posted, journal-anchored task artifacts (issue #2553)
         "artifacts",
+        # Bot-added: drift autofix (regen_contract_drift.py)
+        "endpoints",
     }
 )
 
