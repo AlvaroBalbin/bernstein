@@ -301,6 +301,8 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "pool",
         # Agent-posted, journal-anchored task artifacts (issue #2553)
         "artifacts",
+        # Certify/verify self-hosted OpenAI-compatible endpoints (issue #2889)
+        "endpoints",
     }
 )
 

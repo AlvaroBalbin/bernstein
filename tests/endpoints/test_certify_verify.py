@@ -7,7 +7,6 @@ No external service needed.
 from __future__ import annotations
 
 import json
-import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from bernstein.core.endpoints.conformance import PATCH_REFERENCE_DIFF
 
 # ---------------------------------------------------------------------------
 # Fake OpenAI-compatible server
@@ -45,7 +46,16 @@ _FAKE_TOOL_CALL_RESPONSE = {
             "message": {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{"id": "call_abc", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"foo.py"}'}}],
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "record_finding",
+                            "arguments": '{"path":"src/app.py","line":12,"message":"unused import"}',
+                        },
+                    }
+                ],
             },
             "finish_reason": "tool_calls",
         }
@@ -57,7 +67,7 @@ _STREAM_CHUNKS = [
     b'data: {"id":"s01","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"po"},"finish_reason":null}]}\n\n',
     b'data: {"id":"s01","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"content":"ng"},"finish_reason":null}]}\n\n',
     b'data: {"id":"s01","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
-    b'data: [DONE]\n\n',
+    b"data: [DONE]\n\n",
 ]
 
 
@@ -109,7 +119,26 @@ class _FakeOAIHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp_body)
             self.wfile.flush()
         else:
-            resp_body = json.dumps(_FAKE_CHAT_RESPONSE).encode()
+            prompt = "\n".join(str(m.get("content", "")) for m in body.get("messages", []))
+            if "unified diff" in prompt:
+                # Patch-fidelity probe: return the reference diff byte-exactly.
+                patch_resp = {
+                    "id": "chatcmpl-patch01",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": PATCH_REFERENCE_DIFF},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 40, "total_tokens": 60},
+                }
+                resp_body = json.dumps(patch_resp).encode()
+            else:
+                resp_body = json.dumps(_FAKE_CHAT_RESPONSE).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(resp_body)))
@@ -132,19 +161,22 @@ def fake_oai_server():
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_certify(base_url, model, out_dir, token="", strict=False, timeout=5):
     try:
         from bernstein.core.endpoints.certify import certify_endpoint
-        return certify_endpoint(base_url=base_url, token=token, model=model,
-                                out_dir=out_dir, strict=strict, timeout=timeout)
+
+        return certify_endpoint(
+            base_url=base_url, token=token, model=model, out_dir=out_dir, strict=strict, timeout=timeout
+        )
     except ImportError:
         return _shim_certify(base_url, model, out_dir, token, strict, timeout)
 
 
 def _shim_certify(base_url, model, out_dir, token, strict, timeout):
     import hashlib
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     probes = []
 
@@ -161,7 +193,8 @@ def _shim_certify(base_url, model, out_dir, token, strict, timeout):
     def _post(path, payload):
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
-            base_url.rstrip("/") + path, data=data,
+            base_url.rstrip("/") + path,
+            data=data,
             headers={"Content-Type": "application/json"},
         )
         if token:
@@ -179,24 +212,35 @@ def _shim_certify(base_url, model, out_dir, token, strict, timeout):
     probes.append({"id": "models_list", "required": True, "passed": status == 200})
 
     # Probe 2: POST chat completions (non-streaming)
-    status, body = _post("/chat/completions",
-                         {"model": model, "messages": [{"role": "user", "content": "ping"}]})
+    status, body = _post("/chat/completions", {"model": model, "messages": [{"role": "user", "content": "ping"}]})
     parsed = json.loads(body) if status == 200 and body else {}
     probes.append({"id": "chat_completions", "required": True, "passed": status == 200})
 
     # Probe 3: streaming — check status and that response contains SSE data
-    status_s, body_s = _post("/chat/completions",
-                              {"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": True})
+    status_s, body_s = _post(
+        "/chat/completions", {"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": True}
+    )
     streaming_ok = status_s == 200 and b"data:" in body_s
     probes.append({"id": "chat_streaming", "required": True, "passed": streaming_ok})
 
     # Probe 4: tool_calls (optional)
-    status_t, body_t = _post("/chat/completions", {
-        "model": model,
-        "messages": [{"role": "user", "content": "read foo.py"}],
-        "tools": [{"type": "function", "function": {"name": "read_file", "description": "read",
-                   "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
-    })
+    status_t, body_t = _post(
+        "/chat/completions",
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "read foo.py"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "read",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    },
+                }
+            ],
+        },
+    )
     tool_ok = False
     if status_t == 200 and body_t:
         resp = json.loads(body_t)
@@ -245,6 +289,7 @@ def _shim_certify(base_url, model, out_dir, token, strict, timeout):
 def _run_verify(cert_path, *, skip_signature=True):
     try:
         from bernstein.core.endpoints.verify import verify_cert
+
         return verify_cert(cert_path=cert_path)
     except ImportError:
         return _shim_verify(cert_path)
@@ -271,10 +316,11 @@ def _shim_verify(cert_path):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestCertifyBasicPass:
     def test_record_schema(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        assert record["schema"] == "bernstein.endpoint.certification.v1"
+        assert record["schema_version"] == 1
 
     def test_base_url_preserved(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
@@ -294,7 +340,7 @@ class TestCertifyBasicPass:
 
     def test_required_probes_all_pass(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        failures = [p for p in record["probes"] if p["required"] and not p["passed"]]
+        failures = [p for p in record["probes"] if not p["passed"]]
         assert failures == []
 
     def test_cert_file_written(self, fake_oai_server, tmp_path):
@@ -314,40 +360,36 @@ class TestCertifyBasicPass:
 
     def test_install_key_fp_present(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        assert "install_key_fp" in record
+        assert record["signer_public_key_pem"]
 
 
 class TestCertifyProbeDetails:
-    def test_models_list_probe_passes(self, fake_oai_server, tmp_path):
-        record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        probe = next(p for p in record["probes"] if p["id"] == "models_list")
-        assert probe["passed"] is True
-        assert probe["required"] is True
+    def _probe(self, record, name):
+        return next(p for p in record["probes"] if p["probe"] == name)
 
-    def test_chat_completions_probe_passes(self, fake_oai_server, tmp_path):
+    def test_reachability_probe_passes(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        probe = next(p for p in record["probes"] if p["id"] == "chat_completions")
-        assert probe["passed"] is True
+        assert self._probe(record, "reachability")["passed"] is True
 
-    def test_streaming_probe_passes(self, fake_oai_server, tmp_path):
+    def test_chat_completion_probe_passes(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        probe = next(p for p in record["probes"] if p["id"] == "chat_streaming")
-        assert probe["passed"] is True
+        assert self._probe(record, "chat_completion")["passed"] is True
 
-    def test_tool_calls_probe_is_optional(self, fake_oai_server, tmp_path):
+    def test_tool_calling_probe_passes(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        probe = next(p for p in record["probes"] if p["id"] == "tool_calls")
-        assert probe["required"] is False
+        assert self._probe(record, "tool_calling")["passed"] is True
 
-    def test_finish_reason_probe_passes(self, fake_oai_server, tmp_path):
+    def test_patch_fidelity_probe_passes(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        probe = next(p for p in record["probes"] if p["id"] == "finish_reason")
-        assert probe["passed"] is True
+        assert self._probe(record, "patch_fidelity")["passed"] is True
 
-    def test_assistant_role_probe_passes(self, fake_oai_server, tmp_path):
+    def test_timeout_behavior_probe_passes(self, fake_oai_server, tmp_path):
         record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
-        probe = next(p for p in record["probes"] if p["id"] == "assistant_role")
-        assert probe["passed"] is True
+        assert self._probe(record, "timeout_behavior")["passed"] is True
+
+    def test_context_floor_probe_passes(self, fake_oai_server, tmp_path):
+        record = _run_certify(fake_oai_server, "test-model", tmp_path / "certs")
+        assert self._probe(record, "context_floor")["passed"] is True
 
 
 class TestVerifyLoop:
@@ -403,7 +445,9 @@ class TestCertifyStrictMode:
     def test_non_strict_passes_even_if_optional_fails(self, tmp_path):
         # Server that returns 200 for everything but no tool_calls in response
         class _NoToolServer(BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args): pass
+            def log_message(self, fmt, *args):
+                pass
+
             def do_GET(self):
                 if self.path == "/v1/models":
                     body = json.dumps(_FAKE_MODELS_RESPONSE).encode()
@@ -414,7 +458,9 @@ class TestCertifyStrictMode:
                     self.wfile.write(body)
                     self.wfile.flush()
                 else:
-                    self.send_response(404); self.end_headers()
+                    self.send_response(404)
+                    self.end_headers()
+
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(length) if length else b"{}"
@@ -425,22 +471,23 @@ class TestCertifyStrictMode:
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Content-Length", str(len(full)))
                     self.end_headers()
-                    self.wfile.write(full); self.wfile.flush()
+                    self.wfile.write(full)
+                    self.wfile.flush()
                 else:
                     resp = json.dumps(_FAKE_CHAT_RESPONSE).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(resp)))
                     self.end_headers()
-                    self.wfile.write(resp); self.wfile.flush()
+                    self.wfile.write(resp)
+                    self.wfile.flush()
 
         server = HTTPServer(("127.0.0.1", 0), _NoToolServer)
         port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         try:
-            record = _run_certify(f"http://127.0.0.1:{port}/v1", "test-model",
-                                  tmp_path / "certs", strict=False)
+            record = _run_certify(f"http://127.0.0.1:{port}/v1", "test-model", tmp_path / "certs", strict=False)
             assert record["passed"] is True
         finally:
             server.shutdown()
@@ -453,7 +500,7 @@ class TestCertifyBadServer:
 
     def test_unreachable_all_probes_failed(self, tmp_path):
         record = _run_certify("http://127.0.0.1:1/v1", "test-model", tmp_path / "certs", timeout=1)
-        assert all(not p["passed"] for p in record["probes"] if p["required"])
+        assert all(not p["passed"] for p in record["probes"])
 
 
 class TestCertifyDifferentModels:
@@ -471,8 +518,7 @@ class TestIntegrationsListEntry:
             pytest.skip("use_cases module not importable")
 
         if isinstance(USE_CASES, dict):
-            assert "self-hosted-endpoints" in USE_CASES, \
-                "USE_CASES missing 'self-hosted-endpoints' key"
+            assert "self-hosted-endpoints" in USE_CASES, "USE_CASES missing 'self-hosted-endpoints' key"
             entry = USE_CASES["self-hosted-endpoints"]
         else:
             names = [getattr(uc, "name", None) for uc in USE_CASES]
@@ -481,5 +527,4 @@ class TestIntegrationsListEntry:
 
         # AdapterUseCase uses docs_path, not adapters field
         docs = getattr(entry, "docs_path", "") or ""
-        assert "self-hosted-endpoints" in docs, \
-            f"docs_path should reference self-hosted-endpoints, got: {docs!r}"
+        assert "self-hosted-endpoints" in docs, f"docs_path should reference self-hosted-endpoints, got: {docs!r}"

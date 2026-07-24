@@ -150,6 +150,29 @@ def test_enumerate_rows_includes_generic_adapter() -> None:
     assert "generic" in names
 
 
+def test_enumerate_rows_includes_self_hosted_endpoints() -> None:
+    """AC3: the self-hosted OpenAI-compatible endpoint path is surfaced.
+
+    It is a capability, not an installable binary, so it carries no binary
+    and never reports as ``installed``. It links to the operator docs page.
+    """
+    rows = _enumerate_rows()
+    by_name = {row["name"]: row for row in rows}
+    assert "self-hosted-endpoints" in by_name
+    row = by_name["self-hosted-endpoints"]
+    assert row["binary"] == ""
+    assert row["installed"] is False
+    assert row["headline"]
+    assert row["docs"] == "docs/operations/self-hosted-endpoints.md"
+
+
+def test_integrations_list_shows_self_hosted_endpoint_path(runner: CliRunner) -> None:
+    """AC3: ``integrations list`` surfaces the self-hosted endpoint path."""
+    result = runner.invoke(cli, ["integrations", "list"])
+    assert result.exit_code == 0, result.output
+    assert "self-hosted-endpoints" in result.output
+
+
 def test_filter_installed_predicate() -> None:
     """``_filter_installed`` keeps only rows with ``installed=True``."""
     rows: list[dict[str, Any]] = [

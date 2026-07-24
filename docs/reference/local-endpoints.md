@@ -56,6 +56,13 @@ bernstein doctor --endpoint http://127.0.0.1:11434/v1 --role manager   # evaluat
 bernstein doctor --endpoint http://127.0.0.1:11434/v1 --json           # machine-readable verdicts
 ```
 
+`bernstein endpoints certify --base-url <url>` is the same certification
+under a name that reads for any self-hosted OpenAI-compatible endpoint, and
+`bernstein endpoints verify --base-url <url> --model <id>` re-checks a stored
+receipt offline. See
+[Self-hosted OpenAI-compatible endpoints](../operations/self-hosted-endpoints.md)
+for the endpoint-family table and the full certify -> verify walkthrough.
+
 The doctor runs a fixed conformance subset with pinned prompts at
 `temperature 0`:
 
