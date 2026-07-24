@@ -64,9 +64,7 @@ def test_endpoints_certify_json_carries_signed_record(tmp_path: Path, monkeypatc
     """AC2: the JSON view exposes the signed-record fields (fingerprint, anchor)."""
     _isolate(tmp_path, monkeypatch)
     with stub_endpoint_server() as base_url:
-        result = _invoke(
-            ["endpoints", "certify", "--base-url", base_url, "--model", "tiny-coder", "--json"]
-        )
+        result = _invoke(["endpoints", "certify", "--base-url", base_url, "--model", "tiny-coder", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["model"] == "tiny-coder"
@@ -125,9 +123,7 @@ def test_endpoints_verify_json_reports_ok(tmp_path: Path, monkeypatch: pytest.Mo
     _isolate(tmp_path, monkeypatch)
     with stub_endpoint_server() as base_url:
         _invoke(["endpoints", "certify", "--base-url", base_url, "--model", "tiny-coder"])
-    result = _invoke(
-        ["endpoints", "verify", "--base-url", base_url, "--model", "tiny-coder", "--json"]
-    )
+    result = _invoke(["endpoints", "verify", "--base-url", base_url, "--model", "tiny-coder", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["ok"] is True
@@ -138,9 +134,7 @@ def test_endpoints_verify_json_reports_ok(tmp_path: Path, monkeypatch: pytest.Mo
 def test_endpoints_verify_missing_receipt_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifying an endpoint that was never certified fails closed."""
     _isolate(tmp_path, monkeypatch)
-    result = _invoke(
-        ["endpoints", "verify", "--base-url", "http://127.0.0.1:9/v1", "--model", "ghost", "--json"]
-    )
+    result = _invoke(["endpoints", "verify", "--base-url", "http://127.0.0.1:9/v1", "--model", "ghost", "--json"])
     assert result.exit_code == 1
     payload = json.loads(result.output)
     assert payload["ok"] is False
@@ -161,8 +155,6 @@ def test_endpoints_verify_detects_tampered_receipt(tmp_path: Path, monkeypatch: 
     receipt.write_text(json.dumps(data, separators=(",", ":"), sort_keys=True))
 
     # The tampered file no longer matches the requested (base_url, model).
-    result = _invoke(
-        ["endpoints", "verify", "--base-url", base_url, "--model", "tiny-coder", "--json"]
-    )
+    result = _invoke(["endpoints", "verify", "--base-url", base_url, "--model", "tiny-coder", "--json"])
     assert result.exit_code == 1
     assert json.loads(result.output)["ok"] is False
