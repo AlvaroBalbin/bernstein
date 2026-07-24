@@ -970,8 +970,14 @@ def _run_endpoint_certification(
     timeout: float,
     roles: tuple[str, ...],
     as_json: bool,
+    model_flag: str = "--endpoint-model",
 ) -> int:
     """Probe an OpenAI-compatible endpoint and seal a certification receipt.
+
+    ``model_flag`` names the option a caller should pass to set the model
+    explicitly; it appears only in the "cannot resolve a model" message so
+    the shared implementation can serve both ``doctor --endpoint``
+    (``--endpoint-model``) and ``endpoints certify`` (``--model``).
 
     Returns the process exit code: 0 when every evaluated role certified,
     1 when at least one role was rejected, 2 when no model could be
@@ -1003,7 +1009,7 @@ def _run_endpoint_certification(
     if not resolved_model:
         console.print(
             "[red]Cannot resolve a model for this endpoint.[/red] The /models "
-            "listing is unavailable; pass --endpoint-model explicitly."
+            f"listing is unavailable; pass {model_flag} explicitly."
         )
         return 2
 
