@@ -164,7 +164,10 @@ dev = [
     "diff-cover>=9.0",  # Per-PR diff coverage gate
     # PDF re-parse for tests that assert reportlab-emitted Article 12
     # PDFs are well-formed (tests/unit/compliance/test_article12.py).
-    "pypdf>=4.0",
+    # Floor raised to the patched release for CVE-2026-59935 (fixed
+    # 6.14.2) and CVE-2026-59936 (fixed 6.14.1): crafted-PDF inline-image
+    # denial of service.
+    "pypdf>=6.14.2",
     # Resource-leak / RSS / fd-count probes for the TC-C stress suite
     # (tests/stress/*). Pure-Python wrappers around platform APIs, MIT-
     # licensed, no native compile required. Tests degrade gracefully when
@@ -799,8 +802,9 @@ dev = [
     "syrupy>=4.6",
     "diff-cover>=9.0",
     # PDF re-parse for Article 12 evidence tests (mirror of
-    # [project.optional-dependencies].dev).
-    "pypdf>=4.0",
+    # [project.optional-dependencies].dev).  Floor raised to the patched
+    # release for CVE-2026-59935 / CVE-2026-59936 (crafted-PDF DoS).
+    "pypdf>=6.14.2",
     # Resource-leak probes for the TC-C stress suite (mirror of
     # [project.optional-dependencies].dev).  Optional at runtime - the
     # stress suite ``importorskip``s when missing.
