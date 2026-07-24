@@ -154,10 +154,34 @@ against the operator's published key rather than trust-on-first-use.
 ## Publish for discovery
 
 `bernstein a2a publish --endpoint https://node.example/a2a` projects the node's
-signed capability card into agent-registry manifests (A2A card + MCP registry),
-each carrying a verifiable publisher fingerprint, so peers discover the node by
-verifiable capability rather than by an opaque URL. The AGNTCY ADS / OASF
-descriptor surface is a separate follow-up.
+signed capability card into agent-registry manifests, each carrying a verifiable
+publisher fingerprint, so peers discover the node by verifiable capability
+rather than by an opaque URL. Three surfaces are emitted (repeat `--surface` to
+narrow):
+
+| Surface | Record | Trust root |
+|---|---|---|
+| `a2a-card` | The signed capability card itself (JWS per RFC 7515 over RFC 8785 canonical bytes). | The card signature. |
+| `mcp-registry` | A `server.json`-shaped record carrying the `ed25519/<fp>` publisher block the MCP verifier already parses, plus a `sha256/` content hash over the embedded card. | The card signature + content hash. |
+| `agntcy-ads` | An [OASF](https://schema.oasf.outshift.com/) capability descriptor — a deterministic projection of the signed card — bound to the node's key by a Sigstore-style provenance statement: a detached JWS (RFC 7515 §A.5) over the RFC 8785-canonical descriptor, signed with the card's Ed25519 key. | The provenance signature (verified against the card key). |
+
+The `agntcy-ads` surface signs a fresh provenance, so it needs the node's
+private key. In the normal mint-and-reuse flow the key sits beside the card
+(`<card>.key.pem`, `0600`); if only a card file is present the surface is skipped
+by default, or fails loudly when requested with `--surface agntcy-ads`. Online
+keyless submission (Fulcio + Rekor) for the provenance is a separate follow-up;
+the emitted record verifies offline today. Every record is deterministic:
+republishing an unchanged node rewrites identical bytes.
+
+### Resolve a published record
+
+A peer that fetched any of these records runs the full round-trip offline —
+verify provenance, then confirm the capability it needs is one the node's signed
+card actually advertises — via `resolve_publication_capability` (or
+`AgentDiscovery.resolve_published_record`, which additionally tracks a verified
+node as an `a2a-registry` directory entry). Resolution fails on a tampered record
+or a missing capability, and the registry never becomes an authority: an
+unverifiable record is never registered.
 
 ## Related
 

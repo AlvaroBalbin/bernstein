@@ -16,6 +16,15 @@ All notable project changes are tracked here (code + docs).
   receipt the caller verifies offline with `bernstein a2a verify`. Off by
   default behind `BERNSTEIN_A2A_SERVER_ENABLED`. See
   [`docs/operations/a2a-server.md`](operations/a2a-server.md). Refs #2609.
+- A2A registry publication third surface: `bernstein a2a publish` now emits an
+  AGNTCY ADS record alongside the `a2a-card` and `mcp-registry` surfaces. The
+  record is an OASF capability descriptor — a deterministic projection of the
+  signed card — bound to the node's Ed25519 key by a detached-JWS provenance
+  signature verified offline against the card key. Discovery gains a
+  resolve-and-confirm round-trip (`resolve_publication_capability` /
+  `AgentDiscovery.resolve_published_record`) that works across all three
+  surfaces: verify provenance, then confirm the required capability against the
+  node's signed card, registering only records that verify. Refs #2609.
 
 ## [3.5.0] - 2026-07-16
 
