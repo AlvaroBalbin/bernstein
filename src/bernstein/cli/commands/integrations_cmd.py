@@ -33,6 +33,11 @@ FORMAT_JSON = "json"
 DOCS_INDEX = "docs/adapters/index.md"
 CONFIG_KNOB = "cli"
 
+#: Synthetic listing entry (not a registered adapter) for the self-hosted
+#: OpenAI-compatible endpoint path. Sourced from ``USE_CASES`` and appended in
+#: :func:`_enumerate_rows`.
+SELF_HOSTED_ENDPOINTS_KEY = "self-hosted-endpoints"
+
 
 def _fallback_headline(adapter_obj: object) -> str:
     """Use the first line of the module docstring when no curated copy exists.
@@ -109,6 +114,15 @@ def _enumerate_rows() -> list[dict[str, object]]:
     if "generic" not in seen:
         generic_mod = importlib.import_module("bernstein.adapters.generic")
         rows.append(_row_for("generic", generic_mod.GenericAdapter))
+
+    # The self-hosted OpenAI-compatible endpoint path is a capability, not an
+    # adapter binary: point an OpenAI-compatible adapter at a self-hosted
+    # server and certify it. Surface it so operators find the path in the
+    # listing instead of by reading adapter source. Its curated use-case
+    # entry supplies the headline, so ``_row_for`` never dereferences the
+    # (absent) adapter object.
+    if SELF_HOSTED_ENDPOINTS_KEY not in seen and SELF_HOSTED_ENDPOINTS_KEY in USE_CASES:
+        rows.append(_row_for(SELF_HOSTED_ENDPOINTS_KEY, None))
 
     rows.sort(key=lambda r: str(r["name"]))
     return rows
@@ -228,6 +242,7 @@ __all__ = [
     "DOCS_INDEX",
     "FORMAT_JSON",
     "FORMAT_TABLE",
+    "SELF_HOSTED_ENDPOINTS_KEY",
     "_enumerate_rows",
     "_filter_installed",
     "_row_for",

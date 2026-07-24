@@ -64,6 +64,7 @@ from bernstein.cli.commands.consensus_cmd import consensus_group
 from bernstein.cli.commands.criterion_profile_cmd import criterion_profile_group
 from bernstein.cli.commands.decisions_cmd import decisions_group
 from bernstein.cli.commands.desktop_register_cmd import desktop_register_cmd
+from bernstein.cli.commands.endpoints_cmd import endpoints_group
 from bernstein.cli.commands.events_cmd import events_group
 from bernstein.cli.commands.export_cmd import export_cmd
 from bernstein.cli.commands.fleet_cmd import fleet_group
@@ -1023,6 +1024,7 @@ cli.add_command(stop)
 cli.add_command(test_adapter, "test-adapter")
 cli.add_command(adapters_group, "adapters")
 cli.add_command(integrations_group, "integrations")
+cli.add_command(endpoints_group, "endpoints")
 cli.add_command(trackers_group, "trackers")
 cli.add_command(run, "run")  # visible: `bernstein run [plan.yaml]`
 cli.add_command(cook, "cook")

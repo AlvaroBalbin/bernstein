@@ -427,6 +427,7 @@ nav:
           - API server operations: operations/api.md
           - Supervisor API: api/supervisor.md
           - Local endpoints: reference/local-endpoints.md
+          - Self-hosted endpoints: operations/self-hosted-endpoints.md
           - ACP bridge: reference/acp-bridge.md
           - ACP server and client roles: interop/acp.md
           - A2A signed agent cards: architecture/a2a.md
