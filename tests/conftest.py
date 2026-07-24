@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 _MAX_RSS_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 _SPAWNER_TMP_REPO_TESTS = {
+    "test_adapter_model_default.py",
     "test_agent_signals.py",
     "test_approval_gates.py",
     "test_conflict_resolution.py",
@@ -68,6 +69,7 @@ _SPAWNER_TMP_REPO_TESTS = {
     "test_evolve_mode.py",
     "test_failure_reduction.py",
     "test_idle_agent_detection.py",
+    "test_manager_write_boundary.py",
     "test_mcp_config.py",
     "test_mcp_manager.py",
     "test_mcp_registry.py",
