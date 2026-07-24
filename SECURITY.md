@@ -8,7 +8,7 @@
 
 ### Preferred channel - Email
 
-**forte@bernstein.run** (PGP key: `/.well-known/security-pgp.asc`)
+**forte@bernstein.run**
 
 Reports are triaged within 72 hours.
 
