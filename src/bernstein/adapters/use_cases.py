@@ -327,6 +327,20 @@ USE_CASES: dict[str, AdapterUseCase] = {
         headline="Atlassian Rovo Dev CLI",
         binary="rovo",
     ),
+    "self-hosted-endpoints": AdapterUseCase(
+        headline="Self-hosted OpenAI-compatible endpoint (vLLM, llama.cpp, TGI, NIM, LM Studio, Ollama)",
+        binary="",
+        details=(
+            "Point the clm or ollama adapter at any OpenAI-compatible "
+            "inference server. Qualify the endpoint with "
+            "`bernstein endpoints certify --base-url <url>` to get a "
+            "signed certification record; merge-critical roles refuse an "
+            "uncertified endpoint at config validation. "
+            "Exercised families: vLLM, llama.cpp server, TGI, NVIDIA NIM, "
+            "LM Studio, Ollama."
+        ),
+        docs_path="docs/operations/self-hosted-endpoints.md",
+    ),
 }
 
 
