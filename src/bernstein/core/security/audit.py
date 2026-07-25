@@ -27,6 +27,7 @@ import secrets
 import shutil
 import stat
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -336,6 +337,32 @@ def _compute_hmac(key: bytes, prev_hmac: str, entry: dict[str, Any]) -> str:
     return _hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
 
 
+#: Per-audit-dir re-entrancy state for :func:`_chain_append_lock`.
+#:
+#: ``flock`` locks attach to an *open file description*, not to a process or a
+#: thread, so a second ``os.open`` + ``flock(LOCK_EX)`` from the thread that
+#: already holds the lock blocks on itself. That makes the naive way of turning
+#: "read the head" and "append the record" into one atomic section -- wrapping
+#: :meth:`AuditLog.log` in another ``_chain_append_lock`` -- a deadlock. The
+#: per-thread depth counter lets the outermost acquisition own the ``flock``
+#: while inner ones pass through, and the per-dir ``RLock`` keeps a *different*
+#: thread out for the whole nested section, so re-entrancy never widens the
+#: window it exists to close.
+_APPEND_GUARDS: dict[str, threading.RLock] = {}
+_APPEND_GUARDS_LOCK = threading.Lock()
+_APPEND_DEPTH = threading.local()
+
+
+def _append_guard(audit_key: str) -> threading.RLock:
+    """Return the process-wide re-entrant guard for one audit dir."""
+    with _APPEND_GUARDS_LOCK:
+        guard = _APPEND_GUARDS.get(audit_key)
+        if guard is None:
+            guard = threading.RLock()
+            _APPEND_GUARDS[audit_key] = guard
+        return guard
+
+
 @contextlib.contextmanager
 def _chain_append_lock(audit_dir: Path) -> Iterator[None]:
     """Serialise daily-log appends across processes via ``flock(LOCK_EX)``.
@@ -353,20 +380,45 @@ def _chain_append_lock(audit_dir: Path) -> Iterator[None]:
     the previous day). Falls back to a no-op on platforms without ``fcntl``
     (Windows); the in-process locks callers may hold remain the only ordering
     there, matching how the lineage spine degrades.
+
+    The section is re-entrant *within one thread*: a caller that must read the
+    chain head and append the record that sits on it without an interleaving
+    writer holds this lock across both, and the ``AuditLog.log`` inside it
+    re-enters rather than deadlocking. Other threads and other processes still
+    wait for the outermost section to end.
     """
     audit_dir.mkdir(parents=True, exist_ok=True)
-    if fcntl is None:  # pragma: no cover - Windows path
-        yield
-        return
-    lock_path = audit_dir / ".chain.lock"
-    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    audit_key = str(audit_dir.resolve())
+    guard = _append_guard(audit_key)
+    depths: dict[str, int] | None = getattr(_APPEND_DEPTH, "depths", None)
+    if depths is None:
+        depths = {}
+        _APPEND_DEPTH.depths = depths
+
+    with guard:
+        depths[audit_key] = depths.get(audit_key, 0) + 1
+        try:
+            if depths[audit_key] > 1:
+                # Already inside this thread's section: the outermost frame
+                # holds the flock, so re-taking it would block on ourselves.
+                yield
+                return
+            if fcntl is None:  # pragma: no cover - Windows path
+                yield
+                return
+            lock_path = audit_dir / ".chain.lock"
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+        finally:
+            depths[audit_key] -= 1
+            if not depths[audit_key]:
+                del depths[audit_key]
 
 
 def _path_size(path: Path) -> int:
@@ -876,6 +928,43 @@ class AuditLog:
             if tip is not None:
                 return tip
         return _GENESIS_HMAC
+
+    # -- head ---------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def append_transaction(self) -> Iterator[None]:
+        """Hold the chain against other writers for a read-then-append section.
+
+        :meth:`resync_head` is only meaningful inside this section: outside it,
+        another writer can append between the read and the record that is
+        supposed to sit on what was read. Re-entrant for the calling thread, so
+        the :meth:`log` inside the section does not block on itself; exclusive
+        against every other thread and process.
+        """
+        with _chain_append_lock(self._audit_dir):
+            yield
+
+    def resync_head(self) -> str:
+        """Re-read the chain head from disk and return it.
+
+        The cached head this instance carries reflects its *own* appends: a
+        record another process wrote lands on disk without touching it. A caller
+        that embeds the head into a payload it signs must read it through here,
+        and must do so inside the same :func:`_chain_append_lock` section that
+        appends the record, or another writer can overtake the value between the
+        read and the append -- leaving a signature that names a chain position
+        its own record does not occupy.
+
+        Returns:
+            The chain head as recovered from disk under the verifier's framing.
+        """
+        self._prev_hmac = self._recover_chain_tail()
+        # ``log``'s fast path trusts (path, size) bookkeeping from this
+        # instance's last append; a head re-read from disk retires it, so the
+        # next append re-derives the tail rather than trusting stale sizes.
+        self._synced_path = None
+        self._synced_size = -1
+        return self._prev_hmac
 
     # -- write --------------------------------------------------------------
 
