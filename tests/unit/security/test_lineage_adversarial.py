@@ -102,11 +102,9 @@ def _append(log_path: Path, entry: LineageEntry, agent: _Agent) -> None:
     with log_path.open("ab") as f:
         f.write(canonical + b"\n")
     jws = sign_detached(canonical, agent.priv, kid=agent.kid)
-    digest = hashlib.sha256(entry.artefact_path.encode()).hexdigest()
-    sig_dir = log_path.parent / "signatures" / digest[:2] / digest
-    sig_dir.mkdir(parents=True, exist_ok=True)
-    eh = entry_hash(entry)
-    (sig_dir / (eh.replace("sha256:", "") + ".jws")).write_text(jws)
+    sidecar = _sidecar_path(log_path, entry)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(jws)
 
 
 # ── 1. Replay attack ────────────────────────────────────────────────────────
