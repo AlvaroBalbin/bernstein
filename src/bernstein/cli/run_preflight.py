@@ -178,6 +178,35 @@ def _show_run_summary() -> None:
     _surface_merge_refusals(Path.cwd(), since_ts=_CLI_RUN_EPOCH, console=con)
 
 
+def _exit_nonzero_on_unhealthy_run(status_payload: object) -> None:
+    """Set ``bernstein run``'s exit code from the final run-health verdict.
+
+    A run that completes but did not honestly meet its goal -- a task failed,
+    or a declared task never terminated (e.g. the manager agent produced no
+    model output and was reaped) -- must not exit 0, so an operator scripting
+    ``bernstein run && deploy`` never deploys on a run that accomplished
+    nothing (issue #3010). Only the synchronous (quiescence-wait) path can
+    know the outcome; a non-dict payload (server unreachable / detached) is
+    left as exit 0 rather than guessing.
+    """
+    if not isinstance(status_payload, dict):
+        return
+    from bernstein.core.quality.retrospective import (
+        run_health_exit_code,
+        run_healthy_from_status_counts,
+    )
+
+    counts_obj = status_payload.get("summary", status_payload)
+    counts = counts_obj if isinstance(counts_obj, dict) else status_payload
+    if run_healthy_from_status_counts(counts):
+        return
+    console.print(
+        "[red]Run did not meet its goal[/red] -- a declared task never completed or a task "
+        "failed. See .sdd/runtime/retrospective.md for the run-health breakdown."
+    )
+    raise SystemExit(run_health_exit_code(healthy=False))
+
+
 def _drain_completed_backlog_files() -> None:
     """Move backlog files for terminal tasks from ``claimed/`` to ``closed/``.
 
@@ -550,8 +579,9 @@ def _finalize_run_output(*, quiet: bool) -> None:
 
     try:
         if quiet:
-            _wait_for_run_completion()
+            final_status = _wait_for_run_completion()
             _show_run_summary()
+            _exit_nonzero_on_unhealthy_run(final_status)
             return
 
         from bernstein.cli.terminal_caps import detect_capabilities

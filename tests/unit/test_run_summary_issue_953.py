@@ -195,6 +195,40 @@ class TestCleanupOrdering:
         # The whole point: cleanup ran even though rendering exploded.
         drain.assert_called_once()
 
+    def test_quiet_run_exits_nonzero_when_task_never_completed(self) -> None:
+        """Issue #3010: the synchronous (quiet) completion path must exit
+        non-zero when the run ended with a declared task neither done nor
+        failed -- an operator scripting ``bernstein run && deploy`` must not
+        deploy on a run that produced nothing."""
+        from bernstein.core.retrospective import EXIT_RUN_UNHEALTHY
+
+        from bernstein.cli.run_preflight import _finalize_run_output
+
+        stuck_status = {"total": 1, "done": 0, "failed": 0, "open": 1}
+        with (
+            patch("bernstein.cli.run_bootstrap._wait_for_run_completion", return_value=stuck_status),
+            patch("bernstein.cli.run_preflight._show_run_summary"),
+            patch("bernstein.cli.run_preflight._drain_completed_backlog_files") as drain,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _finalize_run_output(quiet=True)
+        assert exc_info.value.code == EXIT_RUN_UNHEALTHY
+        assert exc_info.value.code != 0
+        # Cleanup still runs on the non-zero-exit path.
+        drain.assert_called_once()
+
+    def test_quiet_run_exits_zero_when_all_done(self) -> None:
+        from bernstein.cli.run_preflight import _finalize_run_output
+
+        done_status = {"total": 2, "done": 2, "failed": 0, "open": 0}
+        with (
+            patch("bernstein.cli.run_bootstrap._wait_for_run_completion", return_value=done_status),
+            patch("bernstein.cli.run_preflight._show_run_summary"),
+            patch("bernstein.cli.run_preflight._drain_completed_backlog_files"),
+        ):
+            # Returns normally (no SystemExit) -> exit code 0.
+            _finalize_run_output(quiet=True)
+
     def test_drain_is_a_noop_when_no_claimed_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """When ``.sdd/backlog/claimed/`` doesn't exist, drain returns silently."""
         from bernstein.cli.run_preflight import _drain_completed_backlog_files
