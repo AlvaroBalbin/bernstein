@@ -36,6 +36,21 @@ A clean payload becomes a `ValidatedPayload(tool_name, payload)`; a failure
 becomes a `ValidationError(tool_name, code, message, errors)`, which the MCP
 server renders as a JSON-RPC 2.0 error object via `to_jsonrpc_error()`.
 
+## Validation scope
+
+This validator runs on the tools registered in `bernstein.mcp.server`, which
+serves the stdio and SSE transports.
+
+The streamable HTTP transport in `bernstein.mcp.remote_transport` is a
+separate implementation and does **not** call `validate_tool_call`. Over that
+transport the size cap, recursion cap, control-character filter and JSON
+Schema checks are all absent, and the 8 tools it exposes carry schemas
+restated inside that module rather than loaded from the schema files below.
+Starting that transport logs a warning saying so. Do not read this page as a
+statement about what an internet-reachable streamable HTTP deployment
+enforces. Bringing both transports onto one registry and one validation path
+is tracked in issue #3083; this note goes away with that change.
+
 ## Schemas
 
 Each tool's schema is a plain JSON Schema (Draft 7) file at

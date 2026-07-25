@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 import textwrap
 from unittest.mock import AsyncMock, patch
 
@@ -712,3 +713,62 @@ class TestProxyAuthHeader:
 
         headers = mock_client.post.call_args.kwargs.get("headers") or {}
         assert headers.get("Authorization") == "Bearer post-tok"
+
+
+# ---------------------------------------------------------------------------
+# Interim validation-scope notice (issue #3088)
+# ---------------------------------------------------------------------------
+
+
+class TestValidationScopeNotice:
+    """The transport must announce that it validates arguments more weakly than stdio.
+
+    Remove this class in the same change that closes issue #3083. Until then
+    it keeps the notice from being dropped while the limitation remains.
+    """
+
+    def test_starting_the_transport_warns_about_weaker_validation(
+        self,
+        _clear_token_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="bernstein.mcp.remote_transport")
+
+        create_asgi_app()
+
+        records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert records, "starting the streamable HTTP transport emitted no warning"
+        message = "\n".join(r.getMessage() for r in records)
+        assert "validation" in message.lower()
+        assert "stdio" in message.lower()
+        assert "#3083" in message
+
+    def test_notice_is_at_warning_level_not_debug(
+        self,
+        _clear_token_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A debug-only notice is invisible in ordinary startup output."""
+        caplog.set_level(logging.INFO, logger="bernstein.mcp.remote_transport")
+
+        create_asgi_app()
+
+        assert any(r.levelno >= logging.WARNING and "#3083" in r.getMessage() for r in caplog.records), (
+            "the notice must be emitted at WARNING or above"
+        )
+
+    def test_notice_names_every_tool_the_transport_exposes(
+        self,
+        _clear_token_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The list is derived from _TOOL_DEFS so it cannot drift from reality."""
+        caplog.set_level(logging.WARNING, logger="bernstein.mcp.remote_transport")
+
+        create_asgi_app()
+
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        exposed = [str(defn["name"]) for defn in remote_transport_module._TOOL_DEFS]
+        assert str(len(exposed)) in message
+        for name in exposed:
+            assert name in message, f"notice does not name exposed tool {name}"
