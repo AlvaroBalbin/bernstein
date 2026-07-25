@@ -47,7 +47,12 @@ from mcp.types import (
     ListTasksRequest,
     ListTasksResult,
     Task,
+    TaskExecutionMode,
     TextContent,
+    ToolExecution,
+)
+from mcp.types import (
+    Tool as MCPTool,
 )
 
 from bernstein.core.protocols.mcp.tool_tiers import (
@@ -187,6 +192,21 @@ def _get_journal_head(task_id: str) -> str:
     return ""
 
 
+#: Retention window advertised on every Tasks-extension task row, in
+#: milliseconds.
+#:
+#: The task server evicts nothing, so ``null`` (the extension's spelling of
+#: "unlimited") would be the literal answer. It is not sendable: ``Task.ttl``
+#: is a required field, and the SDK serialises every response with
+#: ``exclude_none=True``, so a ``None`` ttl is dropped from the wire payload
+#: and the client rejects the row as malformed. A finite window is therefore
+#: advertised instead. It under-claims retention, which is the safe
+#: direction: a client that forgets the handle after this window stops
+#: polling, and the run itself is unaffected. 24h covers the minutes-to-hours
+#: span a Bernstein run occupies.
+_TASK_TTL_MS = 86_400_000
+
+
 def _project_task_helper(data: dict[str, Any]) -> Any:
     from datetime import datetime
 
@@ -263,7 +283,7 @@ def _project_task_helper(data: dict[str, Any]) -> Any:
         statusMessage=status_message,
         createdAt=created_at,
         lastUpdatedAt=last_updated,
-        ttl=None,
+        ttl=_TASK_TTL_MS,
         pollInterval=5000,
     )
 
@@ -292,7 +312,10 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
             estimated_minutes: Rough time estimate in minutes.
 
         Returns:
-            JSON with the created task ID, title, and status.
+            JSON with the created task ID, title, and status. When the call
+            itself is task-augmented (the client sent ``task`` in the request
+            params), a Tasks-extension ``CreateTaskResult`` is returned
+            instead so the client can poll the run.
         """
         err = _validate_or_error(
             "bernstein_run",
@@ -318,7 +341,11 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 "estimated_minutes": estimated_minutes,
             }
 
-            client_supports_tasks = False
+            # Whether THIS call carried task metadata, not whether the client
+            # is capable of tasks. A tasks-capable client still sends plain
+            # tools/call requests, and those require a CallToolResult; only a
+            # task-augmented call may be answered with a CreateTaskResult.
+            is_task_call = False
             traceparent = None
             tracestate = None
             baggage = None
@@ -328,7 +355,7 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                     rc = ctx.request_context
                     if rc is not None:
                         if rc.experimental is not None:
-                            client_supports_tasks = bool(getattr(rc.experimental, "client_supports_tasks", False))
+                            is_task_call = bool(getattr(rc.experimental, "is_task", False))
                         if rc.meta is not None:
                             extra = rc.meta.model_extra or {}
                             traceparent = extra.get("traceparent")
@@ -350,7 +377,7 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 resp.raise_for_status()
                 data: dict[str, Any] = resp.json()
 
-            if client_supports_tasks:
+            if is_task_call:
                 task_obj = _project_task_helper(data)
                 return CreateTaskResult(task=task_obj)
 
@@ -1077,6 +1104,57 @@ def _apply_tool_tier(mcp: FastMCP[None], active_tier: ToolTier) -> None:
         mcp._tool_manager._tools.pop(name, None)
 
 
+#: The ``execution.taskSupport`` mode each tool advertises in ``tools/list``.
+#:
+#: A tool that is absent from this map advertises nothing, which the Tasks
+#: extension reads as ``forbidden``. Only ``bernstein_run`` answers a
+#: task-augmented call with a ``CreateTaskResult``, so it is the only entry
+#: declared ``optional``. ``bernstein_task_handle`` is the stateless polling
+#: fallback: it always answers immediately and never returns a task handle,
+#: so it declares ``forbidden`` explicitly rather than leaving a caller to
+#: infer the default.
+_TOOL_TASK_SUPPORT: dict[str, TaskExecutionMode] = {
+    "bernstein_run": "optional",
+    "bernstein_task_handle": "forbidden",
+}
+
+
+def _declare_task_support(mcp: FastMCP[None]) -> None:
+    """Advertise ``execution.taskSupport`` on the tools that declare a mode.
+
+    The MCP Tasks extension defaults a tool with no ``execution`` hint to
+    ``forbidden``, so without this declaration no client ever sends a
+    task-augmented ``tools/call`` and the extension's request handlers are
+    unreachable.
+
+    FastMCP 1.28.1 carries no ``execution`` field: ``@mcp.tool()`` takes no
+    such argument and ``FastMCP.list_tools`` builds each ``mcp.types.Tool``
+    without it. The hint therefore cannot be attached at registration time,
+    so the low-level ``tools/list`` handler is re-registered here with a
+    wrapper that stamps the field onto the entries FastMCP already built.
+
+    Every ``taskSupport`` declaration in this server goes through this one
+    function, so when an SDK release adds first-class support the migration
+    is deleting this function and moving :data:`_TOOL_TASK_SUPPORT` into the
+    registrations.
+
+    Args:
+        mcp: The FastMCP server whose ``tools/list`` response should carry
+            the declarations.
+    """
+    fastmcp_list_tools = mcp.list_tools
+
+    async def list_tools_with_task_support() -> list[MCPTool]:
+        tools = await fastmcp_list_tools()
+        for tool in tools:
+            mode = _TOOL_TASK_SUPPORT.get(tool.name)
+            if mode is not None:
+                tool.execution = ToolExecution(taskSupport=mode)
+        return tools
+
+    mcp._mcp_server.list_tools()(list_tools_with_task_support)
+
+
 # MCP ``tasks/list`` is a paginated request whose only client-supplied knob is
 # an opaque cursor. We page the task server in fixed windows and encode the next
 # offset into the cursor, so a client can walk past the legacy 500-item cap the
@@ -1127,7 +1205,7 @@ def _register_tasks_extension(mcp: FastMCP[None], server_url: str) -> None:
             statusMessage=task_obj.statusMessage,
             createdAt=task_obj.createdAt,
             lastUpdatedAt=task_obj.lastUpdatedAt,
-            ttl=None,
+            ttl=_TASK_TTL_MS,
             pollInterval=5000,
         )
 
@@ -1198,7 +1276,7 @@ def _register_tasks_extension(mcp: FastMCP[None], server_url: str) -> None:
             statusMessage=task_obj.statusMessage,
             createdAt=task_obj.createdAt,
             lastUpdatedAt=task_obj.lastUpdatedAt,
-            ttl=None,
+            ttl=_TASK_TTL_MS,
             pollInterval=5000,
         )
 
@@ -1255,6 +1333,7 @@ def create_mcp_server(
         register_lineage_resources(mcp, lineage_root=root, enabled=True)
 
     _apply_tool_tier(mcp, active_tier)
+    _declare_task_support(mcp)
     _apply_cost_meter(mcp)
     return mcp
 
