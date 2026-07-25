@@ -292,8 +292,7 @@ class TestRenderPrompt:
 
         assert "T-010" in prompt
         assert "T-011" in prompt
-        assert "curl" in prompt
-        assert "/complete" in prompt
+        assert "bernstein task complete" in prompt
         assert "Step 3: Exit" in prompt
 
 
