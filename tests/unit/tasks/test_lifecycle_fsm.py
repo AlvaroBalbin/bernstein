@@ -21,6 +21,8 @@ import pytest
 from bernstein.core.tasks import lifecycle as lc
 from bernstein.core.tasks.lifecycle import (
     AGENT_TRANSITIONS,
+    APPROVABLE_TASK_STATUSES,
+    TASK_APPROVAL_TARGETS,
     TASK_TRANSITIONS,
     TERMINAL_TASK_STATUSES,
     DuplicateTransitionError,
@@ -170,6 +172,41 @@ def test_closed_and_cancelled_are_terminal() -> None:
 
 def test_open_is_not_terminal() -> None:
     assert TaskStatus.OPEN not in TERMINAL_TASK_STATUSES
+
+
+# ---------------------------------------------------------------------------
+# Approval gates
+# ---------------------------------------------------------------------------
+
+
+def test_only_the_two_decision_states_are_approvable() -> None:
+    """An approval is defined before execution and after it, nowhere else."""
+    assert set(APPROVABLE_TASK_STATUSES) == {TaskStatus.PLANNED, TaskStatus.PENDING_APPROVAL}
+    for status in (
+        TaskStatus.OPEN,
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.BLOCKED,
+        TaskStatus.FAILED,
+        TaskStatus.DONE,
+    ):
+        assert status not in APPROVABLE_TASK_STATUSES
+
+
+def test_approving_a_planned_task_releases_it_for_execution() -> None:
+    """Pre-execution approval promotes the task; it never completes it.
+
+    The target is the same promotion the plan-approval route performs, so it
+    must be a declared transition rather than a value invented here.
+    """
+    target = TASK_APPROVAL_TARGETS[TaskStatus.PLANNED]
+    assert target is TaskStatus.OPEN
+    assert (TaskStatus.PLANNED, target) in TASK_TRANSITIONS
+
+
+def test_approving_a_pending_approval_task_signs_off_the_result() -> None:
+    """Post-execution approval completes work that already ran."""
+    assert TASK_APPROVAL_TARGETS[TaskStatus.PENDING_APPROVAL] is TaskStatus.DONE
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,18 @@ def _make_status_payload() -> dict:
     }
 
 
+def _non_approvable_statuses() -> set:
+    """Every task status an approval must refuse, taken from the state machine.
+
+    Derived rather than listed, so a new status added to ``TaskStatus`` is
+    covered by the refusal matrix without editing this file.
+    """
+    from bernstein.core.tasks.lifecycle import APPROVABLE_TASK_STATUSES
+    from bernstein.core.tasks.models import TaskStatus
+
+    return set(TaskStatus) - set(APPROVABLE_TASK_STATUSES)
+
+
 def _make_task_payload(
     task_id: str = "abc123",
     status: str = "open",
@@ -284,16 +296,163 @@ async def test_bernstein_stop_sends_stop_signal() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _approve_client(read_status: str, post_payload: dict) -> AsyncMock:
+    """Build a mock httpx client whose GET reports *read_status*.
+
+    The POST returns *post_payload*, so a test can assert both which endpoint
+    the approval reached and that it reached one at all.
+    """
+    read_response = MagicMock()
+    read_response.raise_for_status = MagicMock()
+    read_response.json = MagicMock(return_value=_make_task_payload("task-ap-01", status=read_status))
+
+    post_response = MagicMock()
+    post_response.raise_for_status = MagicMock()
+    post_response.json = MagicMock(return_value=post_payload)
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=read_response)
+    mock_client.post = AsyncMock(return_value=post_response)
+    return mock_client
+
+
+def _unwrap_tool_json(result: object) -> dict:
+    """Parse a tool result, stripping the MCP cost-meter envelope."""
+    text = result[0][0].text  # type: ignore[index]
+    parsed = json.loads(text)
+    if isinstance(parsed, dict) and "_meter" in parsed and "result" in parsed:
+        parsed = parsed["result"]
+    return parsed
+
+
 @pytest.mark.asyncio
-async def test_bernstein_approve_completes_task() -> None:
-    """bernstein_approve calls POST /tasks/{id}/complete to approve a task."""
+async def test_bernstein_approve_signs_off_pending_approval_task() -> None:
+    """A pending_approval task is signed off via POST /tasks/{id}/complete."""
     from bernstein.mcp.server import create_mcp_server
 
-    completed = _make_task_payload("task-ap-01", status="done")
+    mock_client = _approve_client(
+        "pending_approval",
+        _make_task_payload("task-ap-01", status="done"),
+    )
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01"})
+
+    parsed = _unwrap_tool_json(result)
+    assert parsed["task_id"] == "task-ap-01"
+    assert parsed["approval"] == "completion_signed_off"
+    call_url = mock_client.post.call_args[0][0]
+    assert "task-ap-01" in call_url
+    assert call_url.endswith("/complete")
+
+
+@pytest.mark.asyncio
+async def test_bernstein_approve_releases_planned_task_without_completing_it() -> None:
+    """A planned task is released for execution, never marked complete.
+
+    Approving before execution is a different operation from signing off
+    finished work: the task becomes open so the orchestrator can run it.
+    """
+    from bernstein.mcp.server import create_mcp_server
+
+    mock_client = _approve_client(
+        "planned",
+        _make_task_payload("task-ap-01", status="open"),
+    )
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01"})
+
+    parsed = _unwrap_tool_json(result)
+    assert parsed["status"] == "open"
+    assert parsed["approval"] == "released_for_execution"
+    call_url = mock_client.post.call_args[0][0]
+    assert call_url.endswith("/force-claim")
+    assert not any("/complete" in str(call) for call in mock_client.post.call_args_list)
+
+
+@pytest.mark.parametrize(
+    "status",
+    sorted(s.value for s in _non_approvable_statuses()),
+)
+@pytest.mark.asyncio
+async def test_bernstein_approve_refuses_non_approval_states(status: str) -> None:
+    """Every state outside the approvable set is refused without any POST.
+
+    The refusal names the current status so the caller can pick a different
+    action instead of retrying the approval.
+    """
+    from bernstein.mcp.server import create_mcp_server
+
+    mock_client = _approve_client(status, _make_task_payload("task-ap-01", status="done"))
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01", "note": "unstick it"})
+
+    parsed = _unwrap_tool_json(result)
+    assert parsed["error"] == "task_not_awaiting_approval"
+    assert parsed["current_status"] == status
+    assert status in parsed["message"]
+    assert sorted(parsed["approvable_statuses"]) == ["pending_approval", "planned"]
+    assert "bernstein_update" in parsed["hint"]
+    mock_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bernstein_approve_refuses_task_with_no_status() -> None:
+    """A task payload carrying no status fails closed rather than completing."""
+    from bernstein.mcp.server import create_mcp_server
+
+    mock_client = _approve_client("", _make_task_payload("task-ap-01", status="done"))
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01"})
+
+    parsed = _unwrap_tool_json(result)
+    assert parsed["error"] == "task_not_awaiting_approval"
+    assert parsed["current_status"] == "unknown"
+    mock_client.post.assert_not_awaited()
+
+
+def test_bernstein_approve_description_names_the_approvable_states() -> None:
+    """The advertised description names every state the tool acts on.
+
+    A model picks the tool from its description, so the description and the
+    enforced set must not drift apart.
+    """
+    from bernstein.core.tasks.lifecycle import APPROVABLE_TASK_STATUSES
+    from bernstein.mcp.server import create_mcp_server
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+    tool = next(t for t in mcp._tool_manager.list_tools() if t.name == "bernstein_approve")
+    description = tool.description or ""
+    for state in APPROVABLE_TASK_STATUSES:
+        assert state.value in description, f"{state.value} missing from the tool description"
+
+
+# ---------------------------------------------------------------------------
+# bernstein_complete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bernstein_complete_posts_the_worker_summary() -> None:
+    """bernstein_complete is the worker completion verb: POST /tasks/{id}/complete."""
+    from bernstein.mcp.server import create_mcp_server
 
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value=completed)
+    mock_response.json = MagicMock(return_value=_make_task_payload("task-cp-01", status="done"))
 
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -303,13 +462,17 @@ async def test_bernstein_approve_completes_task() -> None:
     mcp = create_mcp_server(server_url="http://localhost:8052")
 
     with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
-        result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01"})
+        result = await mcp.call_tool(
+            "bernstein_complete",
+            {"task_id": "task-cp-01", "result_summary": "shipped the parser"},
+        )
 
-    text = result[0][0].text  # type: ignore[index]
-    assert "task-ap-01" in text or "approved" in text.lower() or "done" in text.lower()
+    parsed = _unwrap_tool_json(result)
+    assert parsed["task_id"] == "task-cp-01"
+    assert parsed["status"] == "done"
     call_url = mock_client.post.call_args[0][0]
-    assert "task-ap-01" in call_url
-    assert "complete" in call_url
+    assert call_url.endswith("/tasks/task-cp-01/complete")
+    assert mock_client.post.call_args[1]["json"]["result_summary"] == "shipped the parser"
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +630,7 @@ async def test_crash_protection_bernstein_approve() -> None:
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
     mock_client.post = AsyncMock(side_effect=ConnectionError("refused"))
 
     with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):

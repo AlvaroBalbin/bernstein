@@ -424,7 +424,8 @@ The MCP tools below are exposed via Bernstein's MCP server (`mcp/server.py`), no
 | `bernstein_tasks` | List tasks with filtering |
 | `bernstein_cost` | Cost summary for the current run |
 | `bernstein_stop` | Stop the running orchestrator |
-| `bernstein_approve` | Approve a pending task or request |
+| `bernstein_approve` | Grant the approval a planned or pending-approval task is waiting on |
+| `bernstein_complete` | Complete a task the caller is executing, with a result summary |
 | `bernstein_create_subtask` | Create a subtask under an existing task |
 | `bernstein_health` | Health check |
 | `bernstein_scenarios` | List available scenarios |

@@ -92,6 +92,8 @@ def _make_task_dict(
 
 _COMPLETE_RE = re.compile(r"^/tasks/(.+)/complete$")
 _FAIL_RE = re.compile(r"^/tasks/(.+)/fail$")
+_FORCE_CLAIM_RE = re.compile(r"^/tasks/(.+)/force-claim$")
+_TASK_RE = re.compile(r"^/tasks/([^/]+)$")
 
 
 class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
@@ -130,6 +132,21 @@ class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
         self._tasks[task_id] = task
         return httpx.Response(201, json=task)
 
+    def _handle_get_task(self, task_id: str) -> httpx.Response:
+        task = self._tasks.get(task_id)
+        if task is None:
+            return httpx.Response(404, json={"error": f"task {task_id!r} not found"})
+        return httpx.Response(200, json=task)
+
+    def _handle_force_claim(self, task_id: str) -> httpx.Response:
+        """Reset a task to open, as ``POST /tasks/{id}/force-claim`` does."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return httpx.Response(404, json={"error": f"task {task_id!r} not found"})
+        task["status"] = "open"
+        task["priority"] = 0
+        return httpx.Response(200, json=task)
+
     def _handle_task_transition(
         self,
         request: httpx.Request,
@@ -157,6 +174,10 @@ class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
         if method == "POST" and path == "/tasks":
             return self._handle_post_tasks(request)
 
+        m_task = _TASK_RE.match(path)
+        if method == "GET" and m_task:
+            return self._handle_get_task(m_task.group(1))
+
         m_complete = _COMPLETE_RE.match(path)
         if method == "POST" and m_complete:
             return self._handle_task_transition(request, m_complete.group(1), "done")
@@ -164,6 +185,10 @@ class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
         m_fail = _FAIL_RE.match(path)
         if method == "POST" and m_fail:
             return self._handle_task_transition(request, m_fail.group(1), "failed")
+
+        m_force_claim = _FORCE_CLAIM_RE.match(path)
+        if method == "POST" and m_force_claim:
+            return self._handle_force_claim(m_force_claim.group(1))
 
         return httpx.Response(404, json={"error": f"fake lab: unhandled {method} {path}"})
 

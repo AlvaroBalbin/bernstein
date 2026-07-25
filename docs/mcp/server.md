@@ -259,7 +259,10 @@ loop loses its meaning, not merely its log.
    `prev_entry_hash`, `entry_hash`, `signature`, `body_hash`), not a bare
    status string.
 
-3. **Complete** with `bernstein_approve` (the existing completion verb).
+3. **Complete** with `bernstein_complete`, passing the summary of what the
+   work produced. This is the worker's completion verb. `bernstein_approve`
+   is not: it grants an approval a task is waiting on and refuses a task the
+   worker is executing (see below).
 
 Every claim and every update appears as an audit-chain entry
 (`task.claim_receipt` and `task.mailbox_message`), and no new audit event type
@@ -279,6 +282,36 @@ settled by replay against the chain rather than by trust, the task lifecycle
 surface over MCP is complete and uniformly provable: create, query, claim,
 update, complete, cancel, each returning an artifact that verifies against the
 chain.
+
+## The approval gate
+
+`bernstein_approve` grants an approval a task is waiting on. It is not a way
+to finish work: it reads the task first and acts only on the two states where
+the task lifecycle is waiting on a human decision, taken from
+`bernstein.core.tasks.lifecycle.APPROVABLE_TASK_STATUSES`.
+
+| Current status | What approval means | Endpoint | Resulting status |
+|---|---|---|---|
+| `planned` | Release the plan for execution. The work has not run, so nothing is marked done. | `POST /tasks/{id}/force-claim` | `open` |
+| `pending_approval` | Sign off finished work, recording the approver's note as the result summary. | `POST /tasks/{id}/complete` | `done` |
+
+Any other status is refused with a structured error naming the current status,
+and no state-changing request is sent:
+
+```json
+{
+  "error": "task_not_awaiting_approval",
+  "task_id": "t-42",
+  "current_status": "in_progress",
+  "approvable_statuses": ["pending_approval", "planned"],
+  "message": "Task t-42 is in status 'in_progress'. bernstein_approve only acts on a task waiting on an approval decision (pending_approval, planned), and never forces another state to complete.",
+  "hint": "To finish work you are executing, use bernstein_complete. To report that the task is stuck, post to the task mailbox with bernstein_update. To abandon the work, cancel the task (bernstein task cancel <task_id>)."
+}
+```
+
+A task that is stuck, blocked, or unfinished has no approval to grant. Finish
+work you are executing with `bernstein_complete`, report a blocker with
+`bernstein_update`, or abandon the work with `bernstein task cancel <task_id>`.
 
 ## Worked example: pointing a host at the server
 

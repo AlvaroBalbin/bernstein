@@ -232,6 +232,36 @@ TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Approval gates
+# ---------------------------------------------------------------------------
+
+# The task states where the next transition is a human decision, mapped to
+# what that decision does. Approval means two different operations depending
+# on which side of execution the task sits:
+#
+#   PLANNED           - pre-execution. The plan is held back until a human
+#                       signs it off, and approving it releases the task for
+#                       execution (PLANNED -> OPEN, the same promotion
+#                       ``POST /plans/{plan_id}/approve`` performs per task).
+#   PENDING_APPROVAL  - post-execution. The work is finished and the result
+#                       is held until a human signs it off, so approving it
+#                       completes the task (-> DONE) with the approver's note
+#                       as the result summary.
+#
+# Every other status is running, blocked on something other than a decision,
+# or terminal: there is no approval to grant, so an approval verb must refuse
+# rather than force the task forward.
+TASK_APPROVAL_TARGETS: dict[TaskStatus, TaskStatus] = {
+    TaskStatus.PLANNED: TaskStatus.OPEN,
+    TaskStatus.PENDING_APPROVAL: TaskStatus.DONE,
+}
+
+# The statuses an approval verb may act on, derived from the table above so
+# callers cannot drift from the state machine.
+APPROVABLE_TASK_STATUSES: frozenset[TaskStatus] = frozenset(TASK_APPROVAL_TARGETS)
+
+
+# ---------------------------------------------------------------------------
 # Agent session transition table
 # ---------------------------------------------------------------------------
 
