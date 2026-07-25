@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from bernstein.core.a2a import AgentCard
 from bernstein.core.difficulty_estimator import estimate_difficulty, minutes_for_level
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 from bernstein.core.server import (
     A2AAgentCardResponse,
     A2AArtifactRequest,
@@ -132,6 +133,12 @@ async def a2a_message(body: A2AMessageRequest, request: Request) -> A2AMessageRe
     store = _get_store(request)
     sse_bus = _get_sse_bus(request)
     a2a_handler = _get_a2a_handler(request)
+
+    # ``task_id`` names an existing task and the handler appends progress to
+    # it, which is what ``POST /tasks/{id}/progress`` does. That route is
+    # path-scoped; this one carries the id in the body where the middleware
+    # gate cannot read it, so the same rule is applied here.
+    enforce_agent_task_scope_for_ids(request, [body.task_id])
 
     task = store.get_task(body.task_id)
     if task is None:
