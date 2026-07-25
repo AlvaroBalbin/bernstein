@@ -279,6 +279,30 @@ the task it watched corresponds to the audited run.
    the journal head, and the chain head, a forged progress claim fails
    verification: the handle *is* the proof, not a view onto it.
 
+### Task-augmented calls (native task handles)
+
+A host that implements the Tasks extension can skip the polling fallback and
+ask for a native task row instead.
+
+- `bernstein_run` advertises `execution.taskSupport: "optional"` in its
+  `tools/list` entry, so a host may invoke it either way. A **plain**
+  `tools/call` returns the usual `CallToolResult` with the run JSON. A
+  **task-augmented** `tools/call` (one that carries `task` in the request
+  params) returns a `CreateTaskResult` whose `task.taskId` the host then
+  drives with `tasks/get`, `tasks/result`, `tasks/list`, and `tasks/cancel`.
+  The response shape follows the call, not the host's declared capability: a
+  tasks-capable host that sends a plain call still gets a `CallToolResult`.
+- `bernstein_task_handle` advertises `execution.taskSupport: "forbidden"`. It
+  is the stateless polling fallback and always answers immediately, so it must
+  not be invoked as a task.
+- Every task row carries a finite `ttl` (24h) rather than the `null` that
+  spells "unlimited". A `null` ttl is dropped from the serialised response and
+  the receiving host rejects the row, so the retention window is stated
+  explicitly. It under-claims: nothing evicts the run.
+
+Hosts with no Tasks support are unaffected and keep using
+`bernstein_task_handle`.
+
 ### Connecting a host trace to the run's artefacts
 
 W3C Trace Context arriving in a request `_meta` (`traceparent` / `tracestate`
