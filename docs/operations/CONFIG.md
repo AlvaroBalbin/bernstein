@@ -152,6 +152,8 @@ Environment variables are useful in CI and automation. Common variables:
 | `BERNSTEIN_JANITOR_FUZZY_PATHS` | Opt-in fuzzy matching for `path_exists` completion signals. **Default `0` (off)**: exact-path matching is unchanged - the check means exactly the path written in the plan. Set to `1` to enable a fuzzy fallback on a literal miss: a pattern derived from the basename (`**/<stem>*<suffix>`) so a manager-guessed path (e.g. `packages/db/test/foo.test.ts`) can match a worker's repo-idiomatic path (e.g. `packages/db/src/__tests__/foo.test.ts`). A fuzzy match logs a WARNING naming the matched path. Explicit glob syntax written in the criterion itself (`*`, `?`, `[`) is always honored, regardless of this flag. See [TROUBLESHOOTING.md #21](TROUBLESHOOTING.md#21-janitor-path_exists-fails-on-a-correctly-placed-file-acceptance-path-mismatch). |
 | `BERNSTEIN_JANITOR_REOPEN_MAX` | Max janitor-reopen cycles per task before a janitor-FAILed task is permanently failed instead of reopened under the same id. **Default `2`.** A non-numeric value logs a warning and falls back to the default; negative values are clamped to `0` (fail immediately, never reopen). |
 | `BERNSTEIN_QUIESCENCE_SETTLE_S` | Settle delay (seconds) the orchestrator waits after a tick reaches quiescence (all tasks terminal) before the re-check that decides whether to self-stop. **Default `2.0`.** Set `0` to skip the settle sleep entirely (used by tests to avoid a real per-tick delay). |
+| `BERNSTEIN_STALLED_RUN_GRACE_S` | Seconds the task-state fingerprint must stay unchanged before a quiescent run that produced zero terminal tasks is stopped (see §4.3 below). **Default `1800.0`.** Takes precedence over `tuning.orchestrator.stalled_run_grace_s`. |
+| `BERNSTEIN_STALLED_RUN_TICKS` | Consecutive no-progress quiescent ticks required alongside the grace window before that run is stopped (see §4.3). **Default `10`.** Takes precedence over `tuning.orchestrator.stalled_run_ticks`. |
 | `BERNSTEIN_RUN_COMMAND_DEDUPE_WINDOW_S` | Dedupe window (seconds) for the `run_command` builtin: an identical command (same hash) still in flight or finished within this window reuses the original's result instead of re-executing. **Default `2.0`.** Set `0` to disable the dedupe guard entirely. |
 | `BERNSTEIN_OPENAI_AGENTS_TOOL_SOURCE` | Operator lever for the `openai_agents` runner's tool source. Set to `builtin` to make every spawn use the runner's workdir-sandboxed builtin tools (`read_file`/`write_file`/`list_dir`/`run_command`) even when the per-spawn `mcp_config` carries no `tool_source` key. An explicit `mcp_config["tool_source"]` value always wins over this env var. Unset by default. |
 
@@ -181,7 +183,7 @@ Key default groups:
 
 | Group | Examples |
 |-------|---------|
-| `OrchestratorDefaults` | `tick_interval_s`, `drain_timeout_s`, `max_consecutive_failures`, `stale_claim_timeout_s`, `stalled_manager_threshold_s`, `max_agent_runtime_s` |
+| `OrchestratorDefaults` | `tick_interval_s`, `drain_timeout_s`, `max_consecutive_failures`, `stale_claim_timeout_s`, `stalled_manager_threshold_s`, `max_agent_runtime_s`, `stalled_run_grace_s`, `stalled_run_ticks` |
 | `SpawnDefaults` | `spawn_backoff_base_s`, `spawn_backoff_max_s`, `max_spawn_failures` |
 | `TaskDefaults` | Retry limits, deadline windows |
 | `AgentDefaults` | Heartbeat intervals, max dead agents kept, `max_turns` |
@@ -254,6 +256,59 @@ env var, yaml, and default resolution paths alike, so raising the threshold
 via `BERNSTEIN_STALL_THRESHOLD_S` - the primary way an operator raises it -
 surfaces the warning too. The resolution (and this check) happens once per
 orchestrator instance, not on every tick.
+
+### 4.3) Zero-terminal run backstop
+
+The orchestrator's ordinary self-stop fires when a tick reaches quiescence
+(`open_tasks == active_agents == 0`) **and** at least one task has reached
+`done` or `failed`. That gate is what stops tick #1 of a fresh run being read
+as "the run finished". It also means a run that reaches quiescence having
+finished *nothing* has no exit at all: it idles until the container is torn
+down, and reports the run as healthy.
+
+`core/orchestration/run_stall.py` supplies the missing terminal state. It
+stops the run only when every one of the following holds:
+
+- the tick is quiescent with zero `done` and zero `failed` tasks;
+- at least one task is declared and at least one is actively unfinished
+  (`open`, `claimed`, `in_progress`, `orphaned`) - an empty backlog is the
+  pre-ingest startup window, and tasks that are only parked (`planned`,
+  `suspended`, `pending_approval`, `blocked`, `waiting_for_subtasks`) are
+  waiting by design;
+- no task is deferred by retry backoff (an `open` task with a future
+  `created_at`), since that work is still scheduled to arrive;
+- the `(task_id, status)` fingerprint of the whole task set has been
+  unchanged for `stalled_run_grace_s` (default `1800.0`); and
+- that same fingerprint has been observed on at least `stalled_run_ticks`
+  (default `10`) consecutive qualifying ticks, so a single wall-clock jump
+  cannot end a run on its own.
+
+An active hold (`POST /orchestrator/holds`) suppresses the stop exactly as it
+suppresses the ordinary self-stop.
+
+On a confirmed stall the unfinished tasks are marked failed with an explicit
+reason, the final retrospective is regenerated, and the run stops. The report
+therefore states that the goal was not met rather than tallying `0/0` and
+reading healthy.
+
+```yaml
+tuning:
+  orchestrator:
+    stalled_run_grace_s: 3600.0
+    stalled_run_ticks: 20
+```
+
+or the `BERNSTEIN_STALLED_RUN_GRACE_S` / `BERNSTEIN_STALLED_RUN_TICKS` env
+vars, which are checked first.
+
+The `1800.0` default is positioned against two fixed points rather than
+picked round. It sits **above** `stale_claim_timeout_s` (`900.0`) so the
+stale-claim release always gets its chance first - that path produces a real
+failed task carrying its own reason, which is a strictly more informative
+outcome - and **below** the CLI's default wait for run completion (`3600`)
+so a synchronous `bernstein run` observes a genuine terminal state instead of
+timing out against a still-idling orchestrator. Raising it past the CLI wait
+reintroduces the second symptom.
 
 ---
 

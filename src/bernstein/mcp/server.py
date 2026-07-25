@@ -120,6 +120,12 @@ _SERVER_INSTRUCTIONS = (
 # Timeout for all httpx calls to the task server (seconds).
 _HTTP_TIMEOUT = 5.0
 
+# Advisory delay a caller should wait before its first poll of a run handle,
+# reported as ``poll_after_ms`` on the ``bernstein_run`` response. Matches the
+# ``pollInterval`` carried on the projected Tasks-extension task, so a client
+# that reads either field paces itself the same way.
+_POLL_AFTER_MS = 5000
+
 # Env var holding the bearer token the task server expects when auth is
 # enabled. When unset, MCP tools fall back to sending no Authorization
 # header so the default unauth task-server mode keeps working.
@@ -214,6 +220,57 @@ def _get_journal_head(task_id: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _resolve_run_journal(sdd_dir: Path, run_id: str) -> tuple[str, Path]:
+    """Return the ``(run id, journal path)`` a poll identifier resolves to.
+
+    A caller of ``bernstein_task_handle`` holds whichever identifier
+    ``bernstein_run`` handed it: the task id, or the journal run id that
+    :func:`bernstein.core.tasks.checkpoint_retry.task_run_id` derives from
+    the task id. Both must reach the same journal, and the order is fixed so
+    an identifier can never resolve two ways:
+
+    1. ``run_id`` read as a journal run id, when that journal exists on disk.
+    2. ``task_run_id(run_id)``, when that journal exists on disk.
+    3. ``run_id`` as given, so an identifier with no journal at all keeps
+       projecting the empty working handle it projects today.
+
+    Rule 1 before rule 2 is what makes a task id already shaped like
+    ``task-*`` unambiguous: it names its own journal if one exists, and only
+    otherwise is it slugified a second time.
+
+    Every candidate goes through ``run_journal_path``, so the containment
+    barrier stays the single check on both forms and neither can address a
+    journal outside the runs root.
+
+    Args:
+        sdd_dir: The project ``.sdd`` directory.
+        run_id: The identifier the caller polled with.
+
+    Returns:
+        The resolved run id and its containment-checked journal path.
+
+    Raises:
+        JournalPathError: ``run_id`` cannot safely name a journal directory.
+    """
+    from bernstein.core.replay.journal import JournalPathError, run_journal_path
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+
+    direct = run_journal_path(sdd_dir, run_id)
+    if direct.is_file():
+        return run_id, direct
+
+    derived_id = task_run_id(run_id)
+    if derived_id != run_id:
+        try:
+            derived = run_journal_path(sdd_dir, derived_id)
+        except JournalPathError:
+            derived = None
+        if derived is not None and derived.is_file():
+            return derived_id, derived
+
+    return run_id, direct
 
 
 def _project_task_helper(data: dict[str, Any]) -> Any:
@@ -312,6 +369,14 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
     ) -> str:
         """Start an orchestration run by posting a task to the Bernstein server.
 
+        A run executes real work and takes minutes to hours. This call
+        returns as soon as the run is queued, not when it finishes. Do not
+        re-issue it while waiting: that starts a second run. To follow the
+        run, wait ``poll_after_ms`` and then call ``bernstein_task_handle``,
+        passing either the returned ``task_id`` or the returned ``run_id``.
+        Poll it until ``status`` is terminal (``completed``, ``failed`` or
+        ``cancelled``).
+
         Args:
             goal: Description of what you want Bernstein to accomplish.
             role: Specialist role to assign (backend, frontend, qa, security, …).
@@ -321,7 +386,9 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
             estimated_minutes: Rough time estimate in minutes.
 
         Returns:
-            JSON with the created task ID, title, and status.
+            JSON with the created task ID, title and status, plus the
+            ``run_id`` naming the run journal and the advisory
+            ``poll_after_ms`` delay before the first poll.
         """
         err = _validate_or_error(
             "bernstein_run",
@@ -383,8 +450,16 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 task_obj = _project_task_helper(data)
                 return CreateTaskResult(task=task_obj)
 
+            from bernstein.core.tasks.checkpoint_retry import task_run_id
+
             return json.dumps(
-                {"task_id": data["id"], "title": data["title"], "status": data["status"]},
+                {
+                    "task_id": data["id"],
+                    "title": data["title"],
+                    "status": data["status"],
+                    "run_id": task_run_id(data["id"]),
+                    "poll_after_ms": _POLL_AFTER_MS,
+                },
                 indent=2,
             )
         except Exception as exc:
@@ -503,7 +578,11 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
         instance reprojects the same handle from the on-disk journal.
 
         Args:
-            run_id: The run identifier whose journal to project. Must be a
+            run_id: The run to project. Either identifier ``bernstein_run``
+                returned is accepted: the ``task_id``, or the ``run_id``
+                naming the journal. Resolution is journal run id first, then
+                the task id slugified into a journal run id, so the two forms
+                reach one journal and project an identical handle. Must be a
                 plain identifier - path separators and traversal are refused.
             workdir: Project root directory (default: current directory).
 
@@ -520,14 +599,14 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
             from bernstein.core.replay.journal import (
                 JournalPathError,
                 load_events,
-                run_journal_path,
             )
 
             base = Path(workdir).resolve()
             # Shared barrier rather than a local containment check, so this
             # surface cannot drift from the rest of the run-journal readers.
+            # _resolve_run_journal applies it to every candidate id.
             try:
-                journal_path = run_journal_path(base / ".sdd", run_id)
+                resolved_id, journal_path = _resolve_run_journal(base / ".sdd", run_id)
             except JournalPathError as exc:
                 return _error_response(
                     exc,
@@ -535,9 +614,11 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
                 )
             events = load_events(journal_path)
             chain_head = _read_audit_chain_head(base / ".sdd" / "audit")
+            # Both id forms project the identical handle: the handle is a
+            # projection of the journal, not of how the caller addressed it.
             handle = RunHandle.from_journal(
-                task_id=run_id,
-                run_id=run_id,
+                task_id=resolved_id,
+                run_id=resolved_id,
                 events=events,
                 chain_head=chain_head,
             )

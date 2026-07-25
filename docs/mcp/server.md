@@ -229,10 +229,30 @@ free-standing server state: its status is a pure projection of the run
 journal, and it embeds the run's audit-chain head so the host can later prove
 the task it watched corresponds to the audited run.
 
-1. Start a run with `bernstein_run`; note the returned `task_id` (the run id).
-2. Poll `bernstein_task_handle` with that run id. The tool reprojects the
-   handle from the on-disk run journal and the audit-chain head, so any server
-   instance answers identically and the host holds no session:
+1. Start a run with `bernstein_run`. The response body carries everything the
+   poll loop needs:
+
+   ```json
+   {
+     "task_id": "abc123",
+     "title": "Add auth",
+     "status": "open",
+     "run_id": "task-abc123",
+     "poll_after_ms": 5000
+   }
+   ```
+
+   `task_id` names the task on the task server; `run_id` names its run
+   journal (the task id slugified, see `task_run_id`). `poll_after_ms` is the
+   advisory delay before the first poll. A run takes minutes to hours, so a
+   host waits and polls rather than re-issuing `bernstein_run`.
+
+2. Poll `bernstein_task_handle` with **either** identifier from that body.
+   The tool resolves the journal run id first and the slugified task id
+   second, so both forms reach one journal and project an identical handle.
+   It reprojects the handle from the on-disk run journal and the audit-chain
+   head, so any server instance answers identically and the host holds no
+   session:
 
    ```json
    {
