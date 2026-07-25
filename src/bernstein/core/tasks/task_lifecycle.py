@@ -3163,11 +3163,16 @@ def _reconcile_declared_outputs(orch: Any, task: Task, session: AgentSession, *,
             that was accepted while a declared output is missing is a finding in
             its own right.
     """
-    if not task.declared_outputs:
-        # Zero-touch: tasks that never declared an output pay nothing and leave
-        # the chain byte-for-byte as it was.
-        return
     try:
+        # Read through ``getattr``, and inside the guard: this seam is duck-typed
+        # (``orch`` is ``Any``, and callers pass task-shaped objects that need not
+        # carry every field), so a task without the attribute is a shape to skip,
+        # not a completion to fail.
+        declared = getattr(task, "declared_outputs", None)
+        if not declared:
+            # Zero-touch: tasks that never declared an output pay nothing and
+            # leave the chain byte-for-byte as it was.
+            return
         from bernstein.core.lineage.artifact_attempt import (
             ATTEMPT_OUTCOME_FAILED,
             ATTEMPT_OUTCOME_INCOMPLETE,
@@ -3181,7 +3186,7 @@ def _reconcile_declared_outputs(orch: Any, task: Task, session: AgentSession, *,
         missing = reconcile_declared_outputs(
             orch._workdir / ".sdd" / "lineage",
             run_id=run_id,
-            declared=task.declared_outputs,
+            declared=declared,
             task_id=task.id,
             actor=session.id,
             model=task.model or "",
