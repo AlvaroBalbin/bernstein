@@ -800,7 +800,7 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
             task_scope_error = _check_agent_task_scope(
                 path,
                 agent_identity.task_ids,
-                task_id_route_patterns(request.app),
+                task_id_route_patterns(request.scope.get("app")),
             )
             if task_scope_error is not None:
                 logger.warning(
@@ -852,7 +852,7 @@ def _compile_task_id_route_pattern(template: str) -> re.Pattern[str] | None:
     return re.compile("^" + "".join(parts) + "$")
 
 
-def task_id_route_patterns(app: Any) -> tuple[re.Pattern[str], ...]:
+def task_id_route_patterns(app: Any | None) -> tuple[re.Pattern[str], ...]:
     """Return a matcher per registered route that addresses a task by id.
 
     Derived from the app's own route table, so a per-task route registered
@@ -862,12 +862,18 @@ def task_id_route_patterns(app: Any) -> tuple[re.Pattern[str], ...]:
     app is built.
 
     Args:
-        app: The FastAPI/Starlette application serving the request.
+        app: The FastAPI/Starlette application serving the request, or None
+            when the scope carries none.
 
     Returns:
         Compiled patterns, each capturing a ``task_id`` group.  Empty when
-        the app exposes no route table (a bare ASGI callable in a test).
+        the app exposes no route table (``None``, or a bare ASGI callable
+        mounted directly in a test).  The ``/tasks/`` surface is matched by
+        the anchored pattern either way, so an empty result narrows the gate
+        to that surface rather than opening it.
     """
+    if app is None:
+        return ()
     state = getattr(app, "state", None)
     cached = getattr(state, _TASK_ROUTE_PATTERNS_ATTR, None) if state is not None else None
     if cached is not None:
