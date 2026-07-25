@@ -510,9 +510,27 @@ class TestNoRawCurlInRealInjectedSkills:
     files ``inject_skills`` writes to disk.
     """
 
+    def test_role_discovery_did_not_collapse(self) -> None:
+        """Guard the guard, part 1: ``@pytest.mark.parametrize("role", _all_shipped_roles())``
+        silently generates ZERO cases - and the parametrized test below then
+        silently "passes" by not existing - if ``_all_shipped_roles()`` ever
+        returns an empty (or near-empty) list, e.g. because
+        ``_BUNDLED_TEMPLATES_DIR`` resolves to the wrong path. This regression
+        guard is exactly the kind that must fail loudly if its input set
+        collapses, so assert a floor well below the 19 roles shipped today
+        rather than relying on the subset-check below to catch it indirectly.
+        """
+        discovered = _all_shipped_roles()
+        assert len(discovered) >= 10, (
+            f"role discovery found only {len(discovered)} role(s) {discovered} - "
+            "the parametrized no-raw-curl sweep below would silently cover almost "
+            "nothing; check _BUNDLED_TEMPLATES_DIR / 'roles' resolves correctly"
+        )
+
     def test_at_least_the_verified_roles_are_covered(self) -> None:
-        """Guard the guard: issue #3035 was verified for these roles by name;
-        they must still exist and be swept by the parametrized test below."""
+        """Guard the guard, part 2: issue #3035 was verified for these roles by
+        name; they must still exist and be swept by the parametrized test
+        below."""
         verified = {"manager", "backend", "qa", "security", "reviewer", "docs"}
         missing = verified - set(_all_shipped_roles())
         assert not missing, f"roles #3035 verified but no longer shipped: {sorted(missing)}"
