@@ -138,6 +138,48 @@ class TestReapProcessGroup:
         forced = [c for c in mock_killpg.call_args_list if c.args[1] in (signal.SIGKILL, 9)]
         assert forced, "expected a SIGKILL escalation delivered to the surviving group"
 
+    def test_posix_reap_signal_sequence_is_unchanged(self) -> None:
+        """POSIX still reaps with exactly TERM -> poll -> KILL on the group.
+
+        The pid-reuse pin the Windows reap needs must stay inert here: a
+        POSIX reap targets a process *group*, and the kernel does not recycle
+        a group id while the group still has members, so the guard has
+        nothing to add and must not perturb the syscall sequence.
+        """
+        if IS_WINDOWS:
+            pytest.skip("POSIX sequence")
+        sent: list[tuple[int, int]] = []
+
+        def _killpg(pgid: int, sig: int) -> None:
+            sent.append((pgid, sig))
+
+        with patch(f"{_PC}.os.killpg", side_effect=_killpg):
+            receipt = reap_process_group(4321, grace_seconds=0.05, poll_interval=0.01)
+
+        # TERM first, liveness probes with signal 0 in between, KILL last.
+        assert sent[0] == (4321, signal.SIGTERM)
+        assert sent[-1] == (4321, signal.SIGKILL)
+        assert {sig for _pgid, sig in sent} == {signal.SIGTERM, signal.SIGKILL, 0}
+        assert {pgid for pgid, _sig in sent} == {4321}
+        assert receipt.method == "posix_process_group"
+        assert receipt.delivered is True
+        assert receipt.escalated is True
+        # SIGKILL cannot be caught, so a delivered force kill is the
+        # confirmation; re-probing is not, because killpg keeps succeeding
+        # for a group whose members are unreaped zombies.
+        assert receipt.confirmed_dead is True
+
+    def test_posix_already_exited_group_reports_the_guarantee(self) -> None:
+        """A group that is simply gone is a confirmed reap, not a failure."""
+        if IS_WINDOWS:
+            pytest.skip("POSIX semantics")
+        with patch(f"{_PC}.os.killpg", side_effect=ProcessLookupError):
+            receipt = reap_process_group(4321, grace_seconds=0.05, poll_interval=0.01)
+        assert receipt.delivered is False
+        assert receipt.escalated is False
+        assert receipt.already_gone is True
+        assert receipt.confirmed_dead is True
+
     def test_receipt_details_projection(self) -> None:
         """to_details() is a deterministic dict projection of the receipt."""
         receipt = ProcessReapReceipt(
@@ -156,6 +198,8 @@ class TestReapProcessGroup:
             "delivered": True,
             "escalated": False,
             "grace_seconds": 3.0,
+            "already_gone": False,
+            "confirmed_dead": False,
         }
         # Frozen dataclass: two identical receipts project identically.
         assert (

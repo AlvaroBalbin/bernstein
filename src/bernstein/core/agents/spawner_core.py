@@ -242,6 +242,8 @@ def emit_process_reap_receipt(
             grace_seconds=receipt.grace_seconds,
             reason=reason,
             actor=actor,
+            already_gone=receipt.already_gone,
+            confirmed_dead=receipt.confirmed_dead,
         )
     except Exception as exc:  # audit must never block the reap path
         logger.warning(

@@ -99,7 +99,18 @@ def test_adapter_stop_terminates_a_hung_spawn(
     tmp_path: Path,
     fake_cli_fixture: FakeCLIHandle,
 ) -> None:
-    """A hung spawn is stopped through the platform process-tree reap."""
+    """A hung spawn is stopped through the platform process-tree reap.
+
+    The guarantee under test is "the hung spawn is no longer running after
+    stop", not "a stop signal was accepted".  Those are different outcomes:
+    a tree that exits between the spawn and the reap accepts no signal, so
+    ``receipt.delivered`` is False while the guarantee holds perfectly.
+    Windows recycles pids fast enough for that race to be routine on a busy
+    runner, so asserting the raw ``delivered`` flag failed the suite for a
+    spawn that was, in fact, correctly not running.  Assert the guarantee
+    the receipt now reports (``confirmed_dead``) and confirm it
+    independently against the process itself.
+    """
     adapter_cls, model = _ADAPTERS[adapter_name]
     workdir = _git_workdir(tmp_path)
     fake_cli_fixture.configure(mode="hang")
@@ -112,8 +123,12 @@ def test_adapter_stop_terminates_a_hung_spawn(
     pid = int(getattr(result, "pid", 0))
     assert pid > 0
     receipt = reap_process_group(pid, grace_seconds=3.0)
-    assert receipt.delivered
-    # The worker must actually be gone after the reap.
+    # Either a stop was delivered, or the tree was already gone - never a
+    # silent "we could not stop it and left it running".
+    assert receipt.confirmed_dead, f"reap left the spawn unconfirmed: {receipt}"
+    assert receipt.delivered or receipt.already_gone, f"reap reported neither a stop nor an exit: {receipt}"
+    # And the worker really is gone, checked against the process itself
+    # rather than against the receipt that just claimed it.
     proc = getattr(result, "proc", None)
     if proc is not None and hasattr(proc, "wait"):
         with contextlib.suppress(subprocess.TimeoutExpired):

@@ -12,6 +12,7 @@ the POSIX APIs are unavailable.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import ntpath
 import os
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     import pytest
@@ -324,7 +325,11 @@ def kill_process_group_graceful(
     Returns:
         ``True`` if SIGTERM was delivered successfully (even if SIGKILL
         later had to be used).  ``False`` when the group was already dead
-        or the initial SIGTERM could not be sent.
+        or the initial SIGTERM could not be sent.  Callers that need the
+        stronger "the tree is no longer running" guarantee should use
+        :func:`reap_process_group` and read
+        :attr:`ProcessReapReceipt.confirmed_dead` instead - a group that
+        exited on its own reports ``False`` here while still satisfying it.
     """
     return reap_process_group(
         pgid,
@@ -344,9 +349,18 @@ class ProcessReapReceipt:
 
     A deterministic projection of what the reap path did: which platform
     mechanism delivered the stop, whether the graceful stop was delivered,
-    and whether escalation to a force-kill was required.  Callers mirror
-    the receipt into the audit chain so a failure window can be
-    reconstructed offline.
+    whether the target was already gone, whether escalation to a force-kill
+    was required, and - the guarantee callers actually depend on - whether
+    the target is verified to no longer be running.  Callers mirror the
+    receipt into the audit chain so a failure window can be reconstructed
+    offline.
+
+    ``delivered`` answers "did we hand a stop to the OS"; it is *not* the
+    success predicate.  A tree that had already exited before the reap ran
+    accepts no stop, so ``delivered`` is False while the caller's guarantee
+    holds perfectly.  Read :attr:`confirmed_dead` to answer "is the tree
+    gone", and :attr:`already_gone` to tell "it exited on its own" apart
+    from "we stopped it".
 
     Attributes:
         pgid: Process group ID (POSIX) or lead PID (Windows) targeted.
@@ -356,6 +370,13 @@ class ProcessReapReceipt:
         delivered: Whether the initial graceful stop was delivered.
         escalated: Whether a force-kill was required after the grace window.
         grace_seconds: The grace window that applied to this reap.
+        already_gone: Whether the target had already exited before any stop
+            tier ran.  Only ever True when that was affirmatively observed;
+            a target whose state could not be established is not
+            "already gone".
+        confirmed_dead: Whether the target is verified to no longer be
+            running once the reap returned.  This is the guarantee the reap
+            exists to provide.
     """
 
     pgid: int
@@ -364,6 +385,8 @@ class ProcessReapReceipt:
     delivered: bool
     escalated: bool
     grace_seconds: float
+    already_gone: bool = False
+    confirmed_dead: bool = False
 
     def to_details(self) -> dict[str, object]:
         """Return the receipt as a plain dict for audit-chain payloads."""
@@ -374,7 +397,186 @@ class ProcessReapReceipt:
             "delivered": self.delivered,
             "escalated": self.escalated,
             "grace_seconds": self.grace_seconds,
+            "already_gone": self.already_gone,
+            "confirmed_dead": self.confirmed_dead,
         }
+
+
+def _group_stopped_running(pgid: int) -> bool:
+    """Return True when the group has no member left that can run code.
+
+    Confirmation counterpart to :func:`process_group_alive`.  The two answer
+    deliberately different questions.  ``process_group_alive`` drives the
+    decision to *escalate*, so it errs towards "alive" and reports EPERM as
+    alive.  Confirmation needs the sharper question - is anything still
+    running - and a zombie (a process that has exited and is waiting for its
+    parent to call ``wait()``) runs no code.
+
+    macOS reports EPERM, not ESRCH, for a signal aimed at a group whose only
+    remaining members are zombies, so a fully reaped group keeps looking
+    alive to ``killpg(pgid, 0)`` until the parent gets round to reaping it.
+    This probe is only reached after a SIGTERM was accepted for the same
+    group, which proves the group was signalable by us at that point, so a
+    later refusal means the signalable members are gone.
+
+    Args:
+        pgid: Process group ID (POSIX) or lead PID (Windows).
+
+    Returns:
+        True if nothing in the group is still running.
+    """
+    killpg = getattr(os, "killpg", None)
+    if IS_WINDOWS or killpg is None:
+        return not process_group_alive(pgid)
+    try:
+        killpg(pgid, 0)
+    except OSError:
+        return True
+    return False
+
+
+class _ReapPin:
+    """Identity pin held for the duration of one reap.
+
+    The POSIX flavour is inert on purpose.  A POSIX reap targets a process
+    *group*, and the kernel does not recycle a group id while the group
+    still has members, so every ``killpg`` tier already acts on the group it
+    was handed.  :class:`_WinReapPin` does the real work; keeping the POSIX
+    path on this no-op base means Linux and macOS reaps are byte-for-byte
+    the same sequence of syscalls they were before the pin existed.
+    """
+
+    #: True only when the target was affirmatively observed to be gone
+    #: before any stop tier ran.  A target whose state could not be
+    #: established is never "already gone" - not knowing is not proof.
+    already_gone: bool = False
+
+    def confirm_exit(self, pgid: int, *, forced: bool) -> bool:
+        """Return True when the target is verified to no longer be running.
+
+        A delivered force-kill is itself the confirmation on POSIX: SIGKILL
+        cannot be caught, blocked, or ignored.  Re-probing liveness is not a
+        substitute - ``killpg(pgid, 0)`` keeps succeeding for a group whose
+        members are already-dead zombies waiting for their parent to call
+        ``wait()``, so a probe fired straight after SIGKILL reports "alive"
+        for a group that is not running any code at all.
+
+        Args:
+            pgid: Process group ID (POSIX) or lead PID (Windows).
+            forced: Whether an unblockable force-kill was delivered.
+
+        Returns:
+            True if the target is confirmed no longer running.
+        """
+        return forced or _group_stopped_running(pgid)
+
+    def close(self) -> None:
+        """Release any OS resource the pin holds.  No-op on POSIX."""
+
+
+class _WinReapPin(_ReapPin):
+    """An open Windows process handle held for the duration of one reap.
+
+    Windows recycles pids aggressively - a busy runner can hand the same
+    number to an unrelated process within seconds.  Any reap that
+    re-resolves a bare pid between tiers can therefore end up signalling, or
+    reporting on, a process it was never asked to touch, and force-killing
+    someone else's process is far worse than a mis-reported receipt.
+
+    While *any* handle to a process object is open the kernel will not reuse
+    that pid, so opening one handle up front and holding it until the reap
+    returns is the pid-reuse guard: for the whole reap window the number
+    either refers to the process we were asked to reap, or to nothing.
+
+    Two residual gaps are handled explicitly rather than hidden:
+
+    * A pid can be recycled *before* the pin is taken.  The pin therefore
+      also reads the target's creation time and refuses to treat a process
+      that started after the reap request as the reap target - a process
+      born after the caller asked us to stop pid N cannot be the process the
+      caller meant.  Call sites that hold a live ``Popen`` for the child
+      (every adapter spawn path) have no window at all: the parent's own
+      handle already pins the pid.
+    * ``TerminateProcess`` is asynchronous, so a liveness probe fired
+      straight after a kill can still observe ``STILL_ACTIVE`` on a process
+      that is already on its way out.  :meth:`confirm_exit` waits on the
+      handle instead of racing the probe.
+
+    If the handle cannot be opened at all (no ctypes, no permission, no such
+    process) the pin degrades to the inert base behaviour: it never claims
+    the target is gone and never blocks the reap.
+    """
+
+    def __init__(self, pid: int, handle: int, *, already_gone: bool) -> None:
+        self.pid = pid
+        self._handle = handle
+        self.already_gone = already_gone
+
+    def alive(self) -> bool:
+        """Return True when the pinned process has not exited yet."""
+        return bool(self._handle) and _win_handle_alive(self._handle)
+
+    def terminate(self, exit_code: int = 1) -> bool:
+        """Terminate the pinned process through the handle we already hold."""
+        return bool(self._handle) and _win_terminate_handle(self._handle, exit_code)
+
+    def wait_for_exit(self, timeout_ms: int) -> bool:
+        """Block until the pinned process exits or *timeout_ms* elapses."""
+        return bool(self._handle) and _win_wait_for_exit(self._handle, timeout_ms)
+
+    def confirm_exit(self, pgid: int, *, forced: bool) -> bool:
+        """Wait on the pinned handle, then fall back to the liveness probe.
+
+        Windows has real evidence available - the handle becomes signalled
+        when the process leaves the system - so a force-kill request is not
+        allowed to stand in for it here.
+
+        Args:
+            pgid: Lead PID of the reaped tree.
+            forced: Whether a force-kill was delivered (unused: the handle
+                wait is stronger evidence).
+
+        Returns:
+            True if the target is confirmed no longer running.
+        """
+        del forced
+        if self.wait_for_exit(_WIN_EXIT_CONFIRM_MS):
+            return True
+        return _group_stopped_running(pgid)
+
+    def close(self) -> None:
+        """Close the pinned handle, releasing the pid back to the kernel."""
+        if not self._handle:
+            return
+        handle, self._handle = self._handle, 0
+        try:
+            _win_kernel32().CloseHandle(handle)
+        except Exception as exc:  # pragma: no cover - teardown must not raise
+            logger.debug("Could not close reap pin for PID %d: %s", self.pid, exc)
+
+
+@contextlib.contextmanager
+def _pin_reap_target(pgid: int) -> Iterator[_ReapPin]:
+    """Yield an identity pin for *pgid*, held until the reap finishes.
+
+    Args:
+        pgid: Process group ID (POSIX) or lead PID (Windows).
+
+    Yields:
+        A :class:`_ReapPin` - inert on POSIX, a pinned process handle on
+        Windows.  Never raises: a pin that cannot be established degrades to
+        the inert base behaviour so the guard can never break a reap.
+    """
+    pin: _ReapPin = _ReapPin()
+    if IS_WINDOWS:
+        try:
+            pin = _win_pin_process(pgid) or pin
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Could not pin PID %d for reap: %s", pgid, exc)
+    try:
+        yield pin
+    finally:
+        pin.close()
 
 
 def reap_process_group(
@@ -390,6 +592,12 @@ def reap_process_group(
     outcome is returned as a :class:`ProcessReapReceipt` so callers can
     record *how* the reap was performed instead of a bare bool.
 
+    The guarantee is "the target is no longer running", reported as
+    :attr:`ProcessReapReceipt.confirmed_dead`.  A target that had already
+    exited before the reap ran satisfies that guarantee even though no stop
+    could be delivered to it, so ``delivered`` and ``confirmed_dead`` are
+    reported separately instead of being collapsed into one flag.
+
     Args:
         pgid: Process group ID (on Unix) or PID (on Windows).
         grace_seconds: Total time to wait for the graceful stop to take
@@ -403,7 +611,13 @@ def reap_process_group(
     os_name = _detect_os_name()
     method = _REAP_METHOD_WINDOWS if IS_WINDOWS else _REAP_METHOD_POSIX
 
-    def _receipt(*, delivered: bool, escalated: bool) -> ProcessReapReceipt:
+    def _receipt(
+        *,
+        delivered: bool,
+        escalated: bool,
+        already_gone: bool = False,
+        confirmed_dead: bool = False,
+    ) -> ProcessReapReceipt:
         return ProcessReapReceipt(
             pgid=pgid,
             os_name=os_name,
@@ -411,38 +625,71 @@ def reap_process_group(
             delivered=delivered,
             escalated=escalated,
             grace_seconds=grace_seconds,
+            already_gone=already_gone,
+            confirmed_dead=confirmed_dead,
         )
 
     if pgid <= 0:
         return _receipt(delivered=False, escalated=False)
 
-    # Best-effort TERM first; if it fails the group is already gone.
-    if not kill_process_group(pgid, signal.SIGTERM):
-        return _receipt(delivered=False, escalated=False)
+    # Pin the target's identity for the whole reap.  On Windows that is an
+    # open kernel handle, which stops the kernel recycling the pid while any
+    # tier below is running, so no tier can signal - or report on - a process
+    # that merely inherited the number.  Inert on POSIX (see _ReapPin).
+    with _pin_reap_target(pgid) as pin:
+        if pin.already_gone:
+            # Nothing to stop.  The tree the caller asked about is not
+            # running, which is exactly the guarantee they wanted, so this is
+            # a success even though no stop was delivered to anything.
+            return _receipt(
+                delivered=False,
+                escalated=False,
+                already_gone=True,
+                confirmed_dead=True,
+            )
 
-    # Poll for graceful exit.  Probe the whole process *group* rather than the
-    # lead PID: the session leader can reap while a child it spawned keeps the
-    # group alive, and a lead-PID-only check (``process_alive``) would then
-    # declare the group dead the moment the leader exits and skip the SIGKILL
-    # escalation the surviving tree still needs (issue #2643).
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
+        # Best-effort TERM first.
+        if not kill_process_group(pgid, signal.SIGTERM):
+            # The stop could not be delivered.  That is only a reap failure
+            # when the target is still running; a target that has already
+            # exited is the outcome the caller asked for.  Verify rather than
+            # assume - conflating the two is what made an already-exited
+            # Windows spawn look like a failed stop.
+            gone = not process_group_alive(pgid)
+            return _receipt(
+                delivered=False,
+                escalated=False,
+                already_gone=gone,
+                confirmed_dead=gone,
+            )
+
+        # Poll for graceful exit.  Probe the whole process *group* rather than
+        # the lead PID: the session leader can reap while a child it spawned
+        # keeps the group alive, and a lead-PID-only check (``process_alive``)
+        # would then declare the group dead the moment the leader exits and
+        # skip the SIGKILL escalation the surviving tree still needs (#2643).
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if not process_group_alive(pgid):
+                return _receipt(delivered=True, escalated=False, confirmed_dead=True)
+            time.sleep(poll_interval)
+
+        # Group still alive after grace period - escalate.
         if not process_group_alive(pgid):
-            return _receipt(delivered=True, escalated=False)
-        time.sleep(poll_interval)
-
-    # Group still alive after grace period - escalate.
-    escalated = False
-    if process_group_alive(pgid):
+            # Exited right on the grace boundary; no force tier needed.
+            return _receipt(delivered=True, escalated=False, confirmed_dead=True)
         logger.warning(
             "Process group %d did not exit within %.1fs of SIGTERM; sending SIGKILL",
             pgid,
             grace_seconds,
         )
         kill_sig = signal.SIGKILL if is_signal_supported("SIGKILL") else 9
-        kill_process_group(pgid, kill_sig)
-        escalated = True
-    return _receipt(delivered=True, escalated=escalated)
+        forced = kill_process_group(pgid, kill_sig)
+        return _receipt(
+            delivered=True,
+            escalated=True,
+            confirmed_dead=pin.confirm_exit(pgid, forced=forced),
+        )
 
 
 def process_alive(pid: int) -> bool:
@@ -578,9 +825,216 @@ def path_separator() -> str:
 # Internal Windows helpers
 # ---------------------------------------------------------------------------
 
+# Access rights the reap pin asks for.  PROCESS_QUERY_LIMITED_INFORMATION is
+# the minimum needed to read liveness and creation time,
+# _WIN_PROCESS_TERMINATE lets us stop the target through the same handle, and
+# SYNCHRONIZE lets us *wait* for it to leave the system instead of racing a
+# liveness probe.
+_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN_SYNCHRONIZE = 0x00100000
+
+#: ``GetExitCodeProcess`` sentinel for "this process has not exited yet".
+_WIN_STILL_ACTIVE = 259
+
+#: ``WaitForSingleObject`` return meaning "the handle was signalled".
+_WIN_WAIT_OBJECT_0 = 0x0
+
+#: How long a reap waits for a terminated process to actually leave the
+#: system before calling the stop unconfirmed.  ``TerminateProcess`` is
+#: asynchronous, so a probe fired immediately after it can still observe
+#: ``STILL_ACTIVE`` on a process that is already on its way out.
+_WIN_EXIT_CONFIRM_MS = 2000
+
+#: ``taskkill`` exit code for "the process is not running".
+_WIN_TASKKILL_NOT_FOUND = 128
+
+#: Offset between the FILETIME epoch (1601-01-01 UTC) and the Unix epoch.
+_WIN_FILETIME_EPOCH_OFFSET_S = 11644473600.0
+
+#: FILETIME resolution: 100 ns ticks per second.
+_WIN_FILETIME_TICKS_PER_S = 10_000_000.0
+
+
+def _win_open_process(pid: int, access: int) -> int | None:
+    """Return an open kernel handle to *pid*.
+
+    Args:
+        pid: Process ID.
+        access: ``OpenProcess`` desired-access mask.
+
+    Returns:
+        A handle value; ``0`` when ``OpenProcess`` itself refused (no such
+        process, or access denied); ``None`` when the call could not be made
+        at all.  The two are kept apart deliberately: a missing kernel32 is
+        an environment failure and says nothing about the target, whereas a
+        refused open is evidence about the pid.
+    """
+    try:
+        kernel32 = _win_kernel32()
+    except Exception as exc:
+        logger.debug("kernel32 unavailable while opening PID %d: %s", pid, exc)
+        return None
+    try:
+        return int(kernel32.OpenProcess(access, False, pid))
+    except Exception as exc:
+        logger.debug("OpenProcess failed for PID %d: %s", pid, exc)
+        return None
+
+
+def _win_handle_alive(handle: int) -> bool:
+    """Return True when the process behind *handle* has not exited yet."""
+    import ctypes
+    import ctypes.wintypes
+
+    try:
+        exit_code = ctypes.wintypes.DWORD()
+        if not _win_kernel32().GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return bool(exit_code.value == _WIN_STILL_ACTIVE)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("GetExitCodeProcess failed: %s", exc)
+        return False
+
+
+def _win_handle_start_time(handle: int) -> float | None:
+    """Return the creation time of *handle*'s process as a Unix timestamp.
+
+    Args:
+        handle: An open process handle with query rights.
+
+    Returns:
+        Seconds since the Unix epoch, or None when the time is unavailable.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    try:
+        creation = ctypes.wintypes.FILETIME()
+        exited = ctypes.wintypes.FILETIME()
+        kernel = ctypes.wintypes.FILETIME()
+        user = ctypes.wintypes.FILETIME()
+        ok = _win_kernel32().GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        ticks = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("GetProcessTimes failed: %s", exc)
+        return None
+    return ticks / _WIN_FILETIME_TICKS_PER_S - _WIN_FILETIME_EPOCH_OFFSET_S
+
+
+def _win_wait_for_exit(handle: int, timeout_ms: int) -> bool:
+    """Block until *handle*'s process exits or *timeout_ms* elapses.
+
+    ``TerminateProcess`` only *requests* termination, so this is what turns
+    "we asked it to die" into "it is gone" without a polling race.
+
+    Args:
+        handle: An open process handle with ``SYNCHRONIZE`` rights.
+        timeout_ms: Maximum time to wait, in milliseconds.
+
+    Returns:
+        True if the process exited within the timeout.
+    """
+    try:
+        return int(_win_kernel32().WaitForSingleObject(handle, timeout_ms)) == _WIN_WAIT_OBJECT_0
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("WaitForSingleObject failed: %s", exc)
+        return False
+
+
+def _win_terminate_handle(handle: int, exit_code: int = 1) -> bool:
+    """Terminate the process behind *handle*.
+
+    Takes a handle rather than a pid on purpose: the handle already names
+    one specific process object, so this can never hit a different process
+    that inherited the same pid number.
+
+    Args:
+        handle: An open process handle with terminate rights.
+        exit_code: Exit code to report for the terminated process.
+
+    Returns:
+        True if the terminate request was accepted.
+    """
+    try:
+        return bool(_win_kernel32().TerminateProcess(handle, exit_code))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("TerminateProcess failed: %s", exc)
+        return False
+
+
+def _win_pin_process(pid: int) -> _WinReapPin | None:
+    """Open and return a pid-reuse pin for *pid* (Windows only).
+
+    Asks for terminate + synchronize + query rights so the whole reap can be
+    driven through the one handle, and degrades to query-only rights rather
+    than giving up the guard.
+
+    Args:
+        pid: Process ID to pin.
+
+    Returns:
+        A :class:`_WinReapPin`, or None when the kernel boundary is not
+        callable at all.  None means "guard unavailable", never "target
+        gone" - callers fall back to their pre-pin behaviour instead of
+        treating an unreadable environment as proof about the process.
+    """
+    if pid <= 0:
+        return _WinReapPin(pid, 0, already_gone=True)
+    requested_at = time.time()
+    full = _WIN_PROCESS_QUERY_LIMITED_INFORMATION | _WIN_PROCESS_TERMINATE | _WIN_SYNCHRONIZE
+    handle = _win_open_process(pid, full)
+    if handle is None:
+        return None
+    if not handle:
+        handle = _win_open_process(pid, _WIN_PROCESS_QUERY_LIMITED_INFORMATION)
+        if handle is None:
+            return None
+    if not handle:
+        # The pid does not resolve to a process we can observe.  OpenProcess
+        # fails for a pid that is not in use at all, which is the
+        # already-exited case; it also fails when the pid *is* in use by a
+        # process we may not touch.  Both mean "do not signal this number":
+        # report gone so the reap stops here instead of firing stop tiers at
+        # a number that is not ours.
+        return _WinReapPin(pid, 0, already_gone=True)
+
+    pin = _WinReapPin(pid, handle, already_gone=not _win_handle_alive(handle))
+    if pin.already_gone:
+        return pin
+
+    start_time = _win_handle_start_time(handle)
+    if start_time is not None and start_time > requested_at:
+        # This process started after we were asked to reap the pid, so it
+        # cannot be the process the caller meant - the number was recycled.
+        # Drop the pin without ever signalling it.
+        logger.warning(
+            "PID %d was recycled before the reap could pin it (started %.3fs after the request); "
+            "refusing to signal an unrelated process",
+            pid,
+            start_time - requested_at,
+        )
+        pin.close()
+        return _WinReapPin(pid, 0, already_gone=True)
+    return pin
+
 
 def _win_taskkill(pid: int, *, force: bool = False, tree: bool = False) -> bool:
-    """Kill a process on Windows via ``taskkill`` with PowerShell fallback.
+    """Stop a Windows process (optionally its whole tree), pid-reuse safe.
+
+    Pins the pid with an open handle first, so neither the ``taskkill`` tree
+    stop nor the terminate fallback can act on a process that merely
+    inherited the number.  The fallback terminates through the pinned handle
+    rather than re-resolving the pid, and confirms the exit by waiting on the
+    handle instead of racing an asynchronous ``TerminateProcess`` with a
+    liveness probe.
 
     Args:
         pid: Process ID.
@@ -588,9 +1042,35 @@ def _win_taskkill(pid: int, *, force: bool = False, tree: bool = False) -> bool:
         tree: If True, adds ``/T`` (kill child processes).
 
     Returns:
-        True if the process was killed successfully.
+        True if this call stopped the process.  False when the process was
+        already gone (matching the POSIX ``os.kill`` semantics
+        :func:`kill_process` documents) or could not be stopped.
     """
-    # Try taskkill first (faster when it works)
+    pin = _win_pin_process(pid)
+    if pin is None:
+        # The guard could not be established.  Run the tree stop alone
+        # instead of reaching for a fallback that force-kills a bare pid we
+        # cannot prove is still the process we were asked to stop.
+        return _win_run_taskkill(pid, force=force, tree=tree) == 0
+    try:
+        if pin.already_gone:
+            return False
+        return _win_stop_pinned(pin, force=force, tree=tree)
+    finally:
+        pin.close()
+
+
+def _win_run_taskkill(pid: int, *, force: bool, tree: bool) -> int:
+    """Run ``taskkill`` for *pid* and return its exit code.
+
+    Args:
+        pid: Process ID to target.
+        force: If True, adds ``/F`` (force terminate).
+        tree: If True, adds ``/T`` (kill child processes).
+
+    Returns:
+        The ``taskkill`` exit code, or -1 when it could not be run.
+    """
     cmd: list[str] = ["taskkill"]
     if force:
         cmd.append("/F")
@@ -606,27 +1086,40 @@ def _win_taskkill(pid: int, *, force: bool = False, tree: bool = False) -> bool:
             errors="replace",
             timeout=5,
         )
-        if result.returncode == 0:
-            return True
     except (subprocess.TimeoutExpired, OSError) as exc:
         logger.debug("taskkill failed for PID %d: %s", pid, exc)
+        return -1
+    return int(result.returncode)
 
-    # Fallback: PowerShell Stop-Process (more reliable for stubborn processes)
-    try:
-        ps_cmd = f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        # PowerShell returns 0 even if process doesn't exist, so verify
-        return not _win_process_alive(pid)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug("PowerShell Stop-Process failed for PID %d: %s", pid, exc)
-        return False
+
+def _win_stop_pinned(pin: _WinReapPin, *, force: bool, tree: bool) -> bool:
+    """Stop the process behind an established pin.
+
+    Args:
+        pin: An open pin whose target was alive when it was taken.
+        force: If True, adds ``/F`` (force terminate) to ``taskkill``.
+        tree: If True, adds ``/T`` (kill child processes) to ``taskkill``.
+
+    Returns:
+        True if the target is confirmed stopped.
+    """
+    pid = pin.pid
+    # taskkill is the only cheap way to reach the *tree*; the pin holds the
+    # lead pid steady while it runs, so /T resolves children of the process
+    # we meant and not of a namesake.
+    returncode = _win_run_taskkill(pid, force=force, tree=tree)
+    if returncode == 0 and pin.wait_for_exit(_WIN_EXIT_CONFIRM_MS):
+        return True
+    if returncode == _WIN_TASKKILL_NOT_FOUND:
+        logger.debug("taskkill reports PID %d is not running", pid)
+
+    # taskkill refuses to stop a console process without /F, and cannot stop
+    # one at all when the caller lacks rights it needs.  Terminate the lead
+    # through the handle we already hold: no pid lookup, so no chance of
+    # hitting an unrelated process, and no external interpreter to time out.
+    if pin.terminate():
+        return pin.wait_for_exit(_WIN_EXIT_CONFIRM_MS)
+    return not pin.alive()
 
 
 def _win_process_alive(pid: int) -> bool:
