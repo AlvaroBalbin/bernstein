@@ -935,10 +935,21 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
         err = _validate_or_error("bernstein_stop", {"workdir": workdir})
         if err is not None:
             return _validation_error_response(err)
+        from bernstein.mcp.signal_paths import ShutdownSignalPathError, shutdown_signal_path
+
+        # Shared barrier rather than a local containment check, so this
+        # surface cannot drift from the other workdir-derived writers. The
+        # path is resolved and proven contained before any directory is
+        # created, so a refused call leaves nothing behind.
         try:
-            signals_dir = Path(workdir) / ".sdd" / "runtime" / "signals"
-            signals_dir.mkdir(parents=True, exist_ok=True)
-            shutdown_file = signals_dir / "SHUTDOWN"
+            shutdown_file = shutdown_signal_path(workdir)
+        except ShutdownSignalPathError as exc:
+            return _error_response(
+                exc,
+                hint="workdir must be an existing Bernstein project root",
+            )
+        try:
+            shutdown_file.parent.mkdir(parents=True, exist_ok=True)
             shutdown_file.write_text("mcp-stop\n", encoding="utf-8")
             return json.dumps({"status": "shutdown signal sent", "path": str(shutdown_file)})
         except Exception as exc:

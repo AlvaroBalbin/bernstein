@@ -943,12 +943,14 @@ class StreamableHTTPTransport:
             return await self._proxy_post("/tasks", payload)
 
         if name == "bernstein_stop":
-            from pathlib import Path
+            from bernstein.mcp.signal_paths import shutdown_signal_path
 
-            workdir = arguments.get("workdir", ".")
-            signals_dir = Path(workdir) / ".sdd" / "runtime" / "signals"
-            signals_dir.mkdir(parents=True, exist_ok=True)
-            shutdown_file = signals_dir / "SHUTDOWN"
+            # Same barrier as the stdio surface: the workdir must name an
+            # existing project root and the signal path must stay inside it.
+            # A refusal raises and is rendered as the structured tool error,
+            # before any directory is created.
+            shutdown_file = shutdown_signal_path(arguments.get("workdir", "."))
+            shutdown_file.parent.mkdir(parents=True, exist_ok=True)
             shutdown_file.write_text("mcp-remote-stop\n", encoding="utf-8")
             return json.dumps({"status": "shutdown signal sent", "path": str(shutdown_file)})
 
