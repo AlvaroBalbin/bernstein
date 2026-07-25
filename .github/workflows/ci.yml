@@ -1533,6 +1533,48 @@ jobs:
           include-hidden-files: true
           retention-days: 1
 
+  integration-tests:
+    # `tests/integration/**` (126 files) reached CI only through the
+    # `--affected` slice the `test` job runs on pull_request, which selects
+    # the subset the impact map ties to the changed sources. Nothing selected
+    # the directory on push to `main` or in the merge queue, so a break that
+    # arrives through a path the map does not model - a changed default, a
+    # role template, a transitive import - landed with the gate green. This
+    # job runs the whole directory on the events that decide what reaches
+    # `main`, and skips on pull_request so PR latency is unchanged.
+    #
+    # Cost: 126 files, 264s wall at `--parallel 4`, 456 MB peak RSS. The
+    # runner runs each file in its own subprocess (same OOM-avoidance model
+    # as the unit shards), so memory is bounded by the widest single file.
+    name: Integration tests
+    needs: [lint]  # fast-fail: don't burn a runner if lint fails
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # The integration files are slower than unit files (real subprocesses,
+      # loopback servers, git repos); the default 300s per-file cap is too
+      # tight for the widest of them.
+      BERNSTEIN_TEST_FILE_TIMEOUT_SECONDS: "600"
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: "3.13"
+      - name: Run integration suite
+        run: |
+          uv run python scripts/run_tests.py \
+            --test-dir tests/integration \
+            --parallel 4
+
   coverage-report:
     name: Coverage report
     needs: [test]
@@ -1844,6 +1886,7 @@ jobs:
       - adapter-integration-macos
       - adapter-conformance-windows
       - test
+      - integration-tests
       - coverage-report
       - test-macos
     timeout-minutes: 3
@@ -1889,6 +1932,7 @@ jobs:
               "dist-size",
               "install-smoke-pipx",
               "install-smoke-uv",
+              "integration-tests",
           }
           # macOS-gated jobs (see #1468): on PRs these are skipped unless
           # the diff is macos_sensitive or the PR carries the
@@ -1897,6 +1941,11 @@ jobs:
           # Push-only jobs are required on native main pushes but skip
           # intentionally on PR, workflow_dispatch, and merge_group runs.
           PUSH_ONLY = {"coverage-report"}
+          # Jobs that run on push, merge_group, and workflow_dispatch but
+          # skip on pull_request. The `test` job's `--affected` lane already
+          # selects the impacted `tests/integration/**` files on a PR, so
+          # running the whole directory there would only add latency.
+          NON_PR = {"integration-tests"}
           # Events under which a macOS-gated skip is intentional. PRs and
           # manual dispatch already gate macOS behind macos_sensitive /
           # label. merge_group must be included too: a merge queue runs CI
@@ -1933,6 +1982,8 @@ jobs:
                   continue
               if r == "skipped":
                   if name in PUSH_ONLY and event != "push":
+                      continue
+                  if name in NON_PR and event == "pull_request":
                       continue
                   if docs_only and name in DOCS_ONLY_SKIPPABLE:
                       continue

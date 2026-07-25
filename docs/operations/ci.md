@@ -14,6 +14,43 @@ documentation read the inline comments in `.github/workflows/ci.yml`.
 | macOS safety net | Nightly + push-on-sensitive | `.github/workflows/ci-macos-nightly.yml` |
 | Required check | Single `CI gate` job | `.github/workflows/ci.yml` |
 | Concurrency | PR-scoped cancel, push-scoped non-cancel | `.github/workflows/ci.yml` |
+| Integration suite | Affected slice on PR; full directory on push and merge queue | `.github/workflows/ci.yml` |
+
+## Test directory coverage
+
+Every test file must be reachable from a CI lane. The mapping:
+
+| Directory | Lane | Events |
+|---|---|---|
+| `tests/unit/**` | `test` (4 shards x os x python) | all |
+| `tests/integration/**` | `test --affected` slice | pull_request |
+| `tests/integration/**` | `integration-tests` (whole directory) | push, merge_group, workflow_dispatch |
+| `tests/property/**` | `property-tests` | all |
+| `tests/snapshot/**` | `snapshot-tests` | all |
+| `tests/contract/**` | `schemathesis-smoke` | all |
+| `tests/protocol/**` | `publish.yml` | release |
+| `tests/pentest/**` | `pentest.yml` | scheduled / dispatch |
+| `tests/stress/**` | `nightly-deep-tests.yml` | nightly |
+| `tests/chaos/**` | none - on demand | operator |
+| `tests/perf/**` | none - wall-clock thresholds are not meaningful on shared runners | operator |
+
+A test file that lives outside all of these directories is collected by
+nothing. Add new test files under one of the directories above.
+
+### Why `tests/integration/**` runs on push and in the merge queue
+
+The `--affected` slice selects only the integration files the impact map
+ties to the changed sources. A break that arrives through a path the map
+does not model - a changed default, a role template, a transitive import
+- was invisible to every lane that decides what reaches `main`. Only two
+integration files ran on push (`test_capability_matrix_spawn_refusal.py`
+and `test_adapter_e2e.py`, both pinned by name); the other 124 did not.
+
+The measured cost of running the whole directory is 264s wall at
+`--parallel 4` (126 files, 456 MB peak RSS), so the job is off the
+critical path set by the sharded unit suite. It skips on `pull_request`,
+where the affected slice already covers the diff, so PR latency is
+unchanged.
 
 ## macOS matrix policy (closes #1468)
 
