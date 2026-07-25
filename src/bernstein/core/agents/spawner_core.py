@@ -671,13 +671,14 @@ def _render_auth_section(token_path: Path) -> str:
         '  -H "Content-Type: application/json" \\\n'
         '  -d \'{"title": "...", "role": "backend", "description": "..."}\'\n'
         "```\n"
-        "Example - marking a task complete (pass the whole line to `run_command` as ONE string):\n"
+        "Marking a task complete - use the first-class CLI, NOT curl. It reads\n"
+        "the token and the server port itself, so there is no auth header or\n"
+        "JSON body to hand-quote (pass this whole line to `run_command` as ONE string):\n"
         "```bash\n"
-        f"curl -sS -w '\\n%{{http_code}}' -X POST {base}/tasks/<TASK_ID>/complete \\\n"
-        f'  -H "Authorization: Bearer $(cat {absolute})" \\\n'
-        '  -H "Content-Type: application/json" \\\n'
-        '  -d \'{"result_summary": "Done"}\'\n'
+        'bernstein task complete <TASK_ID> --summary "Done"\n'
         "```\n"
+        "It exits non-zero and prints the reason if the server is unreachable or\n"
+        "rejects the token, so you never mis-read a failure as success.\n"
         "If the token file is unreadable for any reason, fall back to the\n"
         "`BERNSTEIN_AUTH_TOKEN` environment variable, which is exported into\n"
         "your shell:\n"
