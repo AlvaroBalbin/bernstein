@@ -367,6 +367,7 @@ nav:
           - Token growth monitor: operations/token-growth-monitor.md
           - Payment mandates: operations/payment-mandates.md
           - Showback canonicalization: cost/showback-canonical.md
+          - Showback statements: cost/showback-statement.md
       - Observability:
           - Overview: operations/observability-overview.md
           - Instrumentation: operations/INSTRUMENTATION.md
@@ -445,6 +446,7 @@ nav:
           - SOC 2 audit: security/AUDIT.md
           - Audit log: security/audit-log.md
           - Multi-tenant audit export: security/audit-multitenant.md
+          - Tenant charters: security/tenant-charters.md
           - Delegation narrowing: security/delegation-narrowing.md
           - DSSE / in-toto envelope: security/audit-dsse-envelope.md
           - EU AI Act Article 12: compliance/eu-ai-act-article-12-bundle.md
