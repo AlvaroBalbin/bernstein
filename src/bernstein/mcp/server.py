@@ -75,7 +75,12 @@ from bernstein.core.protocols.mcp.tool_tiers import (
     resolve_active_tier,
     tool_in_tier,
 )
-from bernstein.mcp.approval_gate import is_approvable, refusal_payload, releases_for_execution
+from bernstein.mcp.approval_gate import (
+    completion_refusal_payload,
+    is_approvable,
+    is_worker_completable,
+    refusal_payload,
+)
 from bernstein.mcp.cost_meter import measure_call, wrap_envelope
 from bernstein.mcp.input_validation import (
     ValidatedPayload,
@@ -161,6 +166,11 @@ def _error_response(exc: Exception, *, hint: str = "Task server may be restartin
 def _approval_refusal_response(task_id: str, current_status: str) -> str:
     """Render the shared approval refusal as the JSON string MCP tools return."""
     return json.dumps(refusal_payload(task_id, current_status), indent=2)
+
+
+def _completion_refusal_response(task_id: str, current_status: str) -> str:
+    """Render the shared completion refusal as the JSON string MCP tools return."""
+    return json.dumps(completion_refusal_payload(task_id, current_status), indent=2)
 
 
 def _validation_error_response(err: ValidationError) -> str:
@@ -875,29 +885,28 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
         task_id: str,
         note: str = "Approved via MCP",
     ) -> str:
-        """Grant the approval a task is waiting on. Not a way to finish work.
+        """Sign off a finished result that is waiting on a decision.
 
-        The tool reads the task first and acts only on the two states where
-        the task lifecycle is waiting on a human decision:
+        The tool reads the task first and acts only on ``pending_approval``:
+        the work has run, the result is held for a decision, and accepting it
+        completes the task with ``note`` as the result summary.
 
-        * ``planned`` - the task is held before execution, so approving it
-          releases the task for execution (it becomes ``open``). Nothing is
-          marked done: the work has not run yet.
-        * ``pending_approval`` - the work is finished and held for sign-off,
-          so approving it completes the task with ``note`` as the result
-          summary.
+        Every other status is refused with a structured error naming the
+        current status, and no state-changing request is sent:
 
-        Any other status (``open``, ``claimed``, ``in_progress``,
-        ``blocked``, ``failed``, terminal states, ...) is refused with a
-        structured error naming the current status. A stuck or unfinished
-        task is not approvable: use ``bernstein_complete`` to finish work you
-        are executing, ``bernstein_update`` to report a blocker on the task
-        mailbox, or cancel the task to abandon it.
+        * ``planned`` - the task is held by plan mode. That decision is
+          recorded on the plan, not on the task, so approve the plan
+          (``bernstein plan approve <plan_id>``). Releasing one task would
+          start the work while the plan is still undecided.
+        * ``open``, ``claimed``, ``in_progress``, ``blocked``, ``failed``,
+          terminal states, ... - there is no approval to grant. Use
+          ``bernstein_complete`` to report work you are executing,
+          ``bernstein_update`` to report a blocker on the task mailbox, or
+          cancel the task to abandon it.
 
         Args:
             task_id: ID of the task to approve.
-            note: Approval note recorded as the result summary when the
-                approval completes a ``pending_approval`` task.
+            note: Approval note recorded as the result summary.
 
         Returns:
             JSON with the task id, its new status, and which approval was
@@ -913,29 +922,18 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
                 current_status = str(read.json().get("status") or "")
                 if not is_approvable(current_status):
                     return _approval_refusal_response(task_id, current_status)
-                if releases_for_execution(current_status):
-                    # Pre-execution approval: release the plan for execution.
-                    # The task must not be completed - it has not run.
-                    approval = "released_for_execution"
-                    resp = await client.post(
-                        f"{server_url}/tasks/{task_id}/force-claim",
-                        headers=_auth_headers(),
-                    )
-                else:
-                    # Post-execution approval: sign off finished work.
-                    approval = "completion_signed_off"
-                    resp = await client.post(
-                        f"{server_url}/tasks/{task_id}/complete",
-                        json={"result_summary": note},
-                        headers=_auth_headers(),
-                    )
+                resp = await client.post(
+                    f"{server_url}/tasks/{task_id}/complete",
+                    json={"result_summary": note},
+                    headers=_auth_headers(),
+                )
                 resp.raise_for_status()
                 data: dict[str, Any] = resp.json()
             return json.dumps(
                 {
                     "task_id": data["id"],
                     "status": data["status"],
-                    "approval": approval,
+                    "approval": "completion_signed_off",
                     "approved_from": current_status,
                     "result_summary": data.get("result_summary"),
                 },
@@ -949,13 +947,20 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
         task_id: str,
         result_summary: str,
     ) -> str:
-        """Complete a task you are executing, with a summary of what you did.
+        """Report the result of work you are executing.
 
         This is the completion verb of the MCP worker loop (claim with
         ``bernstein_claim``, report with ``bernstein_update``, finish here).
-        It is not an approval gate: report only work you actually did, and
-        use ``bernstein_update`` instead when the task is unfinished or
-        stuck.
+        The tool reads the task first and completes it only from a state a
+        worker holds it in (``open``, ``claimed``, ``in_progress``).
+
+        It is not a way to clear a task out of the way. A parent in
+        ``waiting_for_subtasks`` is completed by its subtasks finishing, an
+        ``orphaned`` task belongs to crash recovery, and a result already
+        awaiting a decision is signed off with ``bernstein_approve``; all
+        three are refused with a structured error naming the current status.
+        Report only work that actually ran, and use ``bernstein_update``
+        when the task is unfinished or stuck.
 
         Args:
             task_id: ID of the task to complete.
@@ -963,7 +968,8 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
                 an empty summary and fails the task instead.
 
         Returns:
-            JSON with the task id, its new status, and the recorded summary.
+            JSON with the task id, its new status, and the recorded summary -
+            or a structured refusal naming the current status.
         """
         err = _validate_or_error(
             "bernstein_complete",
@@ -973,6 +979,11 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
             return _validation_error_response(err)
         try:
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+                read = await client.get(f"{server_url}/tasks/{task_id}", headers=_auth_headers())
+                read.raise_for_status()
+                current_status = str(read.json().get("status") or "")
+                if not is_worker_completable(current_status):
+                    return _completion_refusal_response(task_id, current_status)
                 resp = await client.post(
                     f"{server_url}/tasks/{task_id}/complete",
                     json={"result_summary": result_summary},

@@ -22,9 +22,11 @@ from bernstein.core.tasks import lifecycle as lc
 from bernstein.core.tasks.lifecycle import (
     AGENT_TRANSITIONS,
     APPROVABLE_TASK_STATUSES,
+    PLAN_GATED_TASK_STATUSES,
     TASK_APPROVAL_TARGETS,
     TASK_TRANSITIONS,
     TERMINAL_TASK_STATUSES,
+    WORKER_COMPLETABLE_TASK_STATUSES,
     DuplicateTransitionError,
     IllegalTransitionError,
     add_listener,
@@ -179,9 +181,9 @@ def test_open_is_not_terminal() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_only_the_two_decision_states_are_approvable() -> None:
-    """An approval is defined before execution and after it, nowhere else."""
-    assert set(APPROVABLE_TASK_STATUSES) == {TaskStatus.PLANNED, TaskStatus.PENDING_APPROVAL}
+def test_only_the_post_execution_decision_state_is_approvable() -> None:
+    """A per-task approval acts on a finished result awaiting a decision, nowhere else."""
+    assert set(APPROVABLE_TASK_STATUSES) == {TaskStatus.PENDING_APPROVAL}
     for status in (
         TaskStatus.OPEN,
         TaskStatus.CLAIMED,
@@ -193,20 +195,58 @@ def test_only_the_two_decision_states_are_approvable() -> None:
         assert status not in APPROVABLE_TASK_STATUSES
 
 
-def test_approving_a_planned_task_releases_it_for_execution() -> None:
-    """Pre-execution approval promotes the task; it never completes it.
+def test_planned_is_plan_gated_and_never_approvable_per_task() -> None:
+    """Plan mode's decision is recorded on the plan, so a task verb must not grant it.
 
-    The target is the same promotion the plan-approval route performs, so it
-    must be a declared transition rather than a value invented here.
+    Releasing one task out of ``planned`` starts the work while the plan is
+    still undecided, and the operator's later rejection then cancels nothing.
     """
-    target = TASK_APPROVAL_TARGETS[TaskStatus.PLANNED]
-    assert target is TaskStatus.OPEN
-    assert (TaskStatus.PLANNED, target) in TASK_TRANSITIONS
+    assert TaskStatus.PLANNED in PLAN_GATED_TASK_STATUSES
+    assert TaskStatus.PLANNED not in APPROVABLE_TASK_STATUSES
+    assert not (PLAN_GATED_TASK_STATUSES & APPROVABLE_TASK_STATUSES)
 
 
 def test_approving_a_pending_approval_task_signs_off_the_result() -> None:
-    """Post-execution approval completes work that already ran."""
-    assert TASK_APPROVAL_TARGETS[TaskStatus.PENDING_APPROVAL] is TaskStatus.DONE
+    """Post-execution approval completes work that already ran.
+
+    The target has to be a declared transition, otherwise the task server
+    rejects the sign-off and the only state the verb acts on cannot succeed.
+    """
+    target = TASK_APPROVAL_TARGETS[TaskStatus.PENDING_APPROVAL]
+    assert target is TaskStatus.DONE
+    assert (TaskStatus.PENDING_APPROVAL, target) in TASK_TRANSITIONS
+
+
+def test_every_approval_target_is_a_declared_transition() -> None:
+    """No approval may name a target the state machine does not allow."""
+    for source, target in TASK_APPROVAL_TARGETS.items():
+        assert (source, target) in TASK_TRANSITIONS, f"{source.value} -> {target.value} is not declared"
+
+
+def test_every_worker_completable_state_can_reach_done() -> None:
+    """A worker may only report completion from a state the server can complete.
+
+    ``open`` reaches ``done`` through the auto-claim the completion route
+    performs, so it is checked through ``claimed`` rather than directly.
+    """
+    for status in WORKER_COMPLETABLE_TASK_STATUSES:
+        direct = (status, TaskStatus.DONE) in TASK_TRANSITIONS
+        via_claim = (status, TaskStatus.CLAIMED) in TASK_TRANSITIONS and (
+            TaskStatus.CLAIMED,
+            TaskStatus.DONE,
+        ) in TASK_TRANSITIONS
+        assert direct or via_claim, f"{status.value} cannot reach done"
+
+
+def test_states_that_are_not_the_callers_work_are_not_completable() -> None:
+    """A parent waiting on subtasks, a gone worker, and a pending decision are excluded.
+
+    All three have a legal edge to ``done``, so only this set keeps a caller
+    from marking work done that it did not do.
+    """
+    for status in (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.ORPHANED, TaskStatus.PENDING_APPROVAL):
+        assert (status, TaskStatus.DONE) in TASK_TRANSITIONS
+        assert status not in WORKER_COMPLETABLE_TASK_STATUSES
 
 
 # ---------------------------------------------------------------------------

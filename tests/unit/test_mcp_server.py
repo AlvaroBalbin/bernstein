@@ -378,11 +378,12 @@ async def test_bernstein_approve_signs_off_pending_approval_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bernstein_approve_releases_planned_task_without_completing_it() -> None:
-    """A planned task is released for execution, never marked complete.
+async def test_bernstein_approve_refuses_a_planned_task_and_names_the_plan_gate() -> None:
+    """A planned task is held by plan mode, whose decision is not the task's to grant.
 
-    Approving before execution is a different operation from signing off
-    finished work: the task becomes open so the orchestrator can run it.
+    Releasing one task would start the work while the plan is still
+    undecided, so the refusal points at the plan decision instead. No
+    state-changing request is sent.
     """
     from bernstein.mcp.server import create_mcp_server
 
@@ -397,11 +398,10 @@ async def test_bernstein_approve_releases_planned_task_without_completing_it() -
         result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01"})
 
     parsed = _unwrap_tool_json(result)
-    assert parsed["status"] == "open"
-    assert parsed["approval"] == "released_for_execution"
-    call_url = mock_client.post.call_args[0][0]
-    assert call_url.endswith("/force-claim")
-    assert not any("/complete" in str(call) for call in mock_client.post.call_args_list)
+    assert parsed["error"] == "task_not_awaiting_approval"
+    assert parsed["current_status"] == "planned"
+    assert "plan" in parsed["hint"].lower()
+    mock_client.post.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -424,12 +424,15 @@ async def test_bernstein_approve_refuses_non_approval_states(status: str) -> Non
     with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
         result = await mcp.call_tool("bernstein_approve", {"task_id": "task-ap-01", "note": "unstick it"})
 
+    from bernstein.core.tasks.lifecycle import APPROVABLE_TASK_STATUSES
+
     parsed = _unwrap_tool_json(result)
     assert parsed["error"] == "task_not_awaiting_approval"
     assert parsed["current_status"] == status
     assert status in parsed["message"]
-    assert sorted(parsed["approvable_statuses"]) == ["pending_approval", "planned"]
-    assert "bernstein_update" in parsed["hint"]
+    assert sorted(parsed["approvable_statuses"]) == sorted(s.value for s in APPROVABLE_TASK_STATUSES)
+    # The refusal has to name a different action, or the caller can only retry.
+    assert "bernstein_update" in parsed["hint"] or "plan" in parsed["hint"].lower()
     mock_client.post.assert_not_awaited()
 
 
@@ -472,19 +475,25 @@ def test_bernstein_approve_description_names_the_approvable_states() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _non_completable_statuses() -> set:
+    """Every task status a worker completion must refuse, taken from the state machine.
+
+    Derived rather than listed, so a new status added to ``TaskStatus`` is
+    covered by the refusal matrix without editing this file.
+    """
+    from bernstein.core.tasks.lifecycle import WORKER_COMPLETABLE_TASK_STATUSES
+    from bernstein.core.tasks.models import TaskStatus
+
+    return set(TaskStatus) - set(WORKER_COMPLETABLE_TASK_STATUSES)
+
+
+@pytest.mark.parametrize("status", ["open", "claimed", "in_progress"])
 @pytest.mark.asyncio
-async def test_bernstein_complete_posts_the_worker_summary() -> None:
+async def test_bernstein_complete_posts_the_worker_summary(status: str) -> None:
     """bernstein_complete is the worker completion verb: POST /tasks/{id}/complete."""
     from bernstein.mcp.server import create_mcp_server
 
-    mock_response = MagicMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value=_make_task_payload("task-cp-01", status="done"))
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_client = _approve_client(status, _make_task_payload("task-cp-01", status="done"))
 
     mcp = create_mcp_server(server_url="http://localhost:8052")
 
@@ -500,6 +509,75 @@ async def test_bernstein_complete_posts_the_worker_summary() -> None:
     call_url = mock_client.post.call_args[0][0]
     assert call_url.endswith("/tasks/task-cp-01/complete")
     assert mock_client.post.call_args[1]["json"]["result_summary"] == "shipped the parser"
+
+
+@pytest.mark.parametrize(
+    "status",
+    sorted(s.value for s in _non_completable_statuses()),
+)
+@pytest.mark.asyncio
+async def test_bernstein_complete_refuses_a_task_the_caller_is_not_executing(status: str) -> None:
+    """Every state outside the worker-held set is refused without any POST.
+
+    ``bernstein_complete`` replaced the completion path that used to sit on
+    ``bernstein_approve``. Without this matrix the fix would only rename the
+    force-complete: a caller could still finish a parent whose subtasks are
+    running, or a task whose worker is gone, with an invented summary.
+    """
+    from bernstein.mcp.server import create_mcp_server
+
+    mock_client = _approve_client(status, _make_task_payload("task-cp-01", status="done"))
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp.call_tool(
+            "bernstein_complete",
+            {"task_id": "task-cp-01", "result_summary": "looked done to me"},
+        )
+
+    parsed = _unwrap_tool_json(result)
+    assert parsed["error"] == "task_not_completable"
+    assert parsed["current_status"] == status
+    assert status in parsed["message"]
+    mock_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bernstein_complete_refuses_a_task_with_no_status() -> None:
+    """A task payload carrying no status fails closed rather than completing."""
+    from bernstein.mcp.server import create_mcp_server
+
+    mock_client = _approve_client("", _make_task_payload("task-cp-01", status="done"))
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=mock_client):
+        result = await mcp.call_tool(
+            "bernstein_complete",
+            {"task_id": "task-cp-01", "result_summary": "looked done to me"},
+        )
+
+    parsed = _unwrap_tool_json(result)
+    assert parsed["error"] == "task_not_completable"
+    assert parsed["current_status"] == "unknown"
+    mock_client.post.assert_not_awaited()
+
+
+def test_bernstein_complete_description_names_the_completable_states() -> None:
+    """The advertised description names every state the tool acts on.
+
+    A model picks the tool from its description, so the description and the
+    enforced set must not drift apart.
+    """
+    from bernstein.core.tasks.lifecycle import WORKER_COMPLETABLE_TASK_STATUSES
+    from bernstein.mcp.server import create_mcp_server
+
+    mcp = create_mcp_server(server_url="http://localhost:8052")
+    tool = next(t for t in mcp._tool_manager.list_tools() if t.name == "bernstein_complete")
+    description = tool.description or ""
+    for state in WORKER_COMPLETABLE_TASK_STATUSES:
+        assert state.value in description, f"{state.value} missing from the tool description"
 
 
 # ---------------------------------------------------------------------------
