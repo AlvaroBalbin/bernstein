@@ -83,9 +83,29 @@ rejected.
    expiry.
 3. Resolves the user (operator) or identity (agent), populates
    `request.state.user` / `request.state.identity`, and enforces
-   `task_ids` scoping for `/tasks/{id}/{complete,fail,progress,cancel,
-   block,steal}` paths (`auth_middleware.py:55`).
+   `task_ids` scoping on every mutating request. The rule is applied to the
+   task the request acts on, not to a list of blessed URLs, so it holds
+   wherever that id comes from (see the table below).
 4. Returns `JSONResponse(401)` on any verification failure.
+
+**Where the task id comes from.** A rule enforced on only some of these is
+enforced on an arbitrary subset, so all of them are covered:
+
+| How the request names a task | Enforced by |
+| --- | --- |
+| `/tasks/{id}` and anything below it, plus the `/api/v<n>` mirror | deny-by-default path gate; a task route added later is covered without editing the middleware |
+| `{task_id}` in the path under any other prefix (`/approvals/{task_id}/approve`, the review board's per-task decision route) | matchers compiled from the app's own route table (`task_id_route_patterns`), so they cannot drift from the routes it registers |
+| ids in a request body on a `/tasks/` collection route (`batch-ops`, `claim-batch`, `self-create`) | `enforce_agent_task_scope_for_ids` in the handler |
+| a body-carried id outside `/tasks/` (`POST /a2a/message`) | `enforce_agent_task_scope_for_ids` in the handler |
+| an id the handler resolves from another key (the task behind an ACP run, the tasks a plan decision transitions, the tasks a cluster steal reassigns) | `enforce_agent_task_scope_for_ids` on the resolved ids, before the mutation |
+
+The only exemptions are the collection routes under `/tasks/`
+(`TASK_COLLECTION_SEGMENTS` in `auth_middleware.py`), which address the
+collection rather than one task, and the claim-next routes
+(`GET /tasks/next/{role}`, `POST /tasks/claim-receipt`), where the server
+picks the row and the caller cannot name a task. A token with an empty
+`task_ids` claim is an unrestricted manager token, and non-agent
+credentials never reach the check at all.
 
 **Revocation.**
 
