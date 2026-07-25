@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from bernstein.core.git.git_ops import branch_delete, worktree_add, worktree_list, worktree_remove
+from bernstein.core.git.git_pr import _MERGE_DENY_EXACT, _MERGE_DENY_PREFIXES
 from bernstein.core.git.salvage import SalvageResult, salvage_worktree
 from bernstein.core.git.worktree_isolation import validate_worktree_isolation
 from bernstein.core.platform_compat import IS_WINDOWS, process_alive, robust_rmtree
@@ -44,6 +45,9 @@ _GRAVEYARD_DIR_REL = ".sdd/graveyard"
 _GRAVEYARD_REF_PREFIX = "refs/graveyard/"
 _GRAVEYARD_GIT_TIMEOUT_S = 30
 _GRAVEYARD_DEFAULT_PURGE_DAYS = 14
+
+# Local (never-committed) exclude injection (#3017).
+_LOCAL_EXCLUDE_GIT_TIMEOUT_S = 10
 
 
 @dataclass(frozen=True)
@@ -336,49 +340,101 @@ def setup_worktree_env(
             logger.warning("Failed to run worktree setup command: %s", exc)
 
 
-# Only paths that are (a) genuinely orchestrator-owned runtime state, never
-# a plausible task deliverable, and (b) anchored to the worktree root so they
-# cannot shadow a same-named path a target project keeps elsewhere.
-#
-# ``/.sdd/`` is the one that is actually load-bearing: it is the merge
-# guard's own deny-list prefix (see ``_MERGE_DENY_PREFIXES`` in git_pr.py).
-# ``/.claude/mcp.json`` and ``/.claude/scheduled_tasks.json`` are specific
-# files the orchestrator itself writes into every worktree (mcp.json is also
-# an exact deny-list entry). Deliberately NOT included: the whole
-# ``.claude/`` tree and ``CLAUDE.md`` - an agent can be legitimately tasked
-# to *author* a ``.claude/`` skill/command or a ``CLAUDE.md`` in a target
-# repo, and the merge guard does not forbid either, so blanket-ignoring them
-# would silently drop a real deliverable with no error and no graveyard
-# rescue.
-_WORKTREE_GITIGNORE_ENTRIES: tuple[str, ...] = (
-    "/.sdd/",
-    "/.claude/mcp.json",
-    "/.claude/scheduled_tasks.json",
-)
+def _derive_local_exclude_entries() -> tuple[str, ...]:
+    """Build the local-exclude entry list from the merge guard's own deny list.
+
+    Sourced directly from :data:`bernstein.core.git.git_pr._MERGE_DENY_PREFIXES`
+    and :data:`bernstein.core.git.git_pr._MERGE_DENY_EXACT` rather than
+    duplicated by hand, so the two can never drift apart: every path the
+    merge-preflight guard would refuse is excluded here, at worktree-creation
+    time, before it can ever be staged in the first place.
+
+    ``/CLAUDE.md`` is added on top even though it is not in the guard's deny
+    list: the orchestrator itself generates a session-specific ``CLAUDE.md``
+    at the root of every worktree (see ``worktree_claude_md.write_claude_md``),
+    so it is always a duplicate/decoy file at that path, never a genuine
+    target-repo deliverable. All entries are anchored to the worktree root
+    (leading ``/``) so they cannot shadow a same-named path a target project
+    legitimately keeps elsewhere (e.g. a nested ``docs/CLAUDE.md`` or a
+    ``.claude/`` skill/command the agent was tasked to author).
+    """
+    entries = [f"/{prefix}" for prefix in _MERGE_DENY_PREFIXES]
+    entries.extend(f"/{exact}" for exact in sorted(_MERGE_DENY_EXACT))
+    entries.append("/CLAUDE.md")
+    return tuple(entries)
 
 
-def _ensure_worktree_gitignore(worktree_path: Path) -> None:
-    """Ensure the worktree's root ``.gitignore`` excludes orchestrator runtime state.
+def _resolve_git_common_dir(worktree_path: Path) -> Path | None:
+    """Resolve the shared ``$GIT_COMMON_DIR`` for *worktree_path*.
+
+    ``.git/info/exclude`` is not a per-worktree file - git always reads it
+    from the *common* git directory shared by every worktree of a repository
+    (confirmed: writing to a linked worktree's own ``.git/worktrees/<id>/info/``
+    has no effect on that worktree's status). Resolving it explicitly via
+    ``git rev-parse`` (rather than assuming ``repo_root / ".git"``) stays
+    correct even when ``repo_root`` is itself a linked worktree or uses a
+    ``.git`` file (submodules, older worktree layouts).
+
+    Returns ``None`` on any failure - the caller treats this as best-effort.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_LOCAL_EXCLUDE_GIT_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        logger.warning("Could not resolve git-common-dir for %s: %s", worktree_path, exc)
+        return None
+    if result.returncode != 0 or not isinstance(result.stdout, str) or not result.stdout.strip():
+        logger.warning(
+            "git rev-parse --git-common-dir failed for %s: %s",
+            worktree_path,
+            result.stderr.strip() if isinstance(result.stderr, str) else result.stderr,
+        )
+        return None
+    common_dir = Path(result.stdout.strip())
+    # ``--path-format=absolute`` guarantees an absolute path on success.
+    # Refuse anything else rather than risk ``mkdir(parents=True)`` writing
+    # into a bogus relative/CWD-derived location later.
+    if not common_dir.is_absolute():
+        logger.warning(
+            "git rev-parse --git-common-dir returned a non-absolute path for %s: %r",
+            worktree_path,
+            str(common_dir),
+        )
+        return None
+    return common_dir
+
+
+def _ensure_worktree_local_excludes(worktree_path: Path) -> None:
+    """Ensure ``.git/info/exclude`` covers orchestrator runtime state.
 
     Bernstein orchestrates agents against arbitrary target repositories that
-    have no reason to already gitignore bernstein's own runtime state.
-    Without this, an agent that follows its own "finish with ``git add -A &&
-    git commit``" instruction stages ``.sdd/runtime/*`` logs and heartbeats,
-    plus a couple of specific orchestrator-written ``.claude/`` config
-    files - and the reap-and-merge preflight's forbidden-path guard then
-    refuses the *entire* commit, diverting real work to the graveyard
-    instead of merging it.
+    have no reason to already ignore bernstein's own runtime state. Without
+    this, an agent that follows its own "finish with ``git add -A && git
+    commit``" instruction stages ``.sdd/*`` runtime state, ``attestations/``,
+    ``auth/``, ``bernstein.yaml``, ``.env``, ``.claude/mcp.json``, and the
+    orchestrator-generated ``CLAUDE.md`` - and the reap-and-merge preflight's
+    forbidden-path guard then refuses the *entire* commit, diverting real
+    work to the graveyard instead of merging it (or, for ``CLAUDE.md``,
+    lets a decoy file merge silently since the guard does not forbid it).
 
-    Scope is intentionally narrow (see :data:`_WORKTREE_GITIGNORE_ENTRIES`):
-    only paths that are never a plausible task deliverable are covered, so
-    an agent tasked with authoring real ``.claude/*`` or ``CLAUDE.md``
-    content in the target repo is unaffected.
+    Uses ``.git/info/exclude`` rather than a tracked ``.gitignore``: it is
+    local-only and never staged, committed, or visible in the target repo's
+    history, so it cannot conflict with the project's own ignore rules and
+    never shows up as a diff in the agent's own commit. This also means it
+    is safe to cover ``CLAUDE.md`` and the guard's full deny list -- nothing
+    here is imposed on the target repo.
 
-    Appends only the entries missing from any existing ``.gitignore``
-    (tracked or not), so the injection is idempotent: once a repo has these
-    lines - either from a prior agent run that committed them, or because
-    the target project already ignores them - later worktrees produce no
-    diff at all.
+    Appends only the entries missing from the existing file, so the
+    injection is idempotent: once a repo clone's shared git dir has these
+    lines - written by an earlier worktree of the same clone - later
+    worktrees produce no further writes at all.
 
     Best-effort: a failure is logged but never blocks worktree creation - a
     worktree usable without this guard is still better than no worktree.
@@ -386,15 +442,33 @@ def _ensure_worktree_gitignore(worktree_path: Path) -> None:
     Args:
         worktree_path: Root of the newly-created worktree.
     """
-    gitignore_path = worktree_path / ".gitignore"
-    try:
-        existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
-    except OSError as exc:
-        logger.warning("Could not read %s to inject runtime-state ignores: %s", gitignore_path, exc)
+    common_dir = _resolve_git_common_dir(worktree_path)
+    if common_dir is None:
         return
 
+    exclude_path = common_dir / "info" / "exclude"
+    try:
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Could not create %s to inject local excludes: %s", exclude_path.parent, exc)
+        return
+
+    try:
+        # errors="replace" keeps this best-effort even against a
+        # non-UTF-8 byte in an existing exclude file: a decode fallback,
+        # not a hard failure (UnicodeDecodeError is a ValueError, not an
+        # OSError, so it would otherwise slip past a narrower except
+        # clause and crash worktree creation). This function only ever
+        # appends, so a lossy in-memory decode used purely for the
+        # membership check below never touches the bytes already on disk.
+        existing = exclude_path.read_text(encoding="utf-8", errors="replace") if exclude_path.exists() else ""
+    except OSError as exc:
+        logger.warning("Could not read %s to inject local excludes: %s", exclude_path, exc)
+        return
+
+    entries = _derive_local_exclude_entries()
     existing_lines = {line.strip() for line in existing.splitlines()}
-    missing = [entry for entry in _WORKTREE_GITIGNORE_ENTRIES if entry not in existing_lines]
+    missing = [entry for entry in entries if entry not in existing_lines]
     if not missing:
         return
 
@@ -409,11 +483,11 @@ def _ensure_worktree_gitignore(worktree_path: Path) -> None:
     prefix = "" if not existing else ("" if existing.endswith("\n") else "\n") + "\n"
 
     try:
-        with gitignore_path.open("a", encoding="utf-8") as fh:
+        with exclude_path.open("a", encoding="utf-8") as fh:
             fh.write(prefix + block)
-        logger.info("Injected runtime-state ignores into %s: %s", gitignore_path, missing)
+        logger.info("Injected local excludes into %s: %s", exclude_path, missing)
     except OSError as exc:
-        logger.warning("Failed to write runtime-state ignores to %s: %s", gitignore_path, exc)
+        logger.warning("Failed to write local excludes to %s: %s", exclude_path, exc)
 
 
 def _branch_exists(repo_root: Path, branch: str) -> bool:
@@ -905,10 +979,13 @@ class WorktreeManager:
         # no ``asyncio.shield`` (shielding an unbounded cleanup would turn a
         # cancel into a hang).
         try:
-            # Ensure runtime/agent-control state is gitignored before the
-            # agent ever runs ``git add -A`` (#3017). Must happen before any
-            # setup step that might itself write into the worktree.
-            _ensure_worktree_gitignore(worktree_path)
+            # Ensure runtime/agent-control state is locally excluded before
+            # the agent ever runs ``git add -A`` (#3017). Writes to
+            # ``.git/info/exclude``, never the tracked tree, so nothing
+            # here is staged, committed, or visible in the target repo's
+            # history. Must happen before any setup step that might itself
+            # write into the worktree.
+            _ensure_worktree_local_excludes(worktree_path)
 
             # Write lock file for stale detection (T487)
             worker_pid = os.getpid()
