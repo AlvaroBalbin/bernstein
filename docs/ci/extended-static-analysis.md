@@ -50,12 +50,10 @@ the surface those tools do not cover.
 
 ### Semgrep
 
-`.semgrep/baseline.yml` records pre-existing findings on `main` for
-transparency and audit. The actual gate is git-baseline based:
-`semgrep scan --baseline-commit=<base-sha>` on pull requests so only
-new findings introduced by the PR fail the job.
+The gate is git-baseline based: `semgrep scan --baseline-commit=<base-sha>`
+on pull requests, so only new findings introduced by the PR fail the job.
 
-To regenerate the snapshot file:
+To list the current findings on any ref:
 
 ```
 uv tool run semgrep scan \
@@ -65,9 +63,6 @@ uv tool run semgrep scan \
     --json --metrics off --quiet src/ \
     > /tmp/semgrep.json
 ```
-
-Then either update `.semgrep/baseline.yml` by hand or write a small
-script to convert the JSON.
 
 ### Trivy
 
