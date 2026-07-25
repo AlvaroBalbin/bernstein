@@ -18,15 +18,24 @@ meta:
 about:
   title: Bernstein
   description: >-
-    Deterministic multi-agent orchestrator for CLI coding agents. Submit a
-    goal; bernstein decomposes it into tasks, spawns agents in parallel git
-    worktrees, verifies output against a Merkle-chained lineage journal and
-    HMAC audit chain, and merges results. The MCP server exposes
-    bernstein_run, bernstein_status, bernstein_tasks, bernstein_cost,
-    bernstein_stop, and bernstein_approve.
+    Deterministic orchestration for CLI coding agents. Submit a goal and
+    Bernstein decomposes it into tasks, runs agents in parallel git worktrees,
+    and records every run in a replay journal with lineage tracking and an
+    opt-in HMAC-chained audit log that verifies offline. Adapters ship for
+    Claude Code, Codex, Gemini CLI, Aider, OpenHands and 40+ other agent CLIs.
+    The MCP server exposes 13 tools covering run control, task listing and
+    claiming, progress updates, artifact posting, approvals, subtasks, cost
+    reporting, and skill loading.
+  icon: https://avatars.githubusercontent.com/u/271707709?v=4
 source:
   project: https://github.com/sipyourdrink-ltd/bernstein
+  # The catalog validator requires a pinned commit. Refresh this to the
+  # release commit being submitted before opening the catalog PR.
+  commit: ec2c1306eba4f51ace107382dab495156e7f20e6
 run:
+  # The published image sets ENTRYPOINT ["bernstein"], and the catalog
+  # appends run.command after the image reference. Naming the binary here
+  # as well executes `bernstein bernstein mcp`, which exits with
+  # "No such command 'bernstein'". Only the subcommand belongs here.
   command:
-    - bernstein
     - mcp
