@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import json
 import logging
 import os
@@ -57,10 +58,10 @@ from bernstein.core.protocols.mcp.tool_tiers import (
 )
 from bernstein.mcp.cost_meter import measure_call, wrap_envelope
 from bernstein.mcp.input_validation import (
-    ValidatedPayload,
     ValidationError,
-    to_jsonrpc_error,
-    validate_tool_call,
+    get_registry,
+    validate_or_error,
+    validation_error_response,
 )
 
 _orig_convert_result = FuncMetadata.convert_result
@@ -128,29 +129,13 @@ def _error_response(exc: Exception, *, hint: str = "Task server may be restartin
 
 
 def _validation_error_response(err: ValidationError) -> str:
-    """Render a validation failure as the JSON string FastMCP tools return.
-
-    Carries the full structured error so MCP clients can show users which
-    field failed and why, without leaking server internals.
-    """
-    payload = {"error": err.message, "jsonrpc_error": to_jsonrpc_error(err)}
-    return json.dumps(payload)
+    """Render a validation failure as the JSON string FastMCP tools return."""
+    return validation_error_response(err)
 
 
 def _validate_or_error(tool_name: str, params: dict[str, Any]) -> ValidationError | None:
-    """Validate ``params`` against ``tool_name``'s schema.
-
-    Returns ``None`` when the call is allowed, or a ``ValidationError`` the
-    caller should render via :func:`_validation_error_response`. Stripping
-    ``None`` values from the params dict keeps every tool's optional-arg
-    convention working; the schema can still mark them as nullable when
-    that's the intended contract.
-    """
-    cleaned = {k: v for k, v in params.items() if v is not None}
-    result = validate_tool_call(tool_name, cleaned)
-    if isinstance(result, ValidatedPayload):
-        return None
-    return result
+    """Validate ``params`` against ``tool_name``'s schema."""
+    return validate_or_error(tool_name, params)
 
 
 def _register_health_tool(mcp: FastMCP[None]) -> None:
@@ -759,38 +744,33 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
             JSON of the chain-anchored artifact record (``key``, ``version``,
             ``content_hash``, ``spine_entry_hash``, ``journal_index``, ...).
         """
-        err = _validate_or_error(
-            "bernstein_post_artifact",
-            {
-                "task_id": task_id,
-                "key": key,
-                "artifact_type": artifact_type,
-                "poster": poster,
-                "body": body,
-                "columns": columns,
-                "rows": rows,
-                "url": url,
-                "link_kind": link_kind,
-            },
-        )
+        # An argument left at its empty-string default means "not supplied for
+        # this artifact type", so it must not reach the validator: the schema
+        # constrains ``body`` / ``url`` / ``link_kind`` to the values a caller
+        # that actually supplies them would send. Validate exactly the fields
+        # that get posted, so the conditional shape advertised to the caller is
+        # the shape the call is judged against.
+        args: dict[str, Any] = {
+            "task_id": task_id,
+            "key": key,
+            "artifact_type": artifact_type,
+            "poster": poster,
+        }
+        if body:
+            args["body"] = body
+        if columns is not None:
+            args["columns"] = columns
+        if rows is not None:
+            args["rows"] = rows
+        if url:
+            args["url"] = url
+        if link_kind:
+            args["link_kind"] = link_kind
+        err = _validate_or_error("bernstein_post_artifact", args)
         if err is not None:
             return _validation_error_response(err)
         try:
-            payload: dict[str, Any] = {
-                "key": key,
-                "artifact_type": artifact_type,
-                "poster": poster,
-            }
-            if body:
-                payload["body"] = body
-            if columns is not None:
-                payload["columns"] = columns
-            if rows is not None:
-                payload["rows"] = rows
-            if url:
-                payload["url"] = url
-            if link_kind:
-                payload["link_kind"] = link_kind
+            payload: dict[str, Any] = {k: v for k, v in args.items() if k != "task_id"}
             # Carry the caller identity in the request header (the server's
             # authorization principal), not only in the body. The server refuses
             # posts against a task this identity does not hold the claim for.
@@ -1057,6 +1037,41 @@ def _apply_cost_meter(mcp: FastMCP[None]) -> None:
         tool.fn = metered
 
 
+def _apply_advertised_schemas(mcp: FastMCP[None]) -> None:
+    """Advertise each tool's enforced schema as its ``inputSchema``.
+
+    FastMCP derives the advertised schema from the Python signature, which
+    carries none of the constraints the input firewall enforces: a caller is
+    shown ``scope: string`` while ``validate_tool_call`` requires one of
+    ``small`` / ``medium`` / ``large``. The caller sends a plausible value and
+    gets a rejection it had no way to predict. Replacing the derived schema
+    with the schema from ``tool_schemas/<tool>.json`` gives a tool one schema
+    instead of two, so a constrained argument can be filled correctly on the
+    first call.
+
+    Only the advertised copy is replaced. Argument coercion still runs through
+    FastMCP's signature-derived model, and enforcement still runs through
+    ``validate_tool_call`` inside each handler.
+
+    Args:
+        mcp: The FastMCP server whose tools should advertise their schemas.
+    """
+    registry = get_registry()
+    # FastMCP exposes no public per-tool schema override, so patch the tool
+    # manager's registry after registration (same access pattern as
+    # _apply_tool_tier).
+    for name, tool in mcp._tool_manager._tools.items():  # pyright: ignore[reportPrivateUsage]
+        schema = registry.get(name)
+        if schema is None:
+            # Deny-by-default means such a tool is registered but not callable.
+            # Leave the derived schema alone and make the mismatch visible.
+            logger.warning("MCP tool %s has no schema file; advertising the derived schema", name)
+            continue
+        # Deep-copy so a client-side mutation of the advertised schema cannot
+        # reach the process-wide registry the validator reads.
+        tool.parameters = copy.deepcopy(schema)
+
+
 def _apply_tool_tier(mcp: FastMCP[None], active_tier: ToolTier) -> None:
     """Drop every registered tool that is outside ``active_tier``.
 
@@ -1255,6 +1270,7 @@ def create_mcp_server(
         register_lineage_resources(mcp, lineage_root=root, enabled=True)
 
     _apply_tool_tier(mcp, active_tier)
+    _apply_advertised_schemas(mcp)
     _apply_cost_meter(mcp)
     return mcp
 
