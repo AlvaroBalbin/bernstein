@@ -71,6 +71,18 @@ class TestRenderAuthSectionServerUrl:
     def test_curl_examples_use_server_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("BERNSTEIN_SERVER_URL", "http://central:9000")
         section = _render_auth_section(tmp_path / "token")
+        # The subtask-creation curl still honours the configured server URL.
         assert "POST http://central:9000/tasks" in section
-        assert "http://central:9000/tasks/<TASK_ID>/complete" in section
         assert _LOCAL_DEFAULT not in section
+
+    def test_completion_uses_cli_not_embedded_url(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Completion is the first-class CLI (#3015), which resolves the URL itself.
+
+        The auth section no longer embeds a completion endpoint URL: the agent
+        runs ``bernstein task complete`` and the command resolves the server
+        port at runtime, so there is no ``…/complete`` curl to server-URL-adjust.
+        """
+        monkeypatch.setenv("BERNSTEIN_SERVER_URL", "http://central:9000")
+        section = _render_auth_section(tmp_path / "token")
+        assert "bernstein task complete" in section
+        assert "/complete" not in section
