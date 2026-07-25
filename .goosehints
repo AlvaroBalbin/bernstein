@@ -269,6 +269,7 @@ Bernstein is named after Leonard Bernstein, the American conductor and composer.
 | `telemetry.py`            | Telemetry contract - strict schema for agent output metadata |
 | `vcr_fixture.py`          | VCR fixture pattern - dehydrate/hydrate deterministic test fixtures (T805) |
 | `yaml_runner.py`          | YAML eval harness - operator-runnable spec format with judge and golden diff |
+| `bench/`                  | bernstein-bench: runnable, reproducibility-gated evaluation harness |
 | `cases/`                  | cases/ sub-package |
 | `golden_data/`            | Packaged golden benchmark fixtures (ships in wheel via package-data) |
 
@@ -416,6 +417,7 @@ Top-level entry points exposed by the package:
 |--------------------|---------|
 | `bernstein`        | bernstein.cli.main:cli |
 | `bernstein-worker` | bernstein.core.worker:main |
+| `bernstein-bench`  | bernstein.eval.bench.bench_cli:bench_group |
 
 **Back-compat aliases.** Legacy import paths (e.g. `bernstein.core.orchestrator`) are served by a `sys.meta_path` finder, not by physical shim files. The mechanism lives in `src/bernstein/core/__init__.py` as `_CoreRedirectFinder` driven by the `_REDIRECT_MAP` dict - add new aliases there rather than creating shim modules at the old path.
 
