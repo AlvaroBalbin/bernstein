@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from bernstein.core.models import NodeCapacity, NodeInfo, NodeStatus
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 from bernstein.core.server import (
     ClaimGossipRequest,
     ClaimGossipResponse,
@@ -304,6 +305,15 @@ async def steal_tasks(body: TaskStealRequest, request: Request) -> TaskStealResp
         # oldest claimed tasks (best-effort redistribution).
         if not donor_tasks and claimed:
             donor_tasks = sorted(claimed, key=lambda t: t.version)[:count]
+
+        # The caller names no task here - the policy picks them - but the
+        # force-claim below is the same mutation ``POST /tasks/{id}/force-claim``
+        # performs behind the path-level scope gate. Bind the identity to the
+        # ids the policy resolved so a task-scoped token cannot reset a task
+        # it does not hold. Cluster peers authenticate with the shared secret
+        # or a cluster JWT and never populate an agent identity, so this is a
+        # no-op on the real redistribution path.
+        enforce_agent_task_scope_for_ids(request, [task.id for task in donor_tasks])
 
         stolen_ids: list[str] = []
         for task in donor_tasks:
