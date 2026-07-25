@@ -336,21 +336,43 @@ def setup_worktree_env(
             logger.warning("Failed to run worktree setup command: %s", exc)
 
 
-_WORKTREE_GITIGNORE_ENTRIES: tuple[str, ...] = (".sdd/", ".claude/", "CLAUDE.md")
+# Only paths that are (a) genuinely orchestrator-owned runtime state, never
+# a plausible task deliverable, and (b) anchored to the worktree root so they
+# cannot shadow a same-named path a target project keeps elsewhere.
+#
+# ``/.sdd/`` is the one that is actually load-bearing: it is the merge
+# guard's own deny-list prefix (see ``_MERGE_DENY_PREFIXES`` in git_pr.py).
+# ``/.claude/mcp.json`` and ``/.claude/scheduled_tasks.json`` are specific
+# files the orchestrator itself writes into every worktree (mcp.json is also
+# an exact deny-list entry). Deliberately NOT included: the whole
+# ``.claude/`` tree and ``CLAUDE.md`` - an agent can be legitimately tasked
+# to *author* a ``.claude/`` skill/command or a ``CLAUDE.md`` in a target
+# repo, and the merge guard does not forbid either, so blanket-ignoring them
+# would silently drop a real deliverable with no error and no graveyard
+# rescue.
+_WORKTREE_GITIGNORE_ENTRIES: tuple[str, ...] = (
+    "/.sdd/",
+    "/.claude/mcp.json",
+    "/.claude/scheduled_tasks.json",
+)
 
 
 def _ensure_worktree_gitignore(worktree_path: Path) -> None:
-    """Ensure the worktree's root ``.gitignore`` excludes agent-control state.
+    """Ensure the worktree's root ``.gitignore`` excludes orchestrator runtime state.
 
-    Bernstein orchestrates agents against arbitrary target repositories,
-    most of which have no idea ``.sdd/``, ``.claude/``, or ``CLAUDE.md`` are
-    bernstein-internal runtime/agent-control files. Without this, an agent
-    that follows its own "finish with ``git add -A && git commit``"
-    instruction stages ``.sdd/runtime/*`` logs and heartbeats,
-    ``.sdd/skills/activations.jsonl``, ``.claude/*`` config, and
-    ``CLAUDE.md`` - and the reap-and-merge preflight's forbidden-path guard
-    then refuses the *entire* commit, diverting real work to the graveyard
-    instead of merging it (#3017).
+    Bernstein orchestrates agents against arbitrary target repositories that
+    have no reason to already gitignore bernstein's own runtime state.
+    Without this, an agent that follows its own "finish with ``git add -A &&
+    git commit``" instruction stages ``.sdd/runtime/*`` logs and heartbeats,
+    plus a couple of specific orchestrator-written ``.claude/`` config
+    files - and the reap-and-merge preflight's forbidden-path guard then
+    refuses the *entire* commit, diverting real work to the graveyard
+    instead of merging it.
+
+    Scope is intentionally narrow (see :data:`_WORKTREE_GITIGNORE_ENTRIES`):
+    only paths that are never a plausible task deliverable are covered, so
+    an agent tasked with authoring real ``.claude/*`` or ``CLAUDE.md``
+    content in the target repo is unaffected.
 
     Appends only the entries missing from any existing ``.gitignore``
     (tracked or not), so the injection is idempotent: once a repo has these
@@ -368,7 +390,7 @@ def _ensure_worktree_gitignore(worktree_path: Path) -> None:
     try:
         existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
     except OSError as exc:
-        logger.warning("Could not read %s to inject agent-control ignores: %s", gitignore_path, exc)
+        logger.warning("Could not read %s to inject runtime-state ignores: %s", gitignore_path, exc)
         return
 
     existing_lines = {line.strip() for line in existing.splitlines()}
@@ -377,7 +399,7 @@ def _ensure_worktree_gitignore(worktree_path: Path) -> None:
         return
 
     block_lines = [
-        "# Bernstein agent-control/runtime state -- never a deliverable (see #3017).",
+        "# Local agent-orchestrator runtime state (not a project deliverable).",
         *missing,
         "",
     ]
@@ -389,9 +411,9 @@ def _ensure_worktree_gitignore(worktree_path: Path) -> None:
     try:
         with gitignore_path.open("a", encoding="utf-8") as fh:
             fh.write(prefix + block)
-        logger.info("Injected agent-control ignores into %s: %s", gitignore_path, missing)
+        logger.info("Injected runtime-state ignores into %s: %s", gitignore_path, missing)
     except OSError as exc:
-        logger.warning("Failed to write agent-control ignores to %s: %s", gitignore_path, exc)
+        logger.warning("Failed to write runtime-state ignores to %s: %s", gitignore_path, exc)
 
 
 def _branch_exists(repo_root: Path, branch: str) -> bool:
