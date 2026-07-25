@@ -988,10 +988,18 @@ class AuditChainStore:
         two concurrent calls always see distinct ``prev_chain_digest``
         values and the underlying chain stays linear.
         (bot-ack: 3284182792 -- CodeRabbit major.)
+
+        The digest is re-read from disk inside the append section rather than
+        taken from this instance's cache. A cached read sees only our own
+        appends, while the append itself re-syncs, so another process's record
+        landing in between made the event's embedded ``prev_chain_digest``
+        disagree with the ``prev_hmac`` the record was actually written with --
+        an event asserting a chain position it does not occupy, in the one field
+        a reader consults to check that very linkage.
         """
-        with self._append_lock:
+        with self._append_lock, self._log.append_transaction():
             merged: dict[str, Any] = details.copy()
-            merged["prev_chain_digest"] = self.prev_chain_digest
+            merged["prev_chain_digest"] = self._log.resync_head()
             return self._log.log(
                 event_type=event_type,
                 actor=actor,

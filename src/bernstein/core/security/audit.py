@@ -959,11 +959,13 @@ class AuditLog:
             The chain head as recovered from disk under the verifier's framing.
         """
         self._prev_hmac = self._recover_chain_tail()
-        # ``log``'s fast path trusts (path, size) bookkeeping from this
-        # instance's last append; a head re-read from disk retires it, so the
-        # next append re-derives the tail rather than trusting stale sizes.
-        self._synced_path = None
-        self._synced_size = -1
+        # Re-point ``log``'s (path, size) fast path at what we just read, so an
+        # append inside the same section does not pay a second full-file scan.
+        # The day file is re-derived rather than assumed: if the clock rolls over
+        # between here and the append, the paths differ and ``log`` re-syncs.
+        day_path = self._audit_dir / f"{datetime.now(tz=UTC).strftime('%Y-%m-%d')}.jsonl"
+        self._synced_path = day_path
+        self._synced_size = _path_size(day_path)
         return self._prev_hmac
 
     # -- write --------------------------------------------------------------
