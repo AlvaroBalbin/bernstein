@@ -127,6 +127,25 @@ class OrchestratorDefaults:
     stale_claim_timeout_s: float = 900.0  # 15 min
     deadline_warning_window_s: float = 300.0  # 5 min warning before deadline
 
+    # Terminal state for a run that reaches quiescence having produced zero
+    # terminal tasks (issue #3010). The tick loop's only self-stop is gated
+    # on at least one done/failed task, so a run where nothing ever finished
+    # idles indefinitely. See core.orchestration.run_stall for the full
+    # criterion. Tunable via ``tuning.orchestrator.stalled_run_*``, or the
+    # ``BERNSTEIN_STALLED_RUN_GRACE_S`` / ``BERNSTEIN_STALLED_RUN_TICKS``
+    # env vars (checked first).
+    #
+    # 1800s is chosen against two fixed points rather than picked round:
+    #   * strictly ABOVE stale_claim_timeout_s (900s), so the stale-claim
+    #     release always gets its chance first - its outcome is strictly
+    #     more informative, since it produces a real failed task carrying a
+    #     reason instead of a task frozen mid-flight, and
+    #   * strictly BELOW the CLI's default wait for run completion (3600s),
+    #     so a synchronous ``bernstein run`` observes a genuine terminal
+    #     state rather than timing out against a still-idling orchestrator.
+    stalled_run_grace_s: float = 1800.0  # 30 min of zero forward progress
+    stalled_run_ticks: int = 10  # consecutive no-progress quiescent ticks
+
     max_dead_agents_kept: int = 20  # bounded dead-agent history for debugging
     max_processed_done: int = 500  # bounded done-task cache to limit memory
 
