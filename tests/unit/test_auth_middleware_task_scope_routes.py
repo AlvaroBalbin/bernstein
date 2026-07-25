@@ -22,6 +22,7 @@ from bernstein.core.auth_middleware import (
     TASK_BODY_SCOPED_SEGMENTS,
     TASK_COLLECTION_SEGMENTS,
     _check_agent_task_scope,
+    task_collection_route_patterns,
 )
 from fastapi.testclient import TestClient
 
@@ -43,6 +44,9 @@ _TASK_ID_ROUTE_RE = re.compile(r"^(?:/api/v\d+)?/tasks/\{task_id\}(?:/|$)")
 # A literal segment directly under ``/tasks/`` - a collection route, not a
 # task id (e.g. ``/tasks/self-create``).
 _TASK_COLLECTION_ROUTE_RE = re.compile(r"^(?:/api/v\d+)?/tasks/(?P<segment>[^/{}]+)(?:/|$)")
+
+# One ``{name}`` or ``{name:convertor}`` placeholder in a path template.
+_TEMPLATE_PARAM_RE = re.compile(r"\{[^{}]+\}")
 
 _IN_SCOPE_TASK_ID = "task-mine"
 _OUT_OF_SCOPE_TASK_ID = "task-not-mine"
@@ -83,6 +87,23 @@ def _task_collection_segments(application: FastAPI) -> set[str]:
         if match is not None:
             segments.add(match.group("segment"))
     return segments
+
+
+def _task_collection_routes(application: FastAPI) -> list[tuple[str, str]]:
+    """Return ``(method, path_template)`` for every registered collection route."""
+    found: set[tuple[str, str]] = set()
+    for route in application.routes:
+        template = getattr(route, "path", "")
+        if not template or _TASK_COLLECTION_ROUTE_RE.match(template) is None:
+            continue
+        for method in getattr(route, "methods", set()) or set():
+            found.add((method.upper(), template))
+    return sorted(found)
+
+
+def _fill_collection_template(template: str) -> str:
+    """Substitute a placeholder value for any parameter in a collection template."""
+    return _TEMPLATE_PARAM_RE.sub("backend", template)
 
 
 def test_enumeration_finds_the_task_surface(app: FastAPI) -> None:
@@ -144,9 +165,46 @@ def test_task_collection_segments_are_pinned_to_the_route_table(app: FastAPI) ->
 
 def test_collection_routes_are_not_treated_as_task_ids(app: FastAPI) -> None:
     """Collection routes stay reachable for a task-scoped agent."""
-    for segment in _task_collection_segments(app):
-        assert _check_agent_task_scope(f"/tasks/{segment}", [_IN_SCOPE_TASK_ID]) is None, segment
-        assert _check_agent_task_scope(f"/api/v1/tasks/{segment}", [_IN_SCOPE_TASK_ID]) is None, segment
+    collection = task_collection_route_patterns(app)
+    for method, template in _task_collection_routes(app):
+        path = _fill_collection_template(template)
+
+        assert _check_agent_task_scope(path, [_IN_SCOPE_TASK_ID], (), collection, method) is None, path
+
+
+def test_a_task_id_equal_to_a_collection_segment_is_still_scope_checked(app: FastAPI) -> None:
+    """A collection segment name used as a task id does not borrow the exemption.
+
+    The exemption belongs to the registered collection ROUTE, not to the text
+    of the segment.  Keying it on the text alone would leave
+    ``POST /tasks/archive/cancel`` ungated for a task whose id is
+    ``archive``, while ``POST /tasks/<any other id>/cancel`` was denied.
+    """
+    collection = task_collection_route_patterns(app)
+    for segment in sorted(TASK_COLLECTION_SEGMENTS):
+        for path in (f"/tasks/{segment}/cancel", f"/api/v1/tasks/{segment}/complete"):
+            error = _check_agent_task_scope(path, [_IN_SCOPE_TASK_ID], (), collection, "POST")
+
+            assert error is not None, f"{path} is not scope-checked"
+            assert segment in error, path
+
+
+def test_a_collection_route_is_exempt_only_for_the_methods_it_serves(app: FastAPI) -> None:
+    """A path a collection template matches under another method stays gated.
+
+    ``POST /tasks/next/cancel`` matches the GET-only ``/tasks/next/{role}``
+    on path alone, but the router dispatches it to
+    ``POST /tasks/{task_id}/cancel`` with the id ``next``, so the gate has to
+    follow the router rather than the path match.
+    """
+    collection = task_collection_route_patterns(app)
+
+    assert _check_agent_task_scope("/tasks/next/backend", [_IN_SCOPE_TASK_ID], (), collection, "GET") is None
+
+    error = _check_agent_task_scope("/tasks/next/cancel", [_IN_SCOPE_TASK_ID], (), collection, "POST")
+
+    assert error is not None
+    assert "next" in error
 
 
 def test_versioned_mirror_is_scope_checked() -> None:

@@ -43,11 +43,15 @@ to a list of blessed URLs, so it holds wherever that identity arrives from:
   key - an ACP run, a plan, a cluster steal decision - call the same
   function with the ids they resolved, before mutating them.
 
-Only the collection routes in ``TASK_COLLECTION_SEGMENTS`` are exempt from
-the path gate, because they address the collection rather than one task.  A
-token without a task scope (``task_ids == []``) is treated as unrestricted
-(manager / orchestrator tokens), and non-agent credentials (SSO users, the
-legacy operator bearer, the cluster secret) never reach this check at all.
+Only the registered ``/tasks/`` collection routes are exempt from the path
+gate, because they address the collection rather than one task.  That
+exemption is keyed on the route a path resolves to
+(:func:`task_collection_route_patterns`), not on the text of its first
+segment, so a task whose id equals a collection segment name cannot borrow
+the exemption.  A token without a task scope (``task_ids == []``) is treated
+as unrestricted (manager / orchestrator tokens), and non-agent credentials
+(SSO users, the legacy operator bearer, the cluster secret) never reach this
+check at all.
 
 RFC 8707 resource indicators
 ----------------------------
@@ -87,6 +91,10 @@ _PERM_TASKS_WRITE = "tasks:write"
 _PERM_ADMIN_MANAGE = "admin:manage"
 
 type _ExpectedResourceConfig = str | Sequence[str] | None
+
+# One registered ``/tasks/`` collection route: its anchored path matcher and
+# the methods it accepts.  Both must match for a path to be exempt.
+type _CollectionRoutePatterns = Sequence[tuple[re.Pattern[str], frozenset[str]]]
 
 _EMPTY_EXPECTED_RESOURCES: Final[tuple[str, ...]] = ()
 
@@ -145,6 +153,13 @@ TASK_BODY_SCOPED_SEGMENTS: Final[frozenset[str]] = frozenset(
 #                                     for the caller; like ``next``, the
 #                                     caller cannot name a task
 #
+# Membership here is necessary but not sufficient: the exemption applies to
+# the registered collection ROUTES these segments name, not to the segment
+# text wherever it appears.  ``/tasks/archive`` is exempt;
+# ``/tasks/archive/cancel`` is a per-task path that happens to carry
+# ``archive`` as the id and stays gated.  See
+# :func:`task_collection_route_patterns`.
+#
 # ``tests/unit/test_auth_middleware_task_scope_routes.py`` pins this set to
 # the literal segments actually registered under ``/tasks/``: a new
 # collection route fails that test until it is exempted deliberately, and a
@@ -176,8 +191,14 @@ _TASK_ID_TEMPLATE_PARAM: Final[str] = "task_id"
 # One ``{name}`` or ``{name:convertor}`` placeholder in a path template.
 _TEMPLATE_PARAM_RE = re.compile(r"\{(?P<name>[^{}:]+)(?::(?P<convertor>[^{}]+))?\}")
 
+# A path template whose first segment under ``/tasks/`` is a literal rather
+# than a placeholder, on the root mount or an ``/api/v<n>`` mirror.  Used to
+# pick the registered collection routes out of the route table.
+_TASK_COLLECTION_TEMPLATE_RE = re.compile(r"^(?:/api/v\d+)?/tasks/(?P<segment>[^/{}]+)(?:/.*)?$")
+
 # Where the compiled matchers are memoised on ``app.state``.
 _TASK_ROUTE_PATTERNS_ATTR: Final[str] = "_agent_task_scope_route_patterns"
+_TASK_COLLECTION_ROUTE_PATTERNS_ATTR: Final[str] = "_agent_task_scope_collection_route_patterns"
 
 # ---------------------------------------------------------------------------
 # Public and HMAC-authenticated paths
@@ -797,10 +818,13 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         # Agents with a non-empty task_ids list may only act on their assigned
         # tasks.  Agents with task_ids=[] are unrestricted (manager role).
         if agent_identity.task_ids and request.method not in _READ_METHODS:
+            app = request.scope.get("app")
             task_scope_error = _check_agent_task_scope(
                 path,
                 agent_identity.task_ids,
-                task_id_route_patterns(request.scope.get("app")),
+                task_id_route_patterns(app),
+                task_collection_route_patterns(app),
+                request.method,
             )
             if task_scope_error is not None:
                 logger.warning(
@@ -821,28 +845,26 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def _compile_task_id_route_pattern(template: str) -> re.Pattern[str] | None:
-    """Compile one path template into a matcher capturing its ``task_id``.
+def _template_to_pattern(template: str, capture: str | None = None) -> re.Pattern[str]:
+    """Compile a path template into an anchored matcher.
 
-    Returns ``None`` for templates that do not address a task by id.  Other
-    placeholders in the same template become non-capturing wildcards: a
-    ``path`` convertor may span ``/`` (``{file_path:path}``), every other
-    convertor matches one segment, and so does a task id.
+    Placeholders become wildcards: a ``path`` convertor may span ``/``
+    (``{file_path:path}``), every other convertor matches one segment.  The
+    placeholder named *capture*, if any, becomes a named group instead.
 
     Args:
         template: Route path template, e.g. ``/approvals/{task_id}/approve``.
+        capture: Placeholder name to capture, or None to wildcard them all.
 
     Returns:
-        A compiled anchored pattern with a ``task_id`` group, or None.
+        A compiled anchored pattern.
     """
-    if f"{{{_TASK_ID_TEMPLATE_PARAM}}}" not in template:
-        return None
     parts: list[str] = []
     cursor = 0
     for match in _TEMPLATE_PARAM_RE.finditer(template):
         parts.append(re.escape(template[cursor : match.start()]))
-        if match.group("name") == _TASK_ID_TEMPLATE_PARAM:
-            parts.append(f"(?P<{_TASK_ID_TEMPLATE_PARAM}>[^/]+)")
+        if capture is not None and match.group("name") == capture:
+            parts.append(f"(?P<{capture}>[^/]+)")
         elif match.group("convertor") == "path":
             parts.append(".+")
         else:
@@ -852,14 +874,109 @@ def _compile_task_id_route_pattern(template: str) -> re.Pattern[str] | None:
     return re.compile("^" + "".join(parts) + "$")
 
 
+def _compile_task_id_route_pattern(template: str) -> re.Pattern[str] | None:
+    """Compile one path template into a matcher capturing its ``task_id``.
+
+    Args:
+        template: Route path template, e.g. ``/approvals/{task_id}/approve``.
+
+    Returns:
+        A compiled anchored pattern with a ``task_id`` group, or None for a
+        template that does not address a task by id.
+    """
+    if f"{{{_TASK_ID_TEMPLATE_PARAM}}}" not in template:
+        return None
+    return _template_to_pattern(template, _TASK_ID_TEMPLATE_PARAM)
+
+
+def _route_templates(app: Any) -> list[str]:
+    """Return the app's registered path templates, sorted."""
+    templates: set[str] = set()
+    for route in getattr(getattr(app, "router", None), "routes", ()) or ():
+        template = getattr(route, "path", "")
+        if template:
+            templates.add(template)
+    return sorted(templates)
+
+
+def _build_task_id_route_patterns(app: Any) -> tuple[re.Pattern[str], ...]:
+    """Compile a ``task_id``-capturing matcher per per-task route template."""
+    compiled = (_compile_task_id_route_pattern(t) for t in _route_templates(app))
+    return tuple(pattern for pattern in compiled if pattern is not None)
+
+
+def _build_task_collection_route_patterns(app: Any) -> _CollectionRoutePatterns:
+    """Compile a ``(matcher, methods)`` pair per ``/tasks/`` collection route.
+
+    A collection route is one whose first segment under ``/tasks/`` is a
+    literal listed in :data:`TASK_COLLECTION_SEGMENTS` rather than a task id,
+    for example ``/tasks/batch-ops`` or ``/tasks/next/{role}``.
+
+    Two things make the exemption route-resolved rather than text-matched.
+    The matcher covers the WHOLE template, so ``/tasks/archive/cancel`` never
+    matches ``/tasks/archive`` and stays gated even though ``archive`` is a
+    collection segment.  The methods are carried alongside, because a
+    template can match a path the router would dispatch elsewhere for a
+    different method: ``POST /tasks/next/cancel`` matches the GET-only
+    ``/tasks/next/{role}`` on path, yet the router sends it to
+    ``POST /tasks/{task_id}/cancel`` with the id ``next``.  Matching the
+    method too keeps that request gated.
+
+    Args:
+        app: The FastAPI/Starlette application serving the request.
+
+    Returns:
+        Pairs of anchored pattern and the methods that route accepts, in a
+        deterministic order derived from the sorted route table.
+    """
+    methods_by_template: dict[str, set[str]] = {}
+    for route in getattr(getattr(app, "router", None), "routes", ()) or ():
+        template = getattr(route, "path", "")
+        if not template:
+            continue
+        match = _TASK_COLLECTION_TEMPLATE_RE.match(template)
+        if match is None or match.group("segment") not in TASK_COLLECTION_SEGMENTS:
+            continue
+        methods_by_template.setdefault(template, set()).update(getattr(route, "methods", None) or ())
+    return tuple(
+        (_template_to_pattern(template), frozenset(methods_by_template[template]))
+        for template in sorted(methods_by_template)
+    )
+
+
+def _memoise_on_app_state[T](app: Any | None, attr: str, build: Callable[[Any], T]) -> T | tuple[()]:
+    """Return ``build(app)``, memoised on ``app.state`` under *attr*.
+
+    The route table is fixed once the app is built, so the compiled result is
+    cached for the life of the app.
+
+    Args:
+        app: The FastAPI/Starlette application, or None when the ASGI scope
+            carries none.
+        attr: ``app.state`` attribute the result is memoised under.
+        build: Builds the value from the app.
+
+    Returns:
+        The built value, or an empty tuple when there is no app.
+    """
+    if app is None:
+        return ()
+    state = getattr(app, "state", None)
+    cached = getattr(state, attr, None) if state is not None else None
+    if cached is not None:
+        return cast("T", cached)
+    value = build(app)
+    if state is not None:
+        setattr(state, attr, value)
+    return value
+
+
 def task_id_route_patterns(app: Any | None) -> tuple[re.Pattern[str], ...]:
     """Return a matcher per registered route that addresses a task by id.
 
     Derived from the app's own route table, so a per-task route registered
     under a prefix other than ``/tasks/`` is covered the moment it exists and
-    this module never carries a list of prefixes to keep in step.  The result
-    is memoised on ``app.state`` because the route table is fixed once the
-    app is built.
+    this module never carries a list of prefixes to keep in step.
 
     Args:
         app: The FastAPI/Starlette application serving the request, or None
@@ -872,46 +989,72 @@ def task_id_route_patterns(app: Any | None) -> tuple[re.Pattern[str], ...]:
         the anchored pattern either way, so an empty result narrows the gate
         to that surface rather than opening it.
     """
-    if app is None:
-        return ()
-    state = getattr(app, "state", None)
-    cached = getattr(state, _TASK_ROUTE_PATTERNS_ATTR, None) if state is not None else None
-    if cached is not None:
-        return cast("tuple[re.Pattern[str], ...]", cached)
-    templates: set[str] = set()
-    for route in getattr(getattr(app, "router", None), "routes", ()) or ():
-        template = getattr(route, "path", "")
-        if template:
-            templates.add(template)
-    compiled = tuple(
-        pattern for pattern in (_compile_task_id_route_pattern(t) for t in sorted(templates)) if pattern is not None
+    return _memoise_on_app_state(app, _TASK_ROUTE_PATTERNS_ATTR, _build_task_id_route_patterns)
+
+
+def task_collection_route_patterns(app: Any | None) -> _CollectionRoutePatterns:
+    """Return a ``(matcher, methods)`` pair per registered collection route.
+
+    These name the only paths exempt from the ``/tasks/``-anchored gate.  The
+    exemption is keyed on the route a path resolves to, not on the literal
+    text of its first segment, so a task whose id happens to equal a
+    collection segment name cannot borrow that segment's exemption.
+
+    Args:
+        app: The FastAPI/Starlette application serving the request, or None
+            when the scope carries none.
+
+    Returns:
+        Pairs of anchored pattern and accepted methods.  Empty when the app
+        exposes no route table, which exempts nothing and so keeps the gate
+        at its most restrictive.
+    """
+    return _memoise_on_app_state(
+        app,
+        _TASK_COLLECTION_ROUTE_PATTERNS_ATTR,
+        _build_task_collection_route_patterns,
     )
-    if state is not None:
-        setattr(state, _TASK_ROUTE_PATTERNS_ATTR, compiled)
-    return compiled
 
 
-def _addressed_task_id(path: str, route_patterns: Sequence[re.Pattern[str]] = ()) -> str | None:
+def _addressed_task_id(
+    path: str,
+    route_patterns: Sequence[re.Pattern[str]] = (),
+    collection_patterns: _CollectionRoutePatterns = (),
+    method: str | None = None,
+) -> str | None:
     """Return the single task id this path addresses, or None.
 
     ``/tasks/``-anchored paths are resolved first and their answer is final:
-    a collection segment there (``batch-ops``, ``next``, ...) is not a task
-    id, and a path below ``/tasks/{id}/`` is one whether or not a route is
+    a path below ``/tasks/{id}/`` addresses a task whether or not a route is
     registered for it, so an unrouted probe cannot slip past the gate.
     Everything else is matched against the route-table-derived patterns.
+
+    The exemption for collection routes is keyed on the route the path and
+    method resolve to, not on the literal first segment.  Checking the
+    segment text alone would hand a task whose id equals a collection segment
+    name (``archive``, ``next``, ...) that segment's exemption, leaving
+    ``/tasks/archive/cancel`` ungated while ``/tasks/<other>/cancel`` was
+    denied.
 
     Args:
         path: Request URL path.
         route_patterns: Matchers from :func:`task_id_route_patterns`.
+        collection_patterns: Matchers from
+            :func:`task_collection_route_patterns`.
+        method: Request method, matched against the methods each collection
+            route accepts.  None matches any, for callers that only care
+            about the path surface.
 
     Returns:
         The addressed task id, or None when the path addresses no single task.
     """
     anchored = _TASK_ID_PATH_RE.match(path)
     if anchored is not None:
-        task_id = anchored.group(_TASK_ID_TEMPLATE_PARAM)
-        # A collection route under /tasks/, not a task id.
-        return None if task_id in TASK_COLLECTION_SEGMENTS else task_id
+        for pattern, methods in collection_patterns:
+            if pattern.match(path) and (method is None or method in methods):
+                # A registered collection route under /tasks/, not a task id.
+                return None
+        return anchored.group(_TASK_ID_TEMPLATE_PARAM)
     for pattern in route_patterns:
         match = pattern.match(path)
         if match is not None:
@@ -923,6 +1066,8 @@ def _check_agent_task_scope(
     path: str,
     allowed_task_ids: list[str],
     route_patterns: Sequence[re.Pattern[str]] = (),
+    collection_patterns: _CollectionRoutePatterns = (),
+    method: str | None = None,
 ) -> str | None:
     """Return an error message if the request path is out of the agent's task scope.
 
@@ -935,7 +1080,7 @@ def _check_agent_task_scope(
     checked, whatever the action segment below it, on both the root mount and
     the ``/api/v<n>`` mirrors, and on every other registered per-task route.
     Paths that are not task-addressed (bulletin, status, ...) and the
-    collection routes listed in ``TASK_COLLECTION_SEGMENTS`` are allowed.
+    registered ``/tasks/`` collection routes are allowed.
 
     Args:
         path: Request URL path.
@@ -943,11 +1088,16 @@ def _check_agent_task_scope(
         route_patterns: Per-task route matchers for prefixes other than
             ``/tasks/``, from :func:`task_id_route_patterns`.  Defaults to
             empty so the ``/tasks/`` surface can be checked without an app.
+        collection_patterns: Collection-route matchers from
+            :func:`task_collection_route_patterns`.  Defaults to empty, which
+            exempts nothing.
+        method: Request method, matched against the methods each collection
+            route accepts.  None matches any.
 
     Returns:
         Error message string if access should be denied, None otherwise.
     """
-    task_id = _addressed_task_id(path, route_patterns)
+    task_id = _addressed_task_id(path, route_patterns, collection_patterns, method)
     if task_id is None:
         return None
     if task_id not in allowed_task_ids:
