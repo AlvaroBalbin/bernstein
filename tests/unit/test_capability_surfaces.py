@@ -378,16 +378,28 @@ def test_tip_is_printed_after_a_real_subcommand_invocation(tmp_path: Path, monke
     (tmp_path / ".sdd").mkdir()
     monkeypatch.delenv("BERNSTEIN_NO_TIPS", raising=False)
 
+    # The catalog picks a tip at random and most tips do not mention the tool
+    # by name, so asserting a substring of the real tip text is a coin flip.
+    # Pin the tip instead: this asserts that a tip was printed, which is what
+    # the test is for.
+    sentinel = "sentinel-tip-emitted-by-the-root-group"
+
     runner = CliRunner()
-    with patch("bernstein.cli.main.tips_enabled", return_value=True):
+    with (
+        patch("bernstein.cli.main.tips_enabled", return_value=True),
+        patch(
+            "bernstein.cli.utils.tip_integration.get_tip_for_command",
+            return_value=sentinel,
+        ),
+    ):
         first = runner.invoke(cli, ["agents", "trust"])
         second = runner.invoke(cli, ["agents", "trust"])
 
     assert first.exit_code == 0, first.output
-    assert "bernstein" in first.output
+    assert sentinel in first.output
     assert (tmp_path / ".sdd" / "tips" / "last_shown").exists()
     # The cooldown marker suppresses the very next invocation.
-    assert len(second.output) < len(first.output)
+    assert sentinel not in second.output
 
 
 def test_no_tip_when_tips_are_disabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
