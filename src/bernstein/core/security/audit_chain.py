@@ -4707,15 +4707,27 @@ def record_process_reap_receipt(
     grace_seconds: float,
     reason: str,
     actor: str = "spawner",
+    already_gone: bool = False,
+    confirmed_dead: bool = False,
 ) -> AuditEvent:
     """Append a ``process.reap_receipt`` event into *chain* (#2367).
 
     Mirrors a forced agent process-tree reap into the audit chain.  The
     receipt records which platform mechanism delivered the stop (POSIX
     process-group signalling or Windows process-tree termination), whether
-    the graceful stop was delivered, and whether escalation to a force-kill
-    was required.  A verifier reconstructing a failure window can prove
-    offline which reap path ran instead of inferring it from log lines.
+    the graceful stop was delivered, whether the tree had already exited on
+    its own, whether escalation to a force-kill was required, and whether
+    the tree is verified gone.  A verifier reconstructing a failure window
+    can prove offline which reap path ran instead of inferring it from log
+    lines.
+
+    ``delivered`` records what was handed to the OS; ``confirmed_dead``
+    records what was observed afterwards.  They differ whenever a tree
+    exits before the reap reaches it, which is a routine outcome and not a
+    failure, and also whenever the platform cannot observe the outcome at
+    all.  Both new fields are only ever True from an observation, so a
+    verifier reading the chain offline can rely on False meaning "not
+    established" rather than "assumed".
 
     Args:
         chain: The audit chain store accepting the entry.
@@ -4730,6 +4742,11 @@ def record_process_reap_receipt(
         reason: Why the reap ran (e.g. ``"kill_requested"``,
             ``"heartbeat_stale"``, ``"wall_clock_timeout"``).
         actor: Recorded actor; defaults to ``"spawner"``.
+        already_gone: Whether the tree was observed to have already exited
+            before any stop tier ran.
+        confirmed_dead: Whether the tree was observed to no longer be
+            running once the reap returned.  False means the reap could not
+            establish it, which is not the same as the tree still running.
 
     Returns:
         The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded
@@ -4749,6 +4766,8 @@ def record_process_reap_receipt(
             "escalated": escalated,
             "grace_seconds": grace_seconds,
             "reason": reason,
+            "already_gone": already_gone,
+            "confirmed_dead": confirmed_dead,
         },
     )
 

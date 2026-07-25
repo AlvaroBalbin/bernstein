@@ -138,6 +138,110 @@ class TestReapProcessGroup:
         forced = [c for c in mock_killpg.call_args_list if c.args[1] in (signal.SIGKILL, 9)]
         assert forced, "expected a SIGKILL escalation delivered to the surviving group"
 
+    def test_posix_reap_signal_sequence_is_unchanged(self) -> None:
+        """POSIX still reaps with exactly TERM -> poll -> KILL on the group.
+
+        The pid-reuse pin the Windows reap needs must stay inert here: a
+        POSIX reap targets a process *group*, and the kernel does not recycle
+        a group id while the group still has members, so the guard has
+        nothing to add and must not perturb the syscall sequence.
+
+        Only signals that can affect the group are pinned.  Signal 0 sends
+        nothing, so the confirmation probe after the force tier is free to
+        exist; a fourth *delivering* signal, or one aimed anywhere but the
+        group, is what a regression looks like.
+        """
+        if IS_WINDOWS:
+            pytest.skip("POSIX sequence")
+        sent: list[tuple[int, int]] = []
+
+        def _killpg(pgid: int, sig: int) -> None:
+            sent.append((pgid, sig))
+
+        with patch(f"{_PC}.os.killpg", side_effect=_killpg):
+            receipt = reap_process_group(4321, grace_seconds=0.05, poll_interval=0.01)
+
+        delivering = [(pgid, sig) for pgid, sig in sent if sig != 0]
+        # TERM first, liveness probes with signal 0 in between, KILL last.
+        assert sent[0] == (4321, signal.SIGTERM)
+        assert delivering == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+        assert {sig for _pgid, sig in sent} == {signal.SIGTERM, signal.SIGKILL, 0}
+        assert {pgid for pgid, _sig in sent} == {4321}
+        assert receipt.method == "posix_process_group"
+        assert receipt.delivered is True
+        assert receipt.escalated is True
+        # The mocked killpg answers every probe, so the group was never
+        # observed to go away.  A delivered SIGKILL guarantees it will, but
+        # that is a guarantee about the future, not an observation, so the
+        # receipt reports the escalation and confirms nothing.
+        assert receipt.confirmed_dead is False
+
+    def test_unsignalable_group_is_never_reported_confirmed_dead(self) -> None:
+        """F4 regression: EPERM means alive, in confirmation as well as escalation.
+
+        ``process_group_alive`` maps EPERM to "alive" because a member
+        exists we may not signal.  The confirmation probe has to agree: a
+        group that refuses our SIGKILL with EPERM is the one case where the
+        force tier provably did *not* land, so certifying it dead is the
+        worst available answer.  Fails if the confirmation probe treats any
+        OSError as an exit.
+
+        Measured errno behaviour that rules out the cheaper reading: on
+        macOS an unreaped group of exited processes also answers EPERM, and
+        on Linux it answers success, so neither reply distinguishes "exited
+        but unreaped" from "running and out of reach".
+        """
+        if IS_WINDOWS:
+            pytest.skip("POSIX semantics")
+        attempted: list[int] = []
+
+        def _killpg(_pgid: int, sig: int) -> None:
+            attempted.append(sig)
+            if sig == signal.SIGTERM:
+                return  # the group accepted TERM
+            raise PermissionError(1, "Operation not permitted")
+
+        with patch(f"{_PC}.os.killpg", side_effect=_killpg):
+            receipt = reap_process_group(4321, grace_seconds=0.05, poll_interval=0.01)
+
+        assert signal.SIGKILL in attempted or 9 in attempted
+        assert receipt.delivered is True
+        assert receipt.escalated is True
+        # The group refused the force kill and is still there.
+        assert receipt.confirmed_dead is False
+        assert receipt.already_gone is False
+
+    def test_vanished_group_is_confirmed_dead(self) -> None:
+        """The other half of F4: ESRCH is a real observation and still counts.
+
+        Guards against over-correcting into a receipt that can never
+        confirm anything.
+        """
+        if IS_WINDOWS:
+            pytest.skip("POSIX semantics")
+
+        def _killpg(_pgid: int, sig: int) -> None:
+            if sig == signal.SIGTERM:
+                return
+            raise ProcessLookupError(3, "No such process")
+
+        with patch(f"{_PC}.os.killpg", side_effect=_killpg):
+            receipt = reap_process_group(4321, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.delivered is True
+        assert receipt.confirmed_dead is True
+
+    def test_posix_already_exited_group_reports_the_guarantee(self) -> None:
+        """A group that is simply gone is a confirmed reap, not a failure."""
+        if IS_WINDOWS:
+            pytest.skip("POSIX semantics")
+        with patch(f"{_PC}.os.killpg", side_effect=ProcessLookupError):
+            receipt = reap_process_group(4321, grace_seconds=0.05, poll_interval=0.01)
+        assert receipt.delivered is False
+        assert receipt.escalated is False
+        assert receipt.already_gone is True
+        assert receipt.confirmed_dead is True
+
     def test_receipt_details_projection(self) -> None:
         """to_details() is a deterministic dict projection of the receipt."""
         receipt = ProcessReapReceipt(
@@ -156,6 +260,8 @@ class TestReapProcessGroup:
             "delivered": True,
             "escalated": False,
             "grace_seconds": 3.0,
+            "already_gone": False,
+            "confirmed_dead": False,
         }
         # Frozen dataclass: two identical receipts project identically.
         assert (
