@@ -20,10 +20,7 @@ def build_golden_suite_v1() -> BenchSuite:
     tasks = [
         BenchTask(
             id="file_io_read_write",
-            description=(
-                "Create a file, write deterministic content to it, "
-                "read it back, and assert byte-equality."
-            ),
+            description=("Create a file, write deterministic content to it, read it back, and assert byte-equality."),
             steps=(
                 "write 'hello bernstein\\n' to /tmp/bench_test.txt",
                 "read /tmp/bench_test.txt",
@@ -31,17 +28,13 @@ def build_golden_suite_v1() -> BenchSuite:
             ),
             assertions=(
                 {"kind": "file_exists", "path": "/tmp/bench_test.txt"},
-                {"kind": "content_eq", "path": "/tmp/bench_test.txt",
-                 "expected": "hello bernstein\n"},
+                {"kind": "content_eq", "path": "/tmp/bench_test.txt", "expected": "hello bernstein\n"},
             ),
             category="file_io",
         ),
         BenchTask(
             id="refactor_rename_symbol",
-            description=(
-                "In a Python snippet, rename function `foo` to `bar` "
-                "and confirm all call-sites are updated."
-            ),
+            description=("In a Python snippet, rename function `foo` to `bar` and confirm all call-sites are updated."),
             steps=(
                 "parse the Python source and identify all references to `foo`",
                 "rename `foo` → `bar` in definitions and call-sites",
@@ -57,8 +50,7 @@ def build_golden_suite_v1() -> BenchSuite:
         BenchTask(
             id="test_generation_happy_path",
             description=(
-                "Given a pure function `add(a, b) -> int`, generate a "
-                "pytest test that exercises the happy path."
+                "Given a pure function `add(a, b) -> int`, generate a pytest test that exercises the happy path."
             ),
             steps=(
                 "identify the function signature",
@@ -74,10 +66,7 @@ def build_golden_suite_v1() -> BenchSuite:
         ),
         BenchTask(
             id="lint_fix_unused_import",
-            description=(
-                "Remove an unused import from a Python file without "
-                "altering any other lines."
-            ),
+            description=("Remove an unused import from a Python file without altering any other lines."),
             steps=(
                 "detect unused imports via static analysis",
                 "remove the unused import line",
@@ -92,8 +81,7 @@ def build_golden_suite_v1() -> BenchSuite:
         BenchTask(
             id="doc_update_docstring",
             description=(
-                "Add a one-line docstring to a function that currently "
-                "has none, matching a provided spec string."
+                "Add a one-line docstring to a function that currently has none, matching a provided spec string."
             ),
             steps=(
                 "locate the function with no docstring",
@@ -102,8 +90,7 @@ def build_golden_suite_v1() -> BenchSuite:
             ),
             assertions=(
                 {"kind": "has_docstring", "function": "target_fn"},
-                {"kind": "docstring_contains", "function": "target_fn",
-                 "text": "Compute"},
+                {"kind": "docstring_contains", "function": "target_fn", "text": "Compute"},
             ),
             category="documentation",
         ),

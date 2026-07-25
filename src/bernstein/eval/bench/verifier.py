@@ -32,16 +32,17 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING
 
-from bernstein.eval.bench.bundle import SubmissionBundle, TaskResult
-from bernstein.eval.bench.runner import ReplayAdapter
-from bernstein.eval.bench.suite import BenchSuite, BenchTask
-
+if TYPE_CHECKING:
+    from bernstein.eval.bench.bundle import SubmissionBundle, TaskResult
+    from bernstein.eval.bench.runner import ReplayAdapter
+    from bernstein.eval.bench.suite import BenchSuite, BenchTask
 
 # ---------------------------------------------------------------------------
 # Verification result types
 # ---------------------------------------------------------------------------
+
 
 class VerificationStatus(Enum):
     MATCH = "MATCH"
@@ -94,6 +95,7 @@ class BundleVerificationResult:
 # Verifier
 # ---------------------------------------------------------------------------
 
+
 class BenchVerifier:
     """
     Offline verifier for :class:`SubmissionBundle` objects.
@@ -135,8 +137,7 @@ class BenchVerifier:
                 suite_hash=bundle.suite_hash,
                 status=VerificationStatus.HASH_MISMATCH,
                 detail=(
-                    f"Bundle suite_hash {bundle.suite_hash!r} does not match "
-                    f"loaded suite {self._suite.suite_hash!r}."
+                    f"Bundle suite_hash {bundle.suite_hash!r} does not match loaded suite {self._suite.suite_hash!r}."
                 ),
             )
 
@@ -147,9 +148,7 @@ class BenchVerifier:
             if tvr.status != VerificationStatus.MATCH:
                 overall_ok = False
 
-        overall_status = (
-            VerificationStatus.MATCH if overall_ok else VerificationStatus.DIVERGED
-        )
+        overall_status = VerificationStatus.MATCH if overall_ok else VerificationStatus.DIVERGED
         return BundleVerificationResult(
             bundle_hash=bundle.bundle_hash(),
             suite_hash=bundle.suite_hash,
@@ -213,10 +212,8 @@ class BenchVerifier:
 
         # --- c. Re-derive verdict from receipt --------------------------
         try:
-            replayed_passed, replayed_score, _ = self._adapter.score_task(
-                task, result.receipt
-            )
-        except Exception as exc:  # noqa: BLE001
+            replayed_passed, replayed_score, _ = self._adapter.score_task(task, result.receipt)
+        except Exception as exc:
             return TaskVerificationResult(
                 task_id=task_id,
                 status=VerificationStatus.DIVERGED,

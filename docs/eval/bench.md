@@ -230,7 +230,7 @@ print(lb.to_markdown())
 
 ```bash
 # From the repo root:
-pytest tests/eval/bench/ -v
+pytest tests/unit/eval/bench/ -v
 ```
 
 All tests use `MockReplayAdapter` — no network, no real adapters, no API keys.
@@ -249,7 +249,7 @@ src/bernstein/eval/bench/
 ├── leaderboard.py       # Leaderboard, LeaderboardEntry, Markdown render
 └── golden_suite.py      # starter golden-v1 task suite
 
-tests/eval/bench/
+tests/unit/eval/bench/
 └── test_bench.py        # TDD suite — all acceptance criteria
 
 docs/eval/

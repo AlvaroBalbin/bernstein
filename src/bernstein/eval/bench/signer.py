@@ -15,16 +15,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
-from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from bernstein.eval.bench.bundle import SubmissionBundle
-
+if TYPE_CHECKING:
+    from bernstein.eval.bench.bundle import SubmissionBundle
 
 # ---------------------------------------------------------------------------
 # Signer protocol
 # ---------------------------------------------------------------------------
+
 
 class BundleSignerProtocol(Protocol):
     """Anything that can sign a bundle."""
@@ -41,6 +40,7 @@ class BundleSignerProtocol(Protocol):
 # Stub signer (tests / CI — no real keypair required)
 # ---------------------------------------------------------------------------
 
+
 class StubSigner:
     """
     Deterministic stub: derives a fake Ed25519-like signature from the
@@ -53,12 +53,14 @@ class StubSigner:
 
     def sign(self, bundle: SubmissionBundle) -> SubmissionBundle:
         import hmac
+
         bundle_hash = bundle.bundle_hash()
         raw_sig = hmac.new(self._TEST_KEY, bundle_hash.encode(), hashlib.sha256).digest()
         signature = base64.b64encode(raw_sig).decode()
         fingerprint = hashlib.sha256(self._TEST_KEY).hexdigest()[:16] + "-stub"
 
         import dataclasses
+
         return dataclasses.replace(
             bundle,
             signature=signature,
@@ -69,6 +71,7 @@ class StubSigner:
 # ---------------------------------------------------------------------------
 # Production signer (wraps agent_card_signer)
 # ---------------------------------------------------------------------------
+
 
 class AgentCardSigner:
     """
@@ -81,9 +84,11 @@ class AgentCardSigner:
     def sign(self, bundle: SubmissionBundle) -> SubmissionBundle:
         try:
             from bernstein.core.identity.agent_card_signer import sign_payload  # type: ignore[import]
+
             bundle_hash = bundle.bundle_hash()
             sig_result = sign_payload(bundle_hash.encode())
             import dataclasses
+
             return dataclasses.replace(
                 bundle,
                 signature=sig_result["signature"],
@@ -91,6 +96,7 @@ class AgentCardSigner:
             )
         except ImportError:
             import warnings
+
             warnings.warn(
                 "agent_card_signer not available — falling back to StubSigner. "
                 "Run `bernstein init` to set up your install identity.",

@@ -45,10 +45,10 @@ from bernstein.eval.bench.signer import StubSigner
 from bernstein.eval.bench.suite import BenchSuite, BenchTask
 from bernstein.eval.bench.verifier import BenchVerifier, VerificationStatus
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def simple_suite() -> BenchSuite:
@@ -84,9 +84,7 @@ def golden_suite() -> BenchSuite:
     return build_golden_suite_v1()
 
 
-def _make_bundle(
-    suite: BenchSuite, adapter: MockReplayAdapter, cfg: dict | None = None
-) -> SubmissionBundle:
+def _make_bundle(suite: BenchSuite, adapter: MockReplayAdapter, cfg: dict | None = None) -> SubmissionBundle:
     runner = BenchRunner(suite=suite, adapter=adapter, scheduler_config=cfg or {})
     return runner.run()
 
@@ -94,6 +92,7 @@ def _make_bundle(
 # ===========================================================================
 # AC-4 — Suite content-addressing
 # ===========================================================================
+
 
 class TestSuiteContentAddressing:
     """AC-4: suite is content-addressed; a changed task changes the suite hash."""
@@ -111,23 +110,17 @@ class TestSuiteContentAddressing:
             assertions=({"kind": "exists"},),
             category="cat1",
         )
-        mutated = BenchSuite(
-            version="test-v1", tasks=[mutated_task, simple_suite.tasks[1]]
-        )
+        mutated = BenchSuite(version="test-v1", tasks=[mutated_task, simple_suite.tasks[1]])
         assert mutated.suite_hash != original_hash
 
     def test_reordering_tasks_changes_hash(self, simple_suite: BenchSuite) -> None:
-        reordered = BenchSuite(
-            version="test-v1", tasks=list(reversed(simple_suite.tasks))
-        )
+        reordered = BenchSuite(version="test-v1", tasks=list(reversed(simple_suite.tasks)))
         assert reordered.suite_hash != simple_suite.suite_hash
 
     def test_adding_task_changes_hash(self, simple_suite: BenchSuite) -> None:
         extended = BenchSuite(
             version="test-v1",
-            tasks=list(simple_suite.tasks) + [
-                BenchTask(id="task_c", description="C", steps=("s",), assertions=())
-            ],
+            tasks=[*list(simple_suite.tasks), BenchTask(id="task_c", description="C", steps=("s",), assertions=())],
         )
         assert extended.suite_hash != simple_suite.suite_hash
 
@@ -158,56 +151,43 @@ class TestSuiteContentAddressing:
 # AC-1 — Runner: empirical determinism + signed bundle
 # ===========================================================================
 
+
 class TestRunnerDeterminism:
     """AC-1: two runs produce byte-identical receipts; bundle is signed."""
 
-    def test_two_runs_produce_identical_receipts(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_two_runs_produce_identical_receipts(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         cfg = {"scheduler": "test", "workers": 1}
         runner = BenchRunner(suite=simple_suite, adapter=adapter, scheduler_config=cfg)
         b1 = runner.run()
         b2 = runner.run()
-        for r1, r2 in zip(b1.task_results, b2.task_results):
-            assert r1.receipt == r2.receipt, (
-                f"Task {r1.task_id}: receipts diverged between runs"
-            )
+        for r1, r2 in zip(b1.task_results, b2.task_results, strict=True):
+            assert r1.receipt == r2.receipt, f"Task {r1.task_id}: receipts diverged between runs"
 
-    def test_receipt_hashes_stable_across_runs(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_receipt_hashes_stable_across_runs(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         runner = BenchRunner(suite=simple_suite, adapter=adapter, scheduler_config={})
         b1, b2 = runner.run(), runner.run()
-        for r1, r2 in zip(b1.task_results, b2.task_results):
+        for r1, r2 in zip(b1.task_results, b2.task_results, strict=True):
             assert r1.stored_receipt_hash == r2.stored_receipt_hash
 
-    def test_bundle_covers_all_tasks(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_bundle_covers_all_tasks(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         assert len(bundle.task_results) == len(simple_suite.tasks)
 
-    def test_bundle_is_signed_by_stub_signer(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_bundle_is_signed_by_stub_signer(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         """AC-1: the emitted bundle carries a non-empty signature."""
         bundle = _make_bundle(simple_suite, adapter)
         signed = StubSigner().sign(bundle)
         assert signed.signature != "", "signature must be non-empty after signing"
         assert signed.signer_fingerprint != "", "signer_fingerprint must be set"
 
-    def test_signing_is_deterministic(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_signing_is_deterministic(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         s1 = StubSigner().sign(bundle)
         s2 = StubSigner().sign(bundle)
         assert s1.signature == s2.signature
         assert s1.signer_fingerprint == s2.signer_fingerprint
 
-    def test_golden_suite_run(
-        self, golden_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_golden_suite_run(self, golden_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(golden_suite, adapter)
         assert len(bundle.task_results) == len(golden_suite.tasks)
         assert bundle.overall_score == 1.0
@@ -217,10 +197,9 @@ class TestRunnerDeterminism:
 # Bundle round-trip and integrity
 # ===========================================================================
 
+
 class TestBundleRoundTrip:
-    def test_save_load_preserves_bundle_hash(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_save_load_preserves_bundle_hash(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bundle.json"
@@ -237,12 +216,10 @@ class TestBundleRoundTrip:
             path = Path(tmp) / "bundle.json"
             bundle.save(path)
             loaded = SubmissionBundle.load(path)
-        for orig, restored in zip(bundle.task_results, loaded.task_results):
+        for orig, restored in zip(bundle.task_results, loaded.task_results, strict=True):
             assert orig.stored_receipt_hash == restored.stored_receipt_hash
 
-    def test_tampered_bundle_hash_rejected_on_load(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_tampered_bundle_hash_rejected_on_load(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bundle.json"
@@ -258,12 +235,11 @@ class TestBundleRoundTrip:
 # AC-2 — Verifier: MATCH path
 # ===========================================================================
 
+
 class TestVerifierMatch:
     """AC-2: bench verify recomputes scores offline and reports MATCH."""
 
-    def test_honest_bundle_passes_verification(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_honest_bundle_passes_verification(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
         result = verifier.verify(bundle)
@@ -272,9 +248,7 @@ class TestVerifierMatch:
         for tr in result.task_results:
             assert tr.status == VerificationStatus.MATCH
 
-    def test_honest_bundle_after_save_load(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_honest_bundle_after_save_load(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         """verify must pass on a bundle loaded from disk (round-trip)."""
         bundle = _make_bundle(simple_suite, adapter)
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,9 +259,7 @@ class TestVerifierMatch:
         result = verifier.verify(loaded)
         assert result.passed
 
-    def test_verify_names_each_task(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_verify_names_each_task(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         """Report must include a per-task result for every task."""
         bundle = _make_bundle(simple_suite, adapter)
         verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
@@ -295,16 +267,12 @@ class TestVerifierMatch:
         ids = {tr.task_id for tr in result.task_results}
         assert ids == {t.id for t in simple_suite.tasks}
 
-    def test_golden_suite_verifies(
-        self, golden_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_golden_suite_verifies(self, golden_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(golden_suite, adapter)
         verifier = BenchVerifier(suite=golden_suite, adapter=adapter)
         assert verifier.verify(bundle).passed
 
-    def test_report_string_contains_match(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_report_string_contains_match(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
         report = verifier.verify(bundle).report()
@@ -315,40 +283,34 @@ class TestVerifierMatch:
 # AC-3 — Fabricated score rejected
 # ===========================================================================
 
+
 class TestVerifierFabricatedScore:
     """AC-3a: a flipped verdict is caught at the exact diverging task."""
 
-    def test_flipped_verdict_rejected(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_flipped_verdict_rejected(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         tampered = TaskResult(
             task_id=bundle.task_results[0].task_id,
             task_hash=bundle.task_results[0].task_hash,
             receipt=bundle.task_results[0].receipt,
-            passed=not bundle.task_results[0].passed,   # ← flip
+            passed=not bundle.task_results[0].passed,  # ← flip
             score=0.0,
         )
         bad_bundle = SubmissionBundle(
             suite_hash=bundle.suite_hash,
             suite_version=bundle.suite_version,
-            task_results=[tampered] + bundle.task_results[1:],
+            task_results=[tampered, *bundle.task_results[1:]],
             scheduler_config=bundle.scheduler_config,
             submitted_at=bundle.submitted_at,
         )
         verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
         result = verifier.verify(bad_bundle)
         assert not result.passed
-        fabricated = [
-            tr for tr in result.task_results
-            if tr.status == VerificationStatus.FABRICATED_SCORE
-        ]
+        fabricated = [tr for tr in result.task_results if tr.status == VerificationStatus.FABRICATED_SCORE]
         assert len(fabricated) == 1
         assert fabricated[0].task_id == bundle.task_results[0].task_id
 
-    def test_wrong_suite_hash_rejected(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_wrong_suite_hash_rejected(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         forged = SubmissionBundle(
             suite_hash="0000" * 16,
@@ -366,42 +328,36 @@ class TestVerifierFabricatedScore:
 # AC-3 — Artefact-as-proof: missing / corrupted receipt
 # ===========================================================================
 
+
 class TestVerifierReceiptIntegrity:
     """
     AC-3b: removing or corrupting a task's receipt makes the whole bundle
     fail verification — the score has no meaning without the replay substrate.
     """
 
-    def test_empty_receipt_fails(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_empty_receipt_fails(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         stripped = TaskResult(
             task_id=bundle.task_results[0].task_id,
             task_hash=bundle.task_results[0].task_hash,
-            receipt={},           # ← removed
+            receipt={},  # ← removed
             passed=bundle.task_results[0].passed,
             score=bundle.task_results[0].score,
         )
         bad = SubmissionBundle(
             suite_hash=bundle.suite_hash,
             suite_version=bundle.suite_version,
-            task_results=[stripped] + bundle.task_results[1:],
+            task_results=[stripped, *bundle.task_results[1:]],
             scheduler_config=bundle.scheduler_config,
             submitted_at=bundle.submitted_at,
         )
         verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
         result = verifier.verify(bad)
         assert not result.passed
-        missing = [
-            tr for tr in result.task_results
-            if tr.status == VerificationStatus.MISSING_RECEIPT
-        ]
+        missing = [tr for tr in result.task_results if tr.status == VerificationStatus.MISSING_RECEIPT]
         assert len(missing) == 1
 
-    def test_corrupted_receipt_bytes_caught(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_corrupted_receipt_bytes_caught(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         """
         A receipt whose bytes were changed AFTER the bundle was emitted is
         caught even when the verdict is left unchanged.
@@ -413,25 +369,25 @@ class TestVerifierReceiptIntegrity:
 
         # Tamper the receipt bytes without touching the verdict.
         tampered_receipt = copy.deepcopy(bundle.task_results[0].receipt)
-        tampered_receipt["journal_head"] = "aaaa" * 16   # flip one field
+        tampered_receipt["journal_head"] = "aaaa" * 16  # flip one field
 
         # Build a TaskResult that has the ORIGINAL stored_receipt_hash
         # (from emit time) but a DIFFERENT live receipt — simulating a
         # post-emit byte-flip while the stored hash stays pinned.
         original_stored_hash = bundle.task_results[0].stored_receipt_hash
         corrupted = TaskResult.__new__(TaskResult)
-        corrupted.task_id           = bundle.task_results[0].task_id
-        corrupted.task_hash         = bundle.task_results[0].task_hash
-        corrupted.receipt           = tampered_receipt          # ← changed bytes
-        corrupted.passed            = bundle.task_results[0].passed
-        corrupted.score             = bundle.task_results[0].score
-        corrupted.harness_output    = {}
-        corrupted.stored_receipt_hash = original_stored_hash   # ← original hash
+        corrupted.task_id = bundle.task_results[0].task_id
+        corrupted.task_hash = bundle.task_results[0].task_hash
+        corrupted.receipt = tampered_receipt  # ← changed bytes
+        corrupted.passed = bundle.task_results[0].passed
+        corrupted.score = bundle.task_results[0].score
+        corrupted.harness_output = {}
+        corrupted.stored_receipt_hash = original_stored_hash  # ← original hash
 
         bad = SubmissionBundle(
             suite_hash=bundle.suite_hash,
             suite_version=bundle.suite_version,
-            task_results=[corrupted] + bundle.task_results[1:],
+            task_results=[corrupted, *bundle.task_results[1:]],
             scheduler_config=bundle.scheduler_config,
             submitted_at=bundle.submitted_at,
         )
@@ -440,18 +396,12 @@ class TestVerifierReceiptIntegrity:
         result = verifier.verify(bad)
 
         assert not result.passed, "Corrupted receipt must not pass verification"
-        mismatch = [
-            tr for tr in result.task_results
-            if tr.status == VerificationStatus.HASH_MISMATCH
-        ]
+        mismatch = [tr for tr in result.task_results if tr.status == VerificationStatus.HASH_MISMATCH]
         assert len(mismatch) == 1, (
-            f"Expected exactly one HASH_MISMATCH task, got: "
-            f"{[tr.status for tr in result.task_results]}"
+            f"Expected exactly one HASH_MISMATCH task, got: {[tr.status for tr in result.task_results]}"
         )
 
-    def test_one_bad_receipt_fails_whole_bundle(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_one_bad_receipt_fails_whole_bundle(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         """Whole-bundle status must not be MATCH if any task fails."""
         bundle = _make_bundle(simple_suite, adapter)
         stripped = TaskResult(
@@ -464,7 +414,7 @@ class TestVerifierReceiptIntegrity:
         bad = SubmissionBundle(
             suite_hash=bundle.suite_hash,
             suite_version=bundle.suite_version,
-            task_results=[stripped] + bundle.task_results[1:],
+            task_results=[stripped, *bundle.task_results[1:]],
             scheduler_config=bundle.scheduler_config,
             submitted_at=bundle.submitted_at,
         )
@@ -477,62 +427,63 @@ class TestVerifierReceiptIntegrity:
 # AC-5 — Leaderboard: only verified bundles appear
 # ===========================================================================
 
+
 class TestLeaderboard:
     """AC-5: leaderboard lists only bench-verify-passing bundles."""
 
-    def test_only_verified_bundles_appear(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_only_verified_bundles_appear(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         verifier = BenchVerifier(suite=simple_suite, adapter=adapter)
-        assert verifier.verify(bundle).passed   # guard
+        assert verifier.verify(bundle).passed  # guard
 
         lb = Leaderboard(suite_hash=simple_suite.suite_hash, suite_version="test-v1")
-        lb.add_entry(LeaderboardEntry(
-            bundle_hash=bundle.bundle_hash(),
-            suite_hash=bundle.suite_hash,
-            suite_version=bundle.suite_version,
-            overall_score=bundle.overall_score,
-            pass_rate=bundle.pass_rate,
-            num_tasks=len(bundle.task_results),
-            submitted_at=bundle.submitted_at,
-            bundle_path="bundles/test.json",
-        ))
+        lb.add_entry(
+            LeaderboardEntry(
+                bundle_hash=bundle.bundle_hash(),
+                suite_hash=bundle.suite_hash,
+                suite_version=bundle.suite_version,
+                overall_score=bundle.overall_score,
+                pass_rate=bundle.pass_rate,
+                num_tasks=len(bundle.task_results),
+                submitted_at=bundle.submitted_at,
+                bundle_path="bundles/test.json",
+            )
+        )
         md = lb.to_markdown()
         assert bundle.bundle_hash()[:16] in md
         assert "bernstein bench verify" in md
 
-    def test_leaderboard_sorted_by_score_desc(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_leaderboard_sorted_by_score_desc(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         lb = Leaderboard(suite_hash="x", suite_version="v1")
         for score in [0.7, 1.0, 0.5]:
-            lb.add_entry(LeaderboardEntry(
-                bundle_hash=f"hash-{score}",
-                suite_hash="x",
-                suite_version="v1",
-                overall_score=score,
-                pass_rate=score,
-                num_tasks=2,
-                submitted_at=1.0,
-            ))
+            lb.add_entry(
+                LeaderboardEntry(
+                    bundle_hash=f"hash-{score}",
+                    suite_hash="x",
+                    suite_version="v1",
+                    overall_score=score,
+                    pass_rate=score,
+                    num_tasks=2,
+                    submitted_at=1.0,
+                )
+            )
         scores = [e.overall_score for e in lb.entries]
         assert scores == sorted(scores, reverse=True)
 
-    def test_leaderboard_round_trip(
-        self, simple_suite: BenchSuite, adapter: MockReplayAdapter
-    ) -> None:
+    def test_leaderboard_round_trip(self, simple_suite: BenchSuite, adapter: MockReplayAdapter) -> None:
         bundle = _make_bundle(simple_suite, adapter)
         lb = Leaderboard(suite_hash=simple_suite.suite_hash, suite_version="test-v1")
-        lb.add_entry(LeaderboardEntry(
-            bundle_hash=bundle.bundle_hash(),
-            suite_hash=bundle.suite_hash,
-            suite_version=bundle.suite_version,
-            overall_score=bundle.overall_score,
-            pass_rate=bundle.pass_rate,
-            num_tasks=len(bundle.task_results),
-            submitted_at=bundle.submitted_at,
-        ))
+        lb.add_entry(
+            LeaderboardEntry(
+                bundle_hash=bundle.bundle_hash(),
+                suite_hash=bundle.suite_hash,
+                suite_version=bundle.suite_version,
+                overall_score=bundle.overall_score,
+                pass_rate=bundle.pass_rate,
+                num_tasks=len(bundle.task_results),
+                submitted_at=bundle.submitted_at,
+            )
+        )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "lb.json"
             lb.save(path)
@@ -545,20 +496,18 @@ class TestLeaderboard:
 # AC-6 — Docs file exists
 # ===========================================================================
 
+
 class TestDocs:
     """AC-6: docs shipped in the same PR."""
 
     def test_docs_file_exists(self) -> None:
         # Resolve relative to this test file's location in the repo.
-        repo_root = Path(__file__).parents[3]  # tests/eval/bench/test_bench.py → repo root
+        repo_root = Path(__file__).parents[4]  # tests/unit/eval/bench/test_bench.py -> repo root
         docs_path = repo_root / "docs" / "eval" / "bench.md"
-        assert docs_path.exists(), (
-            f"docs/eval/bench.md not found at {docs_path}. "
-            "Docs must ship in the same PR (AC-6)."
-        )
+        assert docs_path.exists(), f"docs/eval/bench.md not found at {docs_path}. Docs must ship in the same PR (AC-6)."
 
     def test_docs_covers_run_and_verify(self) -> None:
-        repo_root = Path(__file__).parents[3]
+        repo_root = Path(__file__).parents[4]
         docs_path = repo_root / "docs" / "eval" / "bench.md"
         if not docs_path.exists():
             pytest.skip("docs file missing — caught by test_docs_file_exists")
@@ -567,15 +516,17 @@ class TestDocs:
         assert "bernstein bench verify" in content
 
 
-
 # ===========================================================================
 # CLI smoke tests
 # ===========================================================================
 
+
 class TestCLI:
     def test_cmd_run_golden_suite(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
+
         from bernstein.eval.bench.bench_cli import bench_group
+
         out = tmp_path / "bundle.json"
         runner = CliRunner()
         result = runner.invoke(bench_group, ["run", "golden-v1", "--out", str(out), "--stub-signer"])
@@ -589,7 +540,9 @@ class TestCLI:
         self, tmp_path: Path, simple_suite: BenchSuite, adapter: MockReplayAdapter
     ) -> None:
         from click.testing import CliRunner
+
         from bernstein.eval.bench.bench_cli import bench_group
+
         bundle = _make_bundle(simple_suite, adapter)
         signed = StubSigner().sign(bundle)
         suite_path = tmp_path / "suite.json"
@@ -604,7 +557,9 @@ class TestCLI:
         self, tmp_path: Path, simple_suite: BenchSuite, adapter: MockReplayAdapter
     ) -> None:
         from click.testing import CliRunner
+
         from bernstein.eval.bench.bench_cli import bench_group
+
         bundle = _make_bundle(simple_suite, adapter)
         tampered = TaskResult(
             task_id=bundle.task_results[0].task_id,
@@ -616,7 +571,7 @@ class TestCLI:
         bad = SubmissionBundle(
             suite_hash=bundle.suite_hash,
             suite_version=bundle.suite_version,
-            task_results=[tampered] + bundle.task_results[1:],
+            task_results=[tampered, *bundle.task_results[1:]],
             scheduler_config=bundle.scheduler_config,
             submitted_at=bundle.submitted_at,
         )

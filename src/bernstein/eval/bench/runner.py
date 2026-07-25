@@ -12,19 +12,19 @@ protocol so tests can pass a hermetic mock without network or real adapters.
 from __future__ import annotations
 
 import hashlib
-import json
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from bernstein.eval.bench.bundle import SubmissionBundle, TaskResult
-from bernstein.eval.bench.suite import BenchSuite, BenchTask
 
+if TYPE_CHECKING:
+    from bernstein.eval.bench.suite import BenchSuite, BenchTask
 
 # ---------------------------------------------------------------------------
 # Protocol: replay adapter
 # ---------------------------------------------------------------------------
+
 
 class ReplayAdapter(Protocol):
     """
@@ -47,9 +47,7 @@ class ReplayAdapter(Protocol):
         """
         ...
 
-    def score_task(
-        self, task: BenchTask, receipt: dict[str, Any]
-    ) -> tuple[bool, float, dict[str, Any]]:
+    def score_task(self, task: BenchTask, receipt: dict[str, Any]) -> tuple[bool, float, dict[str, Any]]:
         """
         Re-run harness.py multiplicative scoring against *receipt*.
 
@@ -61,6 +59,7 @@ class ReplayAdapter(Protocol):
 # ---------------------------------------------------------------------------
 # Mock adapter (hermetic, no network, no real adapters — used in tests)
 # ---------------------------------------------------------------------------
+
 
 class MockReplayAdapter:
     """
@@ -86,15 +85,14 @@ class MockReplayAdapter:
             ],
         }
 
-    def score_task(
-        self, task: BenchTask, receipt: dict[str, Any]
-    ) -> tuple[bool, float, dict[str, Any]]:
+    def score_task(self, task: BenchTask, receipt: dict[str, Any]) -> tuple[bool, float, dict[str, Any]]:
         return True, 1.0, {"note": "mock: all assertions satisfied"}
 
 
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class BenchRunner:

@@ -12,13 +12,15 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Task spec (mirrors yaml_runner task shape, kept dependency-free here)
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class BenchTask:
@@ -53,6 +55,7 @@ class BenchTask:
 # ---------------------------------------------------------------------------
 # Suite
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class BenchSuite:
@@ -113,7 +116,7 @@ class BenchSuite:
         )
 
     @classmethod
-    def load(cls, path: Path) -> "BenchSuite":
+    def load(cls, path: Path) -> BenchSuite:
         raw = json.loads(path.read_text(encoding="utf-8"))
         tasks = [
             BenchTask(

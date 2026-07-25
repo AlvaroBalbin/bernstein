@@ -21,15 +21,15 @@ from pathlib import Path
 
 import click
 
-
 # ---------------------------------------------------------------------------
 # Suite registry
 # ---------------------------------------------------------------------------
 
+
 def _get_suite(name: str):
     """Resolve a suite name or .json path to a BenchSuite."""
-    from bernstein.eval.bench.suite import BenchSuite
     from bernstein.eval.bench.golden_suite import build_golden_suite_v1
+    from bernstein.eval.bench.suite import BenchSuite
 
     _BUILTIN = {
         "golden-v1": build_golden_suite_v1,
@@ -43,9 +43,7 @@ def _get_suite(name: str):
         return BenchSuite.load(path)
 
     raise click.BadParameter(
-        f"Unknown suite {name!r}. "
-        f"Built-in suites: {', '.join(_BUILTIN)}. "
-        "Or pass a path to a .json suite file.",
+        f"Unknown suite {name!r}. Built-in suites: {', '.join(_BUILTIN)}. Or pass a path to a .json suite file.",
         param_hint="suite",
     )
 
@@ -53,6 +51,7 @@ def _get_suite(name: str):
 # ---------------------------------------------------------------------------
 # Top-level group: bernstein bench
 # ---------------------------------------------------------------------------
+
 
 @click.group(name="bench")
 def bench_group() -> None:
@@ -68,14 +67,17 @@ def bench_group() -> None:
 # bernstein bench run
 # ---------------------------------------------------------------------------
 
+
 @bench_group.command(name="run")
 @click.argument("suite")
-@click.option("--out", default="bundle.json", show_default=True,
-              help="Output path for the submission bundle.")
-@click.option("--scheduler", default="default", show_default=True,
-              help="Scheduler name to embed in the bundle.")
-@click.option("--stub-signer", is_flag=True, default=False,
-              help="Use the stub signer instead of the install identity (for testing).")
+@click.option("--out", default="bundle.json", show_default=True, help="Output path for the submission bundle.")
+@click.option("--scheduler", default="default", show_default=True, help="Scheduler name to embed in the bundle.")
+@click.option(
+    "--stub-signer",
+    is_flag=True,
+    default=False,
+    help="Use the stub signer instead of the install identity (for testing).",
+)
 def bench_run(suite: str, out: str, scheduler: str, stub_signer: bool) -> None:
     """Execute a suite and emit a signed submission bundle.
 
@@ -118,10 +120,10 @@ def bench_run(suite: str, out: str, scheduler: str, stub_signer: bool) -> None:
 # bernstein bench verify
 # ---------------------------------------------------------------------------
 
+
 @bench_group.command(name="verify")
 @click.argument("bundle")
-@click.option("--suite", default="golden-v1", show_default=True,
-              help="Suite to verify against.")
+@click.option("--suite", default="golden-v1", show_default=True, help="Suite to verify against.")
 def bench_verify(bundle: str, suite: str) -> None:
     """Verify a bundle by replaying every task receipt offline.
 
@@ -131,7 +133,7 @@ def bench_verify(bundle: str, suite: str) -> None:
     """
     from bernstein.eval.bench.bundle import SubmissionBundle
     from bernstein.eval.bench.runner import MockReplayAdapter
-    from bernstein.eval.bench.verifier import BenchVerifier, VerificationStatus
+    from bernstein.eval.bench.verifier import BenchVerifier
 
     bundle_path = Path(bundle)
     if not bundle_path.exists():

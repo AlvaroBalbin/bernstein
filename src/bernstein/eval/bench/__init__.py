@@ -17,7 +17,6 @@ __all__ = [
     "BenchSuite",
     "BenchTask",
     "BenchVerifier",
-    "build_golden_suite_v1",
     "BundleVerificationResult",
     "Leaderboard",
     "LeaderboardEntry",
@@ -27,4 +26,5 @@ __all__ = [
     "TaskResult",
     "TaskVerificationResult",
     "VerificationStatus",
+    "build_golden_suite_v1",
 ]

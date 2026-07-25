@@ -15,13 +15,15 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Per-task result embedded in a bundle
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TaskResult:
@@ -84,6 +86,7 @@ class TaskResult:
 # ---------------------------------------------------------------------------
 # Bundle
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SubmissionBundle:
@@ -172,7 +175,7 @@ class SubmissionBundle:
         )
 
     @classmethod
-    def load(cls, path: Path) -> "SubmissionBundle":
+    def load(cls, path: Path) -> SubmissionBundle:
         raw = json.loads(path.read_text(encoding="utf-8"))
         task_results = [
             TaskResult(

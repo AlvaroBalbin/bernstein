@@ -83,7 +83,6 @@ from bernstein.cli.compliance_cmd import compliance_group
 from bernstein.cli.config_path_cmd import config_path_cmd
 from bernstein.cli.cost import cost_cmd, cost_envelopes_group, estimate_cmd
 from bernstein.cli.debug_bundle import debug_group
-from bernstein.eval.bench.bench_cli import bench_group
 from bernstein.cli.debug_cmd import debug_cmd
 from bernstein.cli.dep_impact_cmd import dep_impact_cmd
 from bernstein.cli.diff_cmd import diff_cmd
@@ -151,6 +150,7 @@ from bernstein.cli.workspace_cmd import config_group, workspace_group
 from bernstein.cli.worktrees_cmd import worktrees_group
 from bernstein.cli.wrap_up_cmd import wrap_up
 from bernstein.core.json_logging import setup_json_logging
+from bernstein.eval.bench.bench_cli import bench_group
 
 # ---------------------------------------------------------------------------
 # Re-export shared state so existing imports like

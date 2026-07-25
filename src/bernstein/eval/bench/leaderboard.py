@@ -14,13 +14,15 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Leaderboard entry
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LeaderboardEntry:
@@ -37,9 +39,8 @@ class LeaderboardEntry:
 
     def submitted_at_iso(self) -> str:
         import datetime
-        return datetime.datetime.fromtimestamp(
-            self.submitted_at, tz=datetime.timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        return datetime.datetime.fromtimestamp(self.submitted_at, tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +61,7 @@ class LeaderboardEntry:
 # Leaderboard
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Leaderboard:
     """
@@ -76,9 +78,7 @@ class Leaderboard:
     def add_entry(self, entry: LeaderboardEntry) -> None:
         """Add *entry* and re-sort."""
         self.entries.append(entry)
-        self.entries.sort(
-            key=lambda e: (-e.overall_score, e.submitted_at)
-        )
+        self.entries.sort(key=lambda e: (-e.overall_score, e.submitted_at))
 
     # ------------------------------------------------------------------
     # Persistence
@@ -101,7 +101,7 @@ class Leaderboard:
         )
 
     @classmethod
-    def load(cls, path: Path) -> "Leaderboard":
+    def load(cls, path: Path) -> Leaderboard:
         raw = json.loads(path.read_text(encoding="utf-8"))
         entries = [
             LeaderboardEntry(
@@ -138,8 +138,7 @@ class Leaderboard:
         lines = [
             "# bernstein-bench leaderboard",
             "",
-            "> Every row has passed `bernstein bench verify <bundle>`.  "
-            "Click the bundle hash to re-verify.",
+            "> Every row has passed `bernstein bench verify <bundle>`.  Click the bundle hash to re-verify.",
             "",
             f"Suite version: **{self.suite_version}**  ",
             f"Suite hash: `{self.suite_hash}`",
@@ -152,11 +151,7 @@ class Leaderboard:
             score_pct = f"{entry.overall_score * 100:.1f}%"
             pass_pct = f"{entry.pass_rate * 100:.1f}%"
             short_hash = entry.bundle_hash[:16]
-            bundle_link = (
-                f"[`{short_hash}…`]({entry.bundle_path})"
-                if entry.bundle_path
-                else f"`{short_hash}…`"
-            )
+            bundle_link = f"[`{short_hash}…`]({entry.bundle_path})" if entry.bundle_path else f"`{short_hash}…`"
             lines.append(
                 f"| {rank} "
                 f"| {score_pct} "
