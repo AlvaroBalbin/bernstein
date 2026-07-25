@@ -228,7 +228,7 @@ def _apply_sparse_checkout(worktree_path: Path, sparse_paths: Sequence[str]) -> 
         return False
 
 
-def _symlink_dirs(repo_root: Path, worktree_path: Path, dirs: list[str]) -> None:
+def _symlink_dirs(repo_root: Path, worktree_path: Path, dirs: Sequence[str]) -> None:
     """Symlink shared directories from repo root into the worktree.
 
     Args:
@@ -253,7 +253,7 @@ def _symlink_dirs(repo_root: Path, worktree_path: Path, dirs: list[str]) -> None
             logger.warning("Failed to symlink %r into worktree: %s", dir_name, exc)
 
 
-def _copy_files(repo_root: Path, worktree_path: Path, files: list[str]) -> None:
+def _copy_files(repo_root: Path, worktree_path: Path, files: Sequence[str]) -> None:
     """Copy per-worktree files from repo root into the worktree.
 
     Args:
