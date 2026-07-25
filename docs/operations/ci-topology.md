@@ -175,7 +175,7 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/dependabot-auto-merge.yml | workflow: {"contents": "read"}<br>auto-merge: {"contents": "write", "pull-requests": "write"} | GITHUB_TOKEN |
 | .github/workflows/dependency-review.yml | workflow: {"contents": "read"}<br>review: {"contents": "read", "pull-requests": "write"} | - |
 | .github/workflows/docs-drift.yml | workflow: {"contents": "read"}<br>drift-check: {"contents": "read", "issues": "write", "pull-requests": "write"} | - |
-| .github/workflows/docs-observability-snapshot.yml | workflow: {"contents": "read"}<br>snapshot: {"contents": "read", "security-events": "read"} | GITHUB_TOKEN |
+| .github/workflows/docs-observability-snapshot.yml | workflow: {"contents": "read"}<br>snapshot: {"contents": "write", "pull-requests": "write", "security-events": "read"} | GITHUB_TOKEN |
 | .github/workflows/eval-nightly.yml | workflow: {"contents": "read"} | EVAL_ENABLED |
 | .github/workflows/flake-quarantine.yml | workflow: {"contents": "read"}<br>detect-and-quarantine: {"contents": "write", "pull-requests": "write"} | GITHUB_TOKEN |
 | .github/workflows/hotfix-r-tracker.yml | track: {"contents": "read", "issues": "write", "pull-requests": "write"} | - |
@@ -231,7 +231,6 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/cluster-tunnel-e2e.yml | cluster-tunnel-e2e: upload cluster-tunnel-e2e-logs |
 | .github/workflows/coverage-ratchet.yml | ratchet: download coverage-report |
 | .github/workflows/docs-drift.yml | drift-check: upload docs-drift-report |
-| .github/workflows/docs-observability-snapshot.yml | snapshot: upload observability-snapshot |
 | .github/workflows/eval-nightly.yml | bench: upload eval-nightly-${{ github.run_id }}<br>smoke: upload eval-nightly-smoke |
 | .github/workflows/flake-quarantine.yml | detect-and-quarantine: upload xflaky-reports |
 | .github/workflows/license-compliance.yml | license-check: upload license-report |

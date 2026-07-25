@@ -151,7 +151,7 @@ All notable project changes are tracked here (code + docs).
 - Widen the sonar-scan job timeout to 60 minutes with per-step caps (sync 15m, coverage 30m, scan 10m); pin `astral-sh/setup-uv@v8.1.0` with caching (#1616).
 - Generate the SBOM from an isolated venv that contains only the project and its resolved dependencies, so the output reflects bernstein's dependency graph rather than the runner base image (#1618).
 - Add `docs/operations/glitchtip-setup.md` covering DSN provisioning, env-var export, and end-to-end event verification (#1616).
-- Record 14 review-bot findings already resolved on source PR branches and 11 deferred for design judgement (#1618).
+- Record 14 review-bot findings already resolved on source PR branches and 11 deferred for design judgement in `docs/review-bot/deferred-2026-05-19.md` (#1618).
 
 ## [2.3.0] - Tracker-adapter family
 
