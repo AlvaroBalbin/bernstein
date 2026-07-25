@@ -37,6 +37,7 @@ from bernstein.core.auth_middleware import (
     _check_agent_task_scope,
     task_id_route_patterns,
 )
+from bernstein.core.models import TaskStatus
 from fastapi.testclient import TestClient
 
 if TYPE_CHECKING:
@@ -323,10 +324,27 @@ def test_acp_run_cancel_allows_the_agents_own_task(app: FastAPI, monkeypatch: py
 # ---------------------------------------------------------------------------
 
 
+def _mark_planned(application: FastAPI, task_id: str) -> None:
+    """Move a task into ``PLANNED``, the state a plan decision transitions.
+
+    A plan decision only touches its ``PLANNED`` tasks, so a probe left in
+    ``OPEN`` would prove nothing: the route would answer 200 having mutated
+    nothing at all, and the denial assertion would not be measuring the scope
+    rule.
+    """
+    store = application.state.store
+    task = _task(application, task_id)
+    store._index_remove(task)
+    task.status = TaskStatus.PLANNED
+    store._index_add(task)
+
+
 def _save_plan(application: FastAPI, task_ids: list[str]) -> str:
-    """Persist a plan over *task_ids* and return its id."""
+    """Persist a plan over *task_ids* (moved to ``PLANNED``) and return its id."""
     from bernstein.core.security.plan_approval import create_plan
 
+    for task_id in task_ids:
+        _mark_planned(application, task_id)
     tasks = [_task(application, task_id) for task_id in task_ids]
     plan = create_plan("probe goal", tasks)
     application.state.plan_store.save_plan(plan)
@@ -352,7 +370,7 @@ def test_plan_decision_denies_out_of_scope_tasks(
     assert response.status_code == 403, response.text
     assert victim_id in response.json()["detail"]
     after = _task(app, victim_id)
-    assert after.status == before.status
+    assert after.status == before.status == TaskStatus.PLANNED
     assert app.state.plan_store.get_plan(plan_id).status.value == "pending"
 
 
@@ -369,6 +387,7 @@ def test_plan_decision_allows_a_plan_over_the_agents_own_tasks(
     response = _client(app, 27).post(f"/plans/{plan_id}/approve", headers=headers, json={"reason": "probe"})
 
     assert response.status_code == 200, response.text
+    assert response.json()["promoted_task_ids"] == [own_id]
     assert app.state.plan_store.get_plan(plan_id).status.value == "approved"
 
 
