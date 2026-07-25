@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 from bernstein.core.server import TaskCreate, TaskStore
 from bernstein.core.tenanting import request_tenant_id
 
@@ -225,6 +226,12 @@ async def cancel_acp_run(run_id: str, request: Request) -> ACPRunResponse:
 
     # Cancel the underlying Bernstein task if it's still active
     if run.bernstein_task_id is not None:
+        # The run id is the only task identifier in the path, and it resolves
+        # to a Bernstein task this handler then cancels - the same mutation
+        # ``POST /tasks/{id}/cancel`` performs under the path-level scope
+        # gate. Check the id the handler resolved, not the one the caller
+        # supplied, so the lookup cannot carry a task past the check.
+        enforce_agent_task_scope_for_ids(request, [run.bernstein_task_id])
         task = store.get_task(run.bernstein_task_id)
         if task is not None and task.status.value in ("open", "claimed", "in_progress"):
             with contextlib.suppress(KeyError, ValueError):

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
+
 if TYPE_CHECKING:
     from bernstein.core.task_store import TaskStore
 
@@ -166,11 +168,16 @@ async def batch_operations(body: BatchRequest, request: Request) -> BatchResult:
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
+    # Normalise first, then scope-check the normalised ids: these are the
+    # values the loop below acts on, and checking the raw input instead would
+    # let the rewrite carry an id past the check.
+    task_ids = [re.sub(r"[^\w\-]", "", raw_id)[:64] for raw_id in body.ids]
+    enforce_agent_task_scope_for_ids(request, task_ids)
+
     store = _get_store(request)
     result = BatchResult()
 
-    for raw_id in body.ids:
-        task_id = re.sub(r"[^\w\-]", "", raw_id)[:64]
+    for task_id in task_ids:
         try:
             if body.action == BatchAction.CANCEL:
                 await _cancel_task(store, task_id)
