@@ -78,10 +78,6 @@ ALLOWLIST: dict[str, str] = {
         "Wall-clock performance smoke; thresholds are not meaningful on shared "
         "runners. Run on demand (ADR-009 section 12.5)."
     ),
-    # --- Not collected today; relocation tracked separately ---------------
-    "tests/test_worktree.py": (
-        "Sits at the tests/ root, so no shard collects it. Relocation into tests/unit/ is tracked in #3026."
-    ),
 }
 
 

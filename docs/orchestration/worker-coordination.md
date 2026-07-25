@@ -35,6 +35,49 @@ Claims are journal entries: claim eligibility is reconstructable offline
 from the task journal plus the chain, and rebuilding the store from the
 same JSONL journal reproduces the identical eligibility projection.
 
+## Release receipts
+
+Every transition that surrenders a held claim appends the matching
+`task.release_receipt` event to the same chain, carrying `task_id`, `role`,
+`released_by` (the holder that surrendered it), `task_version`,
+`release_path`, `reason`, and the `from_status` / `to_status` pair.
+
+| Path | `release_path` |
+| --- | --- |
+| `POST /tasks/{id}/force-claim` | `force_claim` |
+| `POST /tasks/{id}/reopen` | `reopen` |
+| `POST /tasks/{id}/cancel` | `cancel_cascade` (root and descendants) |
+| `TaskStore.cancel` | `cancel` |
+| `POST /tasks/{id}/fail` | `fail` / `fail_contract_violation` |
+| `POST /tasks/{id}/complete` with an empty summary | `fail_empty_completion` |
+| Typed worker refusal | `refuse` |
+| `TaskStore.abandon` (the abandoned task) | `abandon` |
+| `TaskStore.abandon` (downstream tasks it blocks) | `abandon_cascade` |
+| Stale-claim reset after a restart | `restart_recovery` |
+| Cluster node departure | `node_departure` |
+
+A surrender is minted only when the task carried evidence of an actual claim
+(`claimed_at` or `claimed_by_session`). Status alone is not enough: a task can
+reach `WAITING_FOR_SUBTASKS` or `BLOCKED` without ever having been claimed,
+and a fabricated surrender on a signed chain cannot be told apart from a real
+one by a verifier.
+
+Delivery is not a surrender. A task reaching `DONE` or `CLOSED` mints no
+receipt, because the worker finished the job it claimed. Its claim ends only
+if the task later goes back to the pool, which happens through `reopen` and
+does mint one.
+
+Both halves are written by the server itself, so a plain `bernstein serve`
+node records them without the orchestrator's audit wiring. A ledger that
+records acquisitions and no surrenders replays as node A holding a task node
+B is already executing; with both halves,
+`bernstein.core.security.audit_chain.reconstruct_claim_holders` folds any
+prefix of the chain into the last claimant of every task at that point,
+offline. That projection is attribution, not liveness: a delivered task stays
+mapped to the worker that delivered it, and the guarantee it does carry is
+that no task is ever mapped to one claimant while another node holds it,
+because every path back to the pool records a release first.
+
 ## Worker mailbox
 
 `POST /tasks/{task_id}/messages` hands a structured payload to another
