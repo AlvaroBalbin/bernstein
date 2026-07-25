@@ -1162,3 +1162,18 @@ def test_shutdown_signal_path_refuses_a_workdir_the_filesystem_cannot_address(tm
 
     with pytest.raises(ShutdownSignalPathError):
         shutdown_signal_path(f"{tmp_path}/pro\x00ject")
+
+
+def test_shutdown_signal_path_refuses_a_workdir_that_is_not_textual() -> None:
+    """A non-textual workdir is refused as a containment error too.
+
+    The remote HTTP surface serves this tool from untyped JSON-RPC
+    arguments, so the value need not be a string at all. Each of these
+    reaches the barrier as-is and must come back as the one documented
+    refusal type rather than as a bare ``TypeError``.
+    """
+    from bernstein.mcp.signal_paths import ShutdownSignalPathError, shutdown_signal_path
+
+    for hostile in (123, ["/tmp"], {"workdir": "/tmp"}, None, b"/tmp"):
+        with pytest.raises(ShutdownSignalPathError):
+            shutdown_signal_path(hostile)  # type: ignore[arg-type]
