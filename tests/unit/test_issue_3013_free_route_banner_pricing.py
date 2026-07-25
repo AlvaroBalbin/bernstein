@@ -26,6 +26,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from bernstein.core.models import Task
+from bernstein.core.plan_approval import _estimate_task_cost, configure_plan_models
 
 from bernstein.cli.run_preflight import (
     _emit_preflight_runtime_warnings,
@@ -33,8 +35,6 @@ from bernstein.cli.run_preflight import (
     console,
 )
 from bernstein.core.cost.model_prices import is_free_route, price_model_usage
-from bernstein.core.models import Task
-from bernstein.core.plan_approval import _estimate_task_cost, configure_plan_models
 
 _FREE_MODEL = "openai/gpt-oss-20b:free"
 _NEMOTRON_FREE = "nvidia/nemotron-3-nano-30b-a3b:free"
