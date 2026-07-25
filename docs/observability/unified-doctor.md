@@ -78,18 +78,17 @@ Two workflows ship alongside the command:
   comment on every pull request with the observe table. Triggered on
   `pull_request: [opened, synchronize, reopened]` and via
   `workflow_dispatch` for backfills.
-- `.github/workflows/docs-observability-snapshot.yml`: writes today's
-  snapshot to
-  `docs/_internal/observability/snapshots/<YYYY-MM-DD>.json` and
-  re-renders `docs/observability/trends.md` with the last 30 days as
+- `.github/workflows/docs-observability-snapshot.yml`: captures today's
+  snapshot as `<YYYY-MM-DD>.json` and renders the last 30 days as
   unicode sparklines. After the render it runs
   `scripts/observability/gate.py`, which diffs today's snapshot against
   yesterday's and reports regressions by reading each row's
   `threshold_status` and computing the numeric delta from the two
   files. It flags a status flip for the worse (`ok -> warn`,
   `* -> fail`), a new or increased security finding, and a backend that
-  lost its credentials. Regressions are recorded in the run summary; the
-  snapshot pull request still opens regardless.
+  lost its credentials. Regressions are recorded in the run summary, and
+  the snapshot, the rendered trends and the regression report are
+  uploaded as the `observability-snapshot` workflow artifact.
 
 ## Local watch mode
 

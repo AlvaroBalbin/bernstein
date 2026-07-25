@@ -195,7 +195,7 @@ Restores the auto patch-publish pipeline after a broken workflow_run dispatcher 
 - Refurb cluster E: FURB182 / FURB183 / FURB142 / FURB101 miscellaneous, 33 autofixes across 21 files; refurb now reports 0 alerts for these rules in `src/` (#1649).
 - Refurb cluster B: FURB109 / FURB108 / FURB126 control flow, 53 autofixes across 44 files; pure control-flow and literal rewrites with no behavioural change (#1651).
 - Review-bot acknowledgement gate caught seven CodeRabbit must-address findings on #1646: HTTP status validation, `gh issue` subprocess `check=True`, doc clarification on soft-fail conditions, narrower import-time exception handling, logging of unexpected fetch failures, `IntRange(min=1)` on `--top-n`, and dropping a truthy fallback in `summarise_severity` / `_bucket_trend_by_day` that was inflating zero counts to one.
-- Adds a CI workflow-health sweep summary at `docs/ci/workflow-health-2026-05-20.md` covering all 47 registered workflows (#1666).
+- Adds a CI workflow-health sweep summary covering all 47 registered workflows (#1666).
 
 ### Dependencies
 
@@ -223,7 +223,7 @@ Restores the auto patch-publish pipeline after a broken workflow_run dispatcher 
 - Widen the sonar-scan job timeout to 60 minutes with per-step caps (sync 15m, coverage 30m, scan 10m); pin `astral-sh/setup-uv@v8.1.0` with caching (#1616).
 - Generate the SBOM from an isolated venv that contains only the project and its resolved dependencies, so the output reflects bernstein's dependency graph rather than the runner base image (#1618).
 - Add `docs/operations/glitchtip-setup.md` covering DSN provisioning, env-var export, and end-to-end event verification (#1616).
-- Record 14 review-bot findings already resolved on source PR branches and 11 deferred for design judgement in `docs/review-bot/deferred-2026-05-19.md` (#1618).
+- Record 14 review-bot findings already resolved on source PR branches and 11 deferred for design judgement (#1618).
 
 ## [2.3.0] - Tracker-adapter family
 
