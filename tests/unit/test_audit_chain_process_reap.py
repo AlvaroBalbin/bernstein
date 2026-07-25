@@ -108,6 +108,40 @@ def test_spawner_emit_helper_writes_receipt(tmp_path: Path) -> None:
     assert rows[0].details["escalated"] is True
 
 
+def test_spawner_emit_helper_carries_the_guarantee_fields(tmp_path: Path) -> None:
+    """An already-exited tree is auditable as a success, not a failed stop.
+
+    ``delivered`` records what was handed to the OS and ``confirmed_dead``
+    records the guarantee; an operator reconstructing a failure window needs
+    both, because a tree that exited before the reap reached it accepts no
+    stop while still leaving nothing running.
+    """
+    from bernstein.core.platform_compat import ProcessReapReceipt
+
+    from bernstein.core.agents.spawner_core import emit_process_reap_receipt
+
+    (tmp_path / ".sdd").mkdir()
+    receipt = ProcessReapReceipt(
+        pgid=888,
+        os_name="windows",
+        method="windows_process_tree",
+        delivered=False,
+        escalated=False,
+        grace_seconds=3.0,
+        already_gone=True,
+        confirmed_dead=True,
+    )
+    emit_process_reap_receipt(tmp_path, "sess-9", receipt, reason="kill_requested")
+
+    chain = AuditChainStore(tmp_path / ".sdd" / "audit")
+    details = chain.query(event_type=EVENT_PROCESS_REAP_RECEIPT)[0].details
+    assert details["delivered"] is False
+    assert details["already_gone"] is True
+    assert details["confirmed_dead"] is True
+    ok, errors = chain.verify()
+    assert ok, errors
+
+
 def test_spawner_emit_helper_never_raises(tmp_path: Path) -> None:
     """Audit mirroring must never mask the kill itself."""
     from unittest.mock import patch

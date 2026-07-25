@@ -40,8 +40,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY: tuple[str, ...] = (
     "README.md",
     "docs/llm-citation-surface.md",
-    "docs/compare/bernstein-vs-github-agent-hq.md",
-    "docs/compare/index.html",
 )
 
 SOFT_THRESHOLD_DAYS = 30
