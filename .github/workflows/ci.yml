@@ -1537,18 +1537,25 @@ jobs:
     # `tests/integration/**` (126 files) reached CI only through the
     # `--affected` slice the `test` job runs on pull_request, which selects
     # the subset the impact map ties to the changed sources. Nothing selected
-    # the directory on push to `main` or in the merge queue, so a break that
-    # arrives through a path the map does not model - a changed default, a
-    # role template, a transitive import - landed with the gate green. This
-    # job runs the whole directory on the events that decide what reaches
-    # `main`, and skips on pull_request so PR latency is unchanged.
+    # the directory on push to `main`, so a break that arrives through a path
+    # the map does not model - a changed default, a role template, a
+    # transitive import - landed with the gate green.
+    #
+    # This job runs on every event, pull_request included. Restricting it to
+    # push and merge_group was considered and rejected: `merge_group` never
+    # fires while the merge-queue ruleset is disabled, so a push-only job
+    # reports on `main` after the merge rather than gating it, and the
+    # required `CI gate` context would still pass on a PR having never run
+    # the directory. The impact map's blind spots are the same on a PR as on
+    # a push, so the lane that decides the merge is the one that needs it.
     #
     # Cost: 126 files, 264s wall at `--parallel 4`, 456 MB peak RSS. The
     # runner runs each file in its own subprocess (same OOM-avoidance model
     # as the unit shards), so memory is bounded by the widest single file.
+    # This runs concurrently with the `test` shards (90-minute timeout), so
+    # it does not extend the critical path.
     name: Integration tests
     needs: [lint]  # fast-fail: don't burn a runner if lint fails
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -1932,7 +1939,6 @@ jobs:
               "dist-size",
               "install-smoke-pipx",
               "install-smoke-uv",
-              "integration-tests",
           }
           # macOS-gated jobs (see #1468): on PRs these are skipped unless
           # the diff is macos_sensitive or the PR carries the
@@ -1941,11 +1947,6 @@ jobs:
           # Push-only jobs are required on native main pushes but skip
           # intentionally on PR, workflow_dispatch, and merge_group runs.
           PUSH_ONLY = {"coverage-report"}
-          # Jobs that run on push, merge_group, and workflow_dispatch but
-          # skip on pull_request. The `test` job's `--affected` lane already
-          # selects the impacted `tests/integration/**` files on a PR, so
-          # running the whole directory there would only add latency.
-          NON_PR = {"integration-tests"}
           # Events under which a macOS-gated skip is intentional. PRs and
           # manual dispatch already gate macOS behind macos_sensitive /
           # label. merge_group must be included too: a merge queue runs CI
@@ -1982,8 +1983,6 @@ jobs:
                   continue
               if r == "skipped":
                   if name in PUSH_ONLY and event != "push":
-                      continue
-                  if name in NON_PR and event == "pull_request":
                       continue
                   if docs_only and name in DOCS_ONLY_SKIPPABLE:
                       continue
