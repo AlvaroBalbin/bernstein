@@ -79,14 +79,23 @@ completion_signals:
 task defaults to `.sdd/outbox/<task-id>/artifact`.
 
 <!-- scope:artifact-spec-reachability start - delete this note when #3110 lands -->
-**How to reach this today.** The block above is the shape of the task record,
-not a block a seed, plan, or backlog file parses. `artifact_spec` is accepted by
-`Task.from_dict` and read by the completion and janitor paths, but it is absent
-from the plan schema, the plan loader, the backlog parser, and every CLI option,
-so an operator sets it by constructing the task record directly (for example
-through the task server or `Task.from_dict`). Declaring it from a seed, plan, or
-backlog entry is tracked in #3110, and routing artifact-mode tasks away from the
-git-only paths in #2996.
+#### How to reach this today
+
+The block above is the shape of an `artifact_spec` on a **task record**, not a
+key a seed file or a plan parses. `artifact_spec` is read by
+`Task.from_dict` in `core/tasks/models.py` and consumed by
+`core/tasks/artifact_completion.py` and `core/quality/janitor.py`. It is absent
+from `core/planning/plan_schema.py`, `core/planning/plan_loader.py`,
+`core/tasks/backlog_parser.py`, every CLI option and every server route.
+
+So the only path that reaches artifact mode today is writing the key into a task
+record under `.sdd/` (or constructing the `Task` through the Python API) before
+the task is claimed. Putting `artifact_spec` in `bernstein.yaml`, a plan file or
+a backlog entry is silently ignored, and the task runs as a normal `code_diff`
+task. Declaring it from a seed, plan, or backlog entry is tracked in
+[issue #3110](https://github.com/sipyourdrink-ltd/bernstein/issues/3110), and
+routing artifact-mode tasks away from the git-only paths in
+[issue #2996](https://github.com/sipyourdrink-ltd/bernstein/issues/2996).
 <!-- scope:artifact-spec-reachability end -->
 
 The bytes are read in the shape the kind expects: JSONL rows for `dataset` and
