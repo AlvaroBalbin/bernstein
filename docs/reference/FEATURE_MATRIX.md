@@ -153,7 +153,7 @@ additionally holds the CLI's server calls to the registered route table.
 | [MCP server mode](../mcp/server.md) | Full | `bernstein mcp`, MCP server in `mcp/server.py` |
 | [MCP tool registry](../integrations/mcp-server-injection.md) | Full | Auto-discovery and per-task config |
 | [MCP catalog client](mcp-catalog.md) | Full | `bernstein mcp catalog browse/search/install` installable server catalog (`core/protocols/mcp_catalog/`) |
-| [MCP input contracts](../mcp/input-validation.md) | Full | Schema-validated, deny-by-default MCP tool-call input firewall (`mcp/input_validation.py`) |
+| [MCP input contracts](../mcp/input-validation.md) | Full | Schema-validated, deny-by-default MCP tool-call input firewall (`mcp/input_validation.py`); the enforced schema is also the advertised `inputSchema` |
 | [Stateless MCP anchoring](../mcp/server.md) | Full | A stateless MCP client can poll a run and verify it offline; calls anchor as `mcp.stateless_call` journal entries (`core/protocols/mcp/stateless_core.py`) |
 | [Runtime capability cards (MCP)](../mcp/server.md) | Full | Per-server capability cards for the MCP server (`mcp/capability.py`) |
 | ACP native bridge | Full | `bernstein acp serve --stdio\|--http :PORT` IDE-native bridge (`core/protocols/acp/`); see `reference/acp-bridge.md` |
