@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -24,6 +25,19 @@ from bernstein.core.orchestration.bootstrap import _watchdog_check_process
 # A pid high enough to be unused on any normal host. It is the value the
 # adversarial review fed to both subsystems to show they disagreed about it.
 DEAD_PID = 999999
+
+#: A ``/health`` payload from a server that has no view of the spawner (no
+#: ``sdd_dir`` configured), which leaves the decision to the local probe. Real
+#: servers always emit the ``components`` block, so a fixture that omits it
+#: entirely tests a shape that never occurs. See
+#: ``test_orchestrator_liveness_false_positives.py`` for the fixture pin.
+HEALTH_NO_OPINION: dict[str, Any] = {
+    "agent_count": 0,
+    "components": {
+        "server": {"status": "ok"},
+        "spawner": {"status": "unknown", "pid": None, "detail": "sdd_dir not configured"},
+    },
+}
 
 
 def _drive_wait(
@@ -39,8 +53,13 @@ def _drive_wait(
     Only the server and the clock are faked. The liveness classification, the
     pidfile read and the confirmation window are the real ones, so a test that
     passes here is a statement about the shipped behaviour.
+
+    The clock advances monotonic and wall time together, exactly as a real
+    ``time.sleep`` does. Faking only one of them changes which clock the code
+    under test is measured on, which is how a wall-clock confirmation window
+    once passed a suite that thought it was testing a monotonic one.
     """
-    health_payload = {"agent_count": 0} if health is None else health
+    health_payload = HEALTH_NO_OPINION if health is None else health
     polls = {"n": 0}
 
     def fake_get(path: str) -> Any:
@@ -53,16 +72,17 @@ def _drive_wait(
             return full_counts
         return None
 
-    clock = {"t": time.time()}
-
-    def fake_time() -> float:
-        clock["t"] += tick_s
-        return clock["t"]
+    elapsed = {"s": 0.0}
+    base_wall, base_mono = time.time(), time.monotonic()
+    clock = SimpleNamespace(
+        time=lambda: base_wall + elapsed["s"],
+        monotonic=lambda: base_mono + elapsed["s"],
+        sleep=lambda seconds: elapsed.__setitem__("s", elapsed["s"] + tick_s),
+    )
 
     with (
         patch.object(rb, "server_get", side_effect=fake_get),
-        patch.object(rb.time, "sleep", return_value=None),
-        patch.object(rb.time, "time", side_effect=fake_time),
+        patch.object(rb, "time", clock),
         patch.object(rb, "_signal_orchestrator_shutdown"),
     ):
         return rb._wait_for_run_completion(timeout_s=timeout_s), polls["n"]
@@ -427,39 +447,30 @@ def _restart_calls(**kwargs: Any) -> list[int]:
     return calls
 
 
-def test_supervisor_does_not_restart_without_a_pid_to_attribute() -> None:
-    """No pid means no evidence of death, so no spawn.
+def test_sharing_the_classifier_does_not_make_the_supervisor_withhold_recovery() -> None:
+    """The shared vocabulary must not turn into a shared refusal to act.
 
-    A supervisor cycle that finds no pidfile is looking either at a run that has
-    not written one yet or at one an operator teardown removed -- teardown
-    deletes every ``*.pid``. Spawning on that reading either starts a second
-    orchestrator against a live task store or resurrects a torn-down run. The
-    old code took "pid is None" straight to the restart branch.
+    An earlier revision of this file asserted the opposite: that an
+    unattributable pid must not spawn. That was wrong, and it regressed
+    recovery against main. The two subsystems read the same classification but
+    they owe it opposite duties. For the CLI, acting on a weak reading destroys
+    a running run, so anything short of positive evidence must do nothing. For
+    the supervisor, NOT acting destroys the run just as thoroughly and
+    permanently, because nothing recreates ``spawner.pid``. So only a positive
+    ``alive`` withholds a restart here.
+
+    See ``test_orchestrator_liveness_false_positives.py`` for the doctor-path
+    scenario that made the regression concrete.
     """
-    assert _restart_calls(pid=None) == [], "a missing pidfile must not trigger a spawn"
+    from bernstein.core.orchestration.process_utils import LIVENESS_ALIVE, LIVENESS_GONE, LIVENESS_UNKNOWN
 
-
-def test_supervisor_does_not_restart_on_an_unattributable_pid() -> None:
-    """The restart path needs a pid it owns, not merely a pid that is not alive.
-
-    This is the pid the CLI classifies as gone. Handing it to the supervisor
-    with no owning pidfile must not spawn, and the two subsystems must reach
-    that conclusion through the same classifier.
-    """
-    from bernstein.core.orchestration.process_utils import LIVENESS_GONE, LIVENESS_UNKNOWN
-
-    assert _restart_calls(pid=DEAD_PID, liveness=LIVENESS_UNKNOWN) == [], (
-        "an unattributable pid must not trigger a spawn"
-    )
-    # Crash recovery itself is intact: a pidfile this supervisor owns, naming a
-    # dead pid, is still restarted. That is the supervisor's whole job.
     assert _restart_calls(pid=DEAD_PID, liveness=LIVENESS_GONE) == [1], (
-        "a genuinely crashed orchestrator must still be restarted"
+        "a genuinely crashed orchestrator must be restarted"
     )
-
-
-def test_supervisor_leaves_a_live_process_alone() -> None:
-    """Control: an alive classification never reaches the restart path."""
-    from bernstein.core.orchestration.process_utils import LIVENESS_ALIVE
-
-    assert _restart_calls(pid=os.getpid(), liveness=LIVENESS_ALIVE) == []
+    assert _restart_calls(pid=DEAD_PID, liveness=LIVENESS_UNKNOWN) == [1], (
+        "an unattributable reading is not a reason to abandon a run"
+    )
+    assert _restart_calls(pid=None) == [1], "a missing pidfile is not a reason to abandon a run either"
+    assert _restart_calls(pid=os.getpid(), liveness=LIVENESS_ALIVE) == [], (
+        "a positive alive is the one reading that withholds a restart"
+    )

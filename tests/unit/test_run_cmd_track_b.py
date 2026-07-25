@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -180,12 +182,14 @@ def _wait_with(status, *, liveness: list[tuple[str, int | None]], timeout_s: flo
 
     The last entry repeats once the script runs out, so a one-entry script
     means "this state, held indefinitely".
-    """
-    clock = {"now": 0.0}
 
-    def _fake_time() -> float:
-        clock["now"] += 5.0
-        return clock["now"]
+    The clock advances monotonic and wall time together, as a real
+    ``time.sleep`` does. The confirmation window is measured on monotonic, so a
+    harness that fakes only ``time.time`` leaves it running on the real clock
+    and no scripted sequence can ever satisfy it.
+    """
+    elapsed = {"s": 0.0}
+    base_wall, base_mono = time.time(), time.monotonic()
 
     it = iter(liveness)
 
@@ -200,10 +204,15 @@ def _wait_with(status, *, liveness: list[tuple[str, int | None]], timeout_s: flo
         # liveness, not about statuses /status cannot express.
         return status
 
+    clock = SimpleNamespace(
+        time=lambda: base_wall + elapsed["s"],
+        monotonic=lambda: base_mono + elapsed["s"],
+        sleep=lambda _s: elapsed.__setitem__("s", elapsed["s"] + 5.0),
+    )
+
     with (
         patch("bernstein.cli.run_bootstrap.server_get", side_effect=_fake_get),
-        patch("bernstein.cli.run_bootstrap.time.sleep", return_value=None),
-        patch("bernstein.cli.run_bootstrap.time.time", side_effect=_fake_time),
+        patch("bernstein.cli.run_bootstrap.time", clock),
         patch("bernstein.cli.run_bootstrap._orchestrator_liveness", side_effect=_fake_liveness),
         patch("bernstein.cli.run_bootstrap._signal_orchestrator_shutdown"),
     ):

@@ -592,10 +592,37 @@ def _finalize_run_output(*, quiet: bool) -> None:
     pre-drain state, and (b) it keeps cleanup correct even when the renderer
     raises ``SystemExit`` or ``KeyboardInterrupt``.
 
+    Exit-code mapping applies on EVERY branch, not only ``--quiet``. Nothing
+    turns ``--quiet`` on automatically and no documented workflow passes it, so
+    binding the outcome signal to that one flag left the ordinary invocations
+    -- the dashboard, the Rich fallback, and the non-interactive detach --
+    exiting 0 on a run that did not meet its goal (issue #3010, whose own
+    reproduction went down the non-interactive branch).
+
+    What each branch can honestly report differs, because they observe
+    different things:
+
+    * ``--quiet`` waits for a terminal state, so it reports both of them:
+      quiescence, and an orchestrator confirmed gone with work outstanding.
+    * The other three do not wait. They check ONCE, after their own work is
+      done, and report only an already-quiescent run. The "orchestrator gone"
+      verdict is an inference from absence that needs a confirmation window
+      across several observations (see ``_wait_for_run_completion``), which a
+      single poll cannot supply.
+
+    The non-interactive branch in particular detaches by design after roughly
+    one spawner tick, so its check usually finds the run still in flight and
+    changes nothing. It fires when a run reached a terminal state inside that
+    window, which is the fast-failure case.
+
     Args:
         quiet: When True, wait for quiescence and print only the terminal summary.
     """
-    from bernstein.cli.run_bootstrap import _wait_for_run_completion, exec_restart
+    from bernstein.cli.run_bootstrap import (
+        _poll_quiescent_status,
+        _wait_for_run_completion,
+        exec_restart,
+    )
 
     try:
         if quiet:
@@ -622,9 +649,13 @@ def _finalize_run_output(*, quiet: bool) -> None:
             except Exception:
                 # Textual failed at runtime -- fall through to fallback
                 _try_fallback_display()
+            # The operator watched the run to its end in the dashboard, so a
+            # finished run is the common case here, not the edge one.
+            _exit_nonzero_on_unhealthy_run(_poll_quiescent_status())
         elif caps.is_tty:
             # TTY but Textual not supported -- use Rich fallback (TUI-003)
             _try_fallback_display()
+            _exit_nonzero_on_unhealthy_run(_poll_quiescent_status())
         else:
             # Non-interactive output detaches from the run immediately, so a
             # spawn refusal in the background orchestrator would never reach
@@ -638,6 +669,9 @@ def _finalize_run_output(*, quiet: bool) -> None:
                 console.print(f"[red]Run failed before any work started:[/red] {reason}")
                 console.print("Details: run 'bernstein status' or read .sdd/runtime/retrospective.md")
                 raise SystemExit(1)
+            # A run that already reached a terminal state within the detach
+            # window must not report success on its way out.
+            _exit_nonzero_on_unhealthy_run(_poll_quiescent_status())
             console.print("Run continues in the background (check: bernstein status).")
     finally:
         _drain_completed_backlog_files()

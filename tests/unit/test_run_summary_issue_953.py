@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -290,11 +291,16 @@ class TestCleanupOrdering:
 
         stuck = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0}
         counts = {"total": 1, "open": 1, "claimed": 0, "in_progress": 0, "orphaned": 0, "done": 0, "failed": 0}
-        clock = {"t": time.time()}
 
-        def _fake_time() -> float:
-            clock["t"] += 2.0
-            return clock["t"]
+        # Monotonic and wall advance together, as a real time.sleep does: the
+        # confirmation window is measured on monotonic.
+        elapsed = {"s": 0.0}
+        base_wall, base_mono = time.time(), time.monotonic()
+        clock = SimpleNamespace(
+            time=lambda: base_wall + elapsed["s"],
+            monotonic=lambda: base_mono + elapsed["s"],
+            sleep=lambda _s: elapsed.__setitem__("s", elapsed["s"] + 2.0),
+        )
 
         def _fake_get(path: str) -> object:
             if path == "/status":
@@ -305,8 +311,7 @@ class TestCleanupOrdering:
 
         with (
             patch.object(rb, "server_get", side_effect=_fake_get),
-            patch.object(rb.time, "sleep", return_value=None),
-            patch.object(rb.time, "time", side_effect=_fake_time),
+            patch.object(rb, "time", clock),
             patch.object(rb, "_signal_orchestrator_shutdown"),
             patch("bernstein.cli.run_preflight._show_run_summary"),
             patch("bernstein.cli.run_preflight._drain_completed_backlog_files"),

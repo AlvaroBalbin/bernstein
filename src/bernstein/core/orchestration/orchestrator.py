@@ -2097,7 +2097,11 @@ class Orchestrator:
                     self._summary_written,
                     _action,
                 )
-                self._generate_run_summary(refreshed_tasks_by_status["done"], refreshed_tasks_by_status["failed"])
+                self._generate_run_summary(
+                    refreshed_tasks_by_status["done"],
+                    refreshed_tasks_by_status["failed"],
+                    full_status_counts={status: len(tasks) for status, tasks in refreshed_tasks_by_status.items()},
+                )
             else:
                 _action = "summary_already_written"
                 logger.info(
@@ -4496,8 +4500,18 @@ class Orchestrator:
         self,
         done_tasks: list[Task],
         failed_tasks: list[Task],
+        *,
+        full_status_counts: dict[str, int] | None = None,
     ) -> None:
-        """Write a run completion summary to .sdd/runtime/summary.md."""
+        """Write a run completion summary to .sdd/runtime/summary.md.
+
+        ``full_status_counts`` is the per-status task histogram at this moment.
+        Without it the interim retrospective sees only done and failed, so a run
+        whose tasks are all still open/claimed/in-progress/orphaned reports
+        ``0/0`` and HEALTHY (issue #3010): ``count_incomplete_declared(None)``
+        is 0, and nothing else in the report can tell "no tasks finished
+        because there were none" from "no tasks finished at all".
+        """
         runtime_dir = self._workdir / ".sdd" / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         summary_path = runtime_dir / "summary.md"
@@ -4593,6 +4607,14 @@ class Orchestrator:
         # etc.). Mark this retrospective INTERIM; run() re-generates the
         # FINAL retrospective, unconditionally overwriting this one, once the
         # tick loop actually exits (see A5 stale-retrospective bug).
+        #
+        # The histogram has to be threaded through even though this report is
+        # interim: when quiescence holds with zero terminal tasks the tick loop
+        # never exits (the self-stop block at 8b is nested under
+        # `_had_any_terminal_task`), so the FINAL regeneration never runs and
+        # this interim report is the only retrospective the run ever writes.
+        # Giving the orchestrator a terminal state for that case is a separate
+        # change to the main loop, tracked apart from this PR.
         generate_retrospective(
             done_tasks=done_tasks,
             failed_tasks=failed_tasks,
@@ -4600,6 +4622,7 @@ class Orchestrator:
             runtime_dir=runtime_dir,
             run_start_ts=self._run_start_ts,
             trigger_reason="mid-run",
+            full_status_counts=full_status_counts,
         )
 
         # Auto-PR: create a GitHub PR if BERNSTEIN_AUTO_PR is set
