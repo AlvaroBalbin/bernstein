@@ -1,6 +1,6 @@
 """Regression tests for #3017: agent worktrees must locally exclude the
 merge guard's full deny list -- plus the orchestrator's own generated
-``CLAUDE.md`` -- at creation time.
+``CLAUDE.md`` -- at creation time, scoped to that ONE worktree only.
 
 Bernstein orchestrates agents against arbitrary target repositories, most of
 which have no idea ``.sdd/``, ``attestations/``, ``auth/``,
@@ -18,14 +18,19 @@ the root of *every* worktree (``worktree_claude_md.write_claude_md``), so
 that exact path is always a duplicate/decoy file, never a genuine
 target-repo deliverable.
 
-The exclude rules live in ``.git/info/exclude`` -- local-only, never
-staged, committed, or visible in the target repo's history -- rather than a
-tracked ``.gitignore``. That is what makes it safe to cover ``CLAUDE.md``
-and the guard's full deny list unconditionally: nothing here is imposed on
-the target repo, so there is no "our rules vs. their rules" conflict and no
-diff shows up in the agent's own commit. A *non-runtime* file elsewhere
-under ``.claude/`` (a skill or command the agent was actually tasked to
-add) is deliberately left alone.
+Mechanism: a bernstein-owned exclude file lives inside this worktree's own
+per-worktree git dir (``.git/worktrees/<id>/``, never the tracked tree) and
+is wired up via ``git config --worktree core.excludesFile``. This was the
+SECOND design tried in this PR, after ``.git/info/exclude`` was proven
+(empirically, see below) to be read from the *shared* common git dir, not
+per-worktree -- which would have silently changed what the operator's own
+main checkout picks up on ``git add -A`` (a freshly-created
+``bernstein.yaml`` seed config, for example, would stop being staged with
+no warning). ``core.excludesFile`` scoped with ``--worktree`` (which
+requires the one-time, idempotent ``extensions.worktreeConfig`` flag) is
+git's native way to scope a setting to exactly one worktree, confirmed to
+leave every other worktree of the same clone -- and the main checkout --
+completely unaffected.
 
 These tests run against a real git repository (not mocks) so ``git add -A``,
 ``git status``, and the merge-preflight guard reflect true on-disk/index
@@ -55,10 +60,10 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
-def _git_common_dir(worktree_path: Path) -> Path:
-    """Resolve the shared git dir the same way the implementation does."""
+def _git_dir(worktree_path: Path) -> Path:
+    """Resolve the *per-worktree* git dir, mirroring the implementation."""
     out = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
         cwd=worktree_path,
         check=True,
         capture_output=True,
@@ -67,9 +72,22 @@ def _git_common_dir(worktree_path: Path) -> Path:
     return Path(out)
 
 
+def _configured_excludes_file(worktree_path: Path) -> Path | None:
+    """Read whatever ``core.excludesFile`` resolves to for *worktree_path*."""
+    result = subprocess.run(
+        ["git", "config", "--worktree", "--get", "core.excludesFile"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip())
+
+
 def _local_exclude_lines(worktree_path: Path) -> set[str]:
-    exclude_path = _git_common_dir(worktree_path) / "info" / "exclude"
-    if not exclude_path.exists():
+    exclude_path = _configured_excludes_file(worktree_path)
+    if exclude_path is None or not exclude_path.exists():
         return set()
     return {line.strip() for line in exclude_path.read_text(encoding="utf-8").splitlines()}
 
@@ -86,7 +104,8 @@ def repo(tmp_path: Path) -> Path:
 
     This mirrors the real-world case: bernstein spawns agents into arbitrary
     client repos that have never heard of ``.sdd/``, ``attestations/``,
-    ``auth/``, or ``.claude/``.
+    ``auth/``, or ``.claude/`` -- and that DO legitimately track their own
+    ``bernstein.yaml`` seed config in the main checkout.
     """
     root = tmp_path / "repo"
     root.mkdir()
@@ -136,12 +155,13 @@ def _make_task() -> Task:
     )
 
 
-def test_create_writes_local_excludes_not_a_tracked_gitignore(tmp_path: Path, repo: Path) -> None:
-    """``WorktreeManager.create`` must inject the full deny-list-derived
-    exclude set into ``.git/info/exclude`` (local-only) -- and must NOT
-    create or modify a tracked ``.gitignore`` in the worktree's working
-    tree, since that would itself be staged and committed into the target
-    repo."""
+def test_create_writes_worktree_scoped_excludes_not_a_tracked_gitignore(tmp_path: Path, repo: Path) -> None:
+    """``WorktreeManager.create`` must configure a worktree-scoped
+    ``core.excludesFile`` covering the full deny-list-derived exclude set --
+    and must NOT create or modify a tracked ``.gitignore`` in the worktree's
+    working tree, since that would itself be staged and committed into the
+    target repo. Must also NOT touch the shared repo-level ``.git/config``
+    beyond the one-time ``extensions.worktreeConfig`` flag."""
     mgr = WorktreeManager(repo_root=repo)
 
     worktree_path = mgr.create("sess-excludes")
@@ -164,12 +184,24 @@ def test_create_writes_local_excludes_not_a_tracked_gitignore(tmp_path: Path, re
     assert ".claude/" not in lines
     assert "/.claude/" not in lines
 
+    # The exclude file lives inside THIS worktree's own git dir, not the
+    # shared/common one.
+    exclude_path = _configured_excludes_file(worktree_path)
+    assert exclude_path is not None
+    assert str(_git_dir(worktree_path)) in str(exclude_path)
+
+    # The shared repo config gained only the (idempotent, harmless)
+    # extensions.worktreeConfig flag -- never the excludesFile setting
+    # itself, which must stay worktree-scoped.
+    shared_config = (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert "worktreeConfig = true" in shared_config
+    assert "excludesFile" not in shared_config
+
 
 def test_create_leaves_target_repo_tracked_tree_unchanged(tmp_path: Path, repo: Path) -> None:
-    """The whole point of using ``.git/info/exclude`` instead of a tracked
-    ``.gitignore``: worktree creation must not stage, modify, or introduce
-    any file in the target repo's working tree / index. ``git status`` right
-    after ``create()`` must be completely clean."""
+    """Worktree creation must not stage, modify, or introduce any file in
+    the target repo's working tree / index. ``git status`` right after
+    ``create()`` must be completely clean."""
     mgr = WorktreeManager(repo_root=repo)
 
     worktree_path = mgr.create("sess-clean-tree")
@@ -203,12 +235,13 @@ def test_git_add_dash_a_does_not_stage_full_deny_list_paths(tmp_path: Path, repo
 
 
 def test_generated_session_claude_md_is_not_staged(tmp_path: Path, repo: Path) -> None:
-    """Regression for the blocker this review caught: the orchestrator
-    itself generates a session ``CLAUDE.md`` at the worktree root via
-    ``write_claude_md`` (real header: "This file was auto-generated by
-    Bernstein for this agent session."). That file must never be staged by
-    ``git add -A`` -- it is never a target-repo deliverable, it's always
-    bernstein's own control file at that exact path."""
+    """Regression for the blocker an earlier review round caught: the
+    orchestrator itself generates a session ``CLAUDE.md`` at the worktree
+    root via ``write_claude_md`` (real header: "This file was
+    auto-generated by Bernstein for this agent session."). That file must
+    never be staged by ``git add -A`` -- it is never a target-repo
+    deliverable, it's always bernstein's own control file at that exact
+    path."""
     mgr = WorktreeManager(repo_root=repo)
     session_id = "sess-claude-md"
     worktree_path = mgr.create(session_id)
@@ -279,3 +312,38 @@ def test_normal_work_commit_passes_merge_preflight_forbidden_path_guard(tmp_path
     # staged set. Empty list == safe to commit/merge.
     forbidden = git_pr._verify_merge_staging_is_safe(worktree_path, f"agent/{session_id}")
     assert forbidden == [], f"merge-preflight forbidden-path guard must not trip on runtime paths, got: {forbidden}"
+
+
+def test_operator_main_checkout_unaffected_after_worktree_lifecycle(tmp_path: Path, repo: Path) -> None:
+    """The scenario this review round was raised to prevent: writing the
+    exclude set to a *shared* location (``.git/info/exclude``) would have
+    silently changed what the operator's own main checkout picks up on
+    ``git add -A`` -- e.g. a freshly-created ``bernstein.yaml`` seed config
+    would stop being staged with no warning.
+
+    After an agent worktree is created (which configures a worktree-scoped
+    excludesFile covering ``bernstein.yaml``, among others) and then
+    destroyed, the operator's MAIN checkout must still stage a
+    newly-created ``bernstein.yaml`` normally -- proving the exclusion
+    never leaked beyond the one worktree it was configured for."""
+    mgr = WorktreeManager(repo_root=repo)
+    session_id = "sess-isolation"
+    worktree_path = mgr.create(session_id)
+
+    # Sanity: the worktree itself does exclude bernstein.yaml.
+    (worktree_path / "bernstein.yaml").write_text("in_worktree: true\n", encoding="utf-8")
+    assert _git(worktree_path, "status", "--porcelain") == ""
+
+    mgr.cleanup(session_id)
+
+    # The operator, in their MAIN checkout, creates a fresh bernstein.yaml
+    # (their own seed config) and stages everything.
+    (repo / "bernstein.yaml").write_text("operator_seed_config: true\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    staged = _staged(repo)
+
+    assert "bernstein.yaml" in staged, (
+        "the exclusion configured for the agent worktree must not leak into "
+        "the operator's main checkout -- their own bernstein.yaml must "
+        "stage normally"
+    )
