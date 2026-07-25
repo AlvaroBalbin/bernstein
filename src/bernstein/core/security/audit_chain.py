@@ -4592,8 +4592,12 @@ def record_process_reap_receipt(
     lines.
 
     ``delivered`` records what was handed to the OS; ``confirmed_dead``
-    records the guarantee.  They differ whenever a tree exits before the
-    reap reaches it, which is a routine outcome and not a failure.
+    records what was observed afterwards.  They differ whenever a tree
+    exits before the reap reaches it, which is a routine outcome and not a
+    failure, and also whenever the platform cannot observe the outcome at
+    all.  Both new fields are only ever True from an observation, so a
+    verifier reading the chain offline can rely on False meaning "not
+    established" rather than "assumed".
 
     Args:
         chain: The audit chain store accepting the entry.
@@ -4608,10 +4612,11 @@ def record_process_reap_receipt(
         reason: Why the reap ran (e.g. ``"kill_requested"``,
             ``"heartbeat_stale"``, ``"wall_clock_timeout"``).
         actor: Recorded actor; defaults to ``"spawner"``.
-        already_gone: Whether the tree had already exited before any stop
-            tier ran.
-        confirmed_dead: Whether the tree is verified to no longer be running
-            once the reap returned.
+        already_gone: Whether the tree was observed to have already exited
+            before any stop tier ran.
+        confirmed_dead: Whether the tree was observed to no longer be
+            running once the reap returned.  False means the reap could not
+            establish it, which is not the same as the tree still running.
 
     Returns:
         The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded

@@ -356,11 +356,25 @@ class ProcessReapReceipt:
     offline.
 
     ``delivered`` answers "did we hand a stop to the OS"; it is *not* the
-    success predicate.  A tree that had already exited before the reap ran
-    accepts no stop, so ``delivered`` is False while the caller's guarantee
-    holds perfectly.  Read :attr:`confirmed_dead` to answer "is the tree
-    gone", and :attr:`already_gone` to tell "it exited on its own" apart
-    from "we stopped it".
+    success predicate.  A target that had already exited accepts no stop, so
+    ``delivered`` is False while the caller's guarantee holds.  Read
+    :attr:`confirmed_dead` to answer "was the target observed gone", and
+    :attr:`already_gone` to tell "it exited on its own" apart from "we
+    stopped it".
+
+    Every field reports something that was observed.  None of them is
+    inferred from a signal having been accepted: a stop that the OS took
+    delivery of is recorded as ``delivered`` or ``escalated``, and nothing
+    more is read into it.  Where the reap could not establish the target's
+    state at all, every claim stays False rather than defaulting to the
+    convenient answer.
+
+    On Windows ``delivered`` is False for a target that had already exited.
+    Before the pinned-handle rewrite the same case reported True, because
+    the old fallback ended in a liveness re-probe that a missing pid
+    satisfied.  Callers that branch on ``delivered`` see that flip; they
+    fall back to a single-process kill, which is a no-op against a pid that
+    no longer exists.
 
     Attributes:
         pgid: Process group ID (POSIX) or lead PID (Windows) targeted.
@@ -370,13 +384,19 @@ class ProcessReapReceipt:
         delivered: Whether the initial graceful stop was delivered.
         escalated: Whether a force-kill was required after the grace window.
         grace_seconds: The grace window that applied to this reap.
-        already_gone: Whether the target had already exited before any stop
-            tier ran.  Only ever True when that was affirmatively observed;
-            a target whose state could not be established is not
-            "already gone".
-        confirmed_dead: Whether the target is verified to no longer be
+        already_gone: Whether the target was observed to have already
+            exited before any stop tier ran.  Only ever True when that was
+            affirmatively observed; a target whose state could not be
+            established is not "already gone", and neither is a target we
+            were refused permission to look at.
+        confirmed_dead: Whether the target was *observed* to no longer be
             running once the reap returned.  This is the guarantee the reap
-            exists to provide.
+            exists to provide, and it is only ever set from an observation:
+            a group id the kernel no longer knows (ESRCH), or a Windows
+            handle that left the system.  A delivered force-kill does not
+            set it.  False therefore means "not established", which is not
+            the same as "still running" - the independent liveness helpers
+            answer that question.
     """
 
     pgid: int
@@ -402,37 +422,58 @@ class ProcessReapReceipt:
         }
 
 
-def _group_stopped_running(pgid: int) -> bool:
-    """Return True when the group has no member left that can run code.
+def _group_observed_gone(pgid: int) -> bool:
+    """Return True only when the group is *observed* to have no members left.
 
-    Confirmation counterpart to :func:`process_group_alive`.  The two answer
-    deliberately different questions.  ``process_group_alive`` drives the
-    decision to *escalate*, so it errs towards "alive" and reports EPERM as
-    alive.  Confirmation needs the sharper question - is anything still
-    running - and a zombie (a process that has exited and is waiting for its
-    parent to call ``wait()``) runs no code.
+    Confirmation counterpart to :func:`process_group_alive`, and it mirrors
+    that function's errno handling on purpose.  ``ESRCH`` is the only reply
+    that establishes anything: it means the kernel has no process group with
+    this id, so nothing in it can run.  ``EPERM`` means a member exists that
+    we may not signal, which is evidence the group is *alive*, not evidence
+    it is gone; treating it as gone is how a receipt ends up certifying a
+    process that is still running.
 
-    macOS reports EPERM, not ESRCH, for a signal aimed at a group whose only
-    remaining members are zombies, so a fully reaped group keeps looking
-    alive to ``killpg(pgid, 0)`` until the parent gets round to reaping it.
-    This probe is only reached after a SIGTERM was accepted for the same
-    group, which proves the group was signalable by us at that point, so a
-    later refusal means the signalable members are gone.
+    Measured behaviour of an unreaped group whose members have all been
+    SIGKILLed but whose parent has not yet called ``wait()``:
+
+    * macOS: ``killpg(pgid, 0)`` raises ``EPERM``.
+    * Linux: ``killpg(pgid, 0)`` succeeds.
+
+    Neither reply distinguishes "exited but unreaped" from "running", and
+    ``killpg`` offers no third answer that would, so neither is treated as
+    confirmation.  The reap reports the stop it delivered and leaves
+    ``confirmed_dead`` False rather than guessing; an unblockable SIGKILL
+    still guarantees eventual death, but that is a guarantee about the
+    future, not an observation of the present.
 
     Args:
         pgid: Process group ID (POSIX) or lead PID (Windows).
 
     Returns:
-        True if nothing in the group is still running.
+        True only if the group was observed to have no members.
     """
     killpg = getattr(os, "killpg", None)
     if IS_WINDOWS or killpg is None:
         return not process_group_alive(pgid)
     try:
         killpg(pgid, 0)
-    except OSError:
+    except ProcessLookupError:
+        # ESRCH: no such process group.  Nothing is left to run.
         return True
+    except OSError:
+        # EPERM (a member exists we may not signal) or any other errno.
+        # Neither says the group stopped, so neither confirms it.
+        return False
     return False
+
+
+#: The pin observed the target already exited before any stop tier ran.
+_PIN_TARGET_EXITED = "exited"
+#: The pin observed the target running, so stop tiers may act on it.
+_PIN_TARGET_RUNNING = "running"
+#: The pin could not establish what the number refers to.  Stop tiers must
+#: not act on it, and the receipt must claim nothing about it.
+_PIN_TARGET_UNOBSERVABLE = "unobservable"
 
 
 class _ReapPin:
@@ -444,31 +485,65 @@ class _ReapPin:
     was handed.  :class:`_WinReapPin` does the real work; keeping the POSIX
     path on this no-op base means Linux and macOS reaps are byte-for-byte
     the same sequence of syscalls they were before the pin existed.
+
+    The target state is a three-way answer, not a boolean.  "Observed
+    exited" and "could not observe" are different findings and must not
+    collapse into one flag: the first is a result the caller asked for, the
+    second is an absence of evidence.  A receipt that reports the second as
+    the first certifies a process nobody looked at.
     """
 
-    #: True only when the target was affirmatively observed to be gone
-    #: before any stop tier ran.  A target whose state could not be
-    #: established is never "already gone" - not knowing is not proof.
-    already_gone: bool = False
+    target_state: str = _PIN_TARGET_RUNNING
 
-    def confirm_exit(self, pgid: int, *, forced: bool) -> bool:
-        """Return True when the target is verified to no longer be running.
+    @property
+    def already_gone(self) -> bool:
+        """True only when the target was *observed* gone before any tier ran."""
+        return self.target_state == _PIN_TARGET_EXITED
 
-        A delivered force-kill is itself the confirmation on POSIX: SIGKILL
-        cannot be caught, blocked, or ignored.  Re-probing liveness is not a
-        substitute - ``killpg(pgid, 0)`` keeps succeeding for a group whose
-        members are already-dead zombies waiting for their parent to call
-        ``wait()``, so a probe fired straight after SIGKILL reports "alive"
-        for a group that is not running any code at all.
+    @property
+    def signalable(self) -> bool:
+        """True when a stop tier may act on this target.
+
+        False both for a target already observed gone (nothing to stop) and
+        for a target whose identity could not be established (signalling it
+        could hit a process the caller never asked us to touch).
+        """
+        return self.target_state == _PIN_TARGET_RUNNING
+
+    def observed_gone(self, pgid: int) -> bool:
+        """Return True only when the target is observed to no longer exist.
 
         Args:
             pgid: Process group ID (POSIX) or lead PID (Windows).
-            forced: Whether an unblockable force-kill was delivered.
 
         Returns:
-            True if the target is confirmed no longer running.
+            True if the observation succeeded and found nothing.
         """
-        return forced or _group_stopped_running(pgid)
+        return _group_observed_gone(pgid)
+
+    def confirm_exit(self, pgid: int, *, force_signal_delivered: bool) -> bool:
+        """Return True only when the target is *observed* no longer running.
+
+        ``force_signal_delivered`` is deliberately not treated as
+        confirmation.  SIGKILL cannot be caught, blocked, or ignored, so it
+        guarantees the group dies - but ``killpg(pgid, sig)`` succeeds when
+        it could signal *any one* member, so a delivered SIGKILL does not
+        establish that every member received it, and it says nothing about
+        the instant the receipt is written.  A guarantee about the future is
+        not an observation of the present, and only the observation is
+        reported.
+
+        Args:
+            pgid: Process group ID (POSIX) or lead PID (Windows).
+            force_signal_delivered: Whether an unblockable force-kill was
+                accepted for the group.  Recorded by the caller as
+                ``escalated``; not evidence of death.
+
+        Returns:
+            True if the target was observed to no longer be running.
+        """
+        del force_signal_delivered
+        return self.observed_gone(pgid)
 
     def close(self) -> None:
         """Release any OS resource the pin holds.  No-op on POSIX."""
@@ -502,19 +577,48 @@ class _WinReapPin(_ReapPin):
       that is already on its way out.  :meth:`confirm_exit` waits on the
       handle instead of racing the probe.
 
-    If the handle cannot be opened at all (no ctypes, no permission, no such
-    process) the pin degrades to the inert base behaviour: it never claims
-    the target is gone and never blocks the reap.
+    Whether the handle could be opened is not the same question as whether
+    the target is gone.  ``OpenProcess`` refuses both for a pid no process
+    has (``ERROR_INVALID_PARAMETER``) and for a pid held by a process this
+    user may not touch (``ERROR_ACCESS_DENIED``).  Only the first is
+    evidence of an exit; the second is a live process we cannot observe, and
+    the pin reports it as such so no tier signals it and no receipt claims
+    it stopped.
     """
 
-    def __init__(self, pid: int, handle: int, *, already_gone: bool) -> None:
+    def __init__(self, pid: int, handle: int, *, target_state: str) -> None:
         self.pid = pid
         self._handle = handle
-        self.already_gone = already_gone
+        self.target_state = target_state
 
     def alive(self) -> bool:
         """Return True when the pinned process has not exited yet."""
         return bool(self._handle) and _win_handle_alive(self._handle)
+
+    def observed_exited(self) -> bool:
+        """Return True only when the handle *reports* the process exited.
+
+        Distinct from ``not alive()``: a handle whose exit code cannot be
+        read is not alive, but it is not observed exited either.
+        """
+        return bool(self._handle) and _win_handle_liveness(self._handle) is False
+
+    def observed_gone(self, pgid: int) -> bool:
+        """Return the pinned handle's own verdict, not a re-probe of the pid.
+
+        ``_win_process_alive`` cannot open a pid it lacks rights to and
+        reports it as not running, so re-probing the number would turn
+        "could not observe" back into "observed gone" one layer down.  The
+        handle already names the target.
+
+        Args:
+            pgid: Lead PID of the reaped tree (unused).
+
+        Returns:
+            True if the handle reports the process exited.
+        """
+        del pgid
+        return self.observed_exited()
 
     def terminate(self, exit_code: int = 1) -> bool:
         """Terminate the pinned process through the handle we already hold."""
@@ -524,25 +628,30 @@ class _WinReapPin(_ReapPin):
         """Block until the pinned process exits or *timeout_ms* elapses."""
         return bool(self._handle) and _win_wait_for_exit(self._handle, timeout_ms)
 
-    def confirm_exit(self, pgid: int, *, forced: bool) -> bool:
-        """Wait on the pinned handle, then fall back to the liveness probe.
+    def confirm_exit(self, pgid: int, *, force_signal_delivered: bool) -> bool:
+        """Wait on the pinned handle for real evidence that the target left.
 
-        Windows has real evidence available - the handle becomes signalled
-        when the process leaves the system - so a force-kill request is not
-        allowed to stand in for it here.
+        Windows has an observation available that POSIX does not: the handle
+        becomes signalled when the process leaves the system.  That is the
+        only thing accepted here.  A force-kill request is not, and neither
+        is a re-probe of the bare pid - ``_win_process_alive`` cannot open a
+        pid it lacks rights to and reports it as not running, which is the
+        same "could not observe read as observed gone" mistake one layer
+        down.
 
         Args:
-            pgid: Lead PID of the reaped tree.
-            forced: Whether a force-kill was delivered (unused: the handle
-                wait is stronger evidence).
+            pgid: Lead PID of the reaped tree (unused: the pinned handle
+                names the target more precisely than the number does).
+            force_signal_delivered: Whether a force-kill was delivered
+                (unused: the handle wait is the evidence).
 
         Returns:
-            True if the target is confirmed no longer running.
+            True if the target was observed to leave the system.
         """
-        del forced
+        del pgid, force_signal_delivered
         if self.wait_for_exit(_WIN_EXIT_CONFIRM_MS):
             return True
-        return _group_stopped_running(pgid)
+        return self.observed_exited()
 
     def close(self) -> None:
         """Close the pinned handle, releasing the pid back to the kernel."""
@@ -638,9 +747,9 @@ def reap_process_group(
     # that merely inherited the number.  Inert on POSIX (see _ReapPin).
     with _pin_reap_target(pgid) as pin:
         if pin.already_gone:
-            # Nothing to stop.  The tree the caller asked about is not
-            # running, which is exactly the guarantee they wanted, so this is
-            # a success even though no stop was delivered to anything.
+            # Nothing to stop.  The tree the caller asked about was observed
+            # not running, which is exactly the guarantee they wanted, so
+            # this is a success even though no stop was delivered.
             return _receipt(
                 delivered=False,
                 escalated=False,
@@ -648,14 +757,25 @@ def reap_process_group(
                 confirmed_dead=True,
             )
 
+        if not pin.signalable:
+            # The number could not be resolved to a process we are allowed
+            # to observe.  Signalling it could hit a process the caller
+            # never asked about, so no tier runs; and not knowing is not
+            # proof of an exit, so the receipt claims neither.
+            logger.warning(
+                "Reap target %d could not be identified; no stop was attempted and no outcome is claimed",
+                pgid,
+            )
+            return _receipt(delivered=False, escalated=False)
+
         # Best-effort TERM first.
         if not kill_process_group(pgid, signal.SIGTERM):
             # The stop could not be delivered.  That is only a reap failure
             # when the target is still running; a target that has already
-            # exited is the outcome the caller asked for.  Verify rather than
-            # assume - conflating the two is what made an already-exited
-            # Windows spawn look like a failed stop.
-            gone = not process_group_alive(pgid)
+            # exited is the outcome the caller asked for.  Observe rather
+            # than assume, and ask the pin (which already names the target)
+            # instead of re-probing the bare number.
+            gone = pin.observed_gone(pgid)
             return _receipt(
                 delivered=False,
                 escalated=False,
@@ -688,7 +808,7 @@ def reap_process_group(
         return _receipt(
             delivered=True,
             escalated=True,
-            confirmed_dead=pin.confirm_exit(pgid, forced=forced),
+            confirmed_dead=pin.confirm_exit(pgid, force_signal_delivered=forced),
         )
 
 
@@ -854,46 +974,95 @@ _WIN_FILETIME_EPOCH_OFFSET_S = 11644473600.0
 #: FILETIME resolution: 100 ns ticks per second.
 _WIN_FILETIME_TICKS_PER_S = 10_000_000.0
 
+#: ``OpenProcess`` last-error for "no process has this id".  This is the
+#: only refusal that is evidence the target exited.
+_WIN_ERROR_INVALID_PARAMETER = 87
 
-def _win_open_process(pid: int, access: int) -> int | None:
-    """Return an open kernel handle to *pid*.
+#: ``OpenProcess`` last-error for "the pid is in use by a process you may
+#: not touch".  Evidence the target is *alive* and unobservable, never
+#: evidence that it is gone.
+_WIN_ERROR_ACCESS_DENIED = 5
+
+
+def _win_last_error(kernel32: Any) -> int:
+    """Return ``GetLastError()``, or 0 when it cannot be read.
+
+    Args:
+        kernel32: The kernel32 handle the failing call was made through.
+
+    Returns:
+        The Win32 last-error code, or 0 when unavailable.  0 is not a real
+        failure code, so callers treat it as "unknown" and stay
+        conservative.
+    """
+    try:
+        return int(kernel32.GetLastError())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("GetLastError unavailable: %s", exc)
+        return 0
+
+
+def _win_open_process(pid: int, access: int) -> tuple[int | None, int]:
+    """Return an open kernel handle to *pid* and the refusal reason.
 
     Args:
         pid: Process ID.
         access: ``OpenProcess`` desired-access mask.
 
     Returns:
-        A handle value; ``0`` when ``OpenProcess`` itself refused (no such
-        process, or access denied); ``None`` when the call could not be made
-        at all.  The two are kept apart deliberately: a missing kernel32 is
-        an environment failure and says nothing about the target, whereas a
-        refused open is evidence about the pid.
+        ``(handle, last_error)``.  ``handle`` is a handle value; ``0`` when
+        ``OpenProcess`` itself refused; ``None`` when the call could not be
+        made at all.  The two are kept apart deliberately: a missing
+        kernel32 is an environment failure and says nothing about the
+        target, whereas a refused open is evidence about the pid - and
+        *which* evidence depends on ``last_error``, so it is returned rather
+        than discarded.
     """
     try:
         kernel32 = _win_kernel32()
     except Exception as exc:
         logger.debug("kernel32 unavailable while opening PID %d: %s", pid, exc)
-        return None
+        return None, 0
     try:
-        return int(kernel32.OpenProcess(access, False, pid))
+        handle = int(kernel32.OpenProcess(access, False, pid))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("OpenProcess failed for PID %d: %s", pid, exc)
-        return None
+        return None, 0
+    return handle, (0 if handle else _win_last_error(kernel32))
 
 
-def _win_handle_alive(handle: int) -> bool:
-    """Return True when the process behind *handle* has not exited yet."""
+def _win_handle_liveness(handle: int) -> bool | None:
+    """Return whether the process behind *handle* is still running.
+
+    Args:
+        handle: An open process handle with query rights.
+
+    Returns:
+        True when the process is running, False when it has exited, and
+        None when the state could not be read at all.  The third answer
+        exists so an unreadable handle is never mistaken for an exit.
+    """
     import ctypes
     import ctypes.wintypes
 
     try:
         exit_code = ctypes.wintypes.DWORD()
         if not _win_kernel32().GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-            return False
+            return None
         return bool(exit_code.value == _WIN_STILL_ACTIVE)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GetExitCodeProcess failed: %s", exc)
-        return False
+        return None
+
+
+def _win_handle_alive(handle: int) -> bool:
+    """Return True when the process behind *handle* has not exited yet.
+
+    An unreadable handle is reported as not alive so no caller keeps
+    waiting on it.  Callers that need to tell "exited" from "could not
+    read" must use :func:`_win_handle_liveness` instead.
+    """
+    return _win_handle_liveness(handle) is True
 
 
 def _win_handle_start_time(handle: int) -> float | None:
@@ -987,42 +1156,68 @@ def _win_pin_process(pid: int) -> _WinReapPin | None:
         treating an unreadable environment as proof about the process.
     """
     if pid <= 0:
-        return _WinReapPin(pid, 0, already_gone=True)
+        # There is no such pid to begin with, on any Windows build.
+        return _WinReapPin(pid, 0, target_state=_PIN_TARGET_EXITED)
     requested_at = time.time()
     full = _WIN_PROCESS_QUERY_LIMITED_INFORMATION | _WIN_PROCESS_TERMINATE | _WIN_SYNCHRONIZE
-    handle = _win_open_process(pid, full)
+    handle, last_error = _win_open_process(pid, full)
     if handle is None:
         return None
     if not handle:
-        handle = _win_open_process(pid, _WIN_PROCESS_QUERY_LIMITED_INFORMATION)
+        # Terminate rights are the likeliest thing to be refused; retry with
+        # the query-only rights the identity check actually needs before
+        # concluding anything about the pid.
+        handle, last_error = _win_open_process(pid, _WIN_PROCESS_QUERY_LIMITED_INFORMATION)
         if handle is None:
             return None
     if not handle:
-        # The pid does not resolve to a process we can observe.  OpenProcess
-        # fails for a pid that is not in use at all, which is the
-        # already-exited case; it also fails when the pid *is* in use by a
-        # process we may not touch.  Both mean "do not signal this number":
-        # report gone so the reap stops here instead of firing stop tiers at
-        # a number that is not ours.
-        return _WinReapPin(pid, 0, already_gone=True)
+        # OpenProcess refused.  Which refusal it was decides what we may
+        # report.  ERROR_INVALID_PARAMETER means no process holds this pid,
+        # which is an observed exit.  ERROR_ACCESS_DENIED means one does and
+        # we may not touch it, which is an observed *live* process we cannot
+        # follow - reporting that as gone would certify a running process.
+        # Any other code is simply unknown.  Only the first is an exit.
+        if last_error == _WIN_ERROR_INVALID_PARAMETER:
+            return _WinReapPin(pid, 0, target_state=_PIN_TARGET_EXITED)
+        logger.warning(
+            "PID %d could not be opened for reap (error %d); it is not signalled and its state is not claimed",
+            pid,
+            last_error,
+        )
+        return _WinReapPin(pid, 0, target_state=_PIN_TARGET_UNOBSERVABLE)
 
-    pin = _WinReapPin(pid, handle, already_gone=not _win_handle_alive(handle))
-    if pin.already_gone:
-        return pin
+    liveness = _win_handle_liveness(handle)
+    if liveness is None:
+        # The handle is open but will not answer.  That is an absence of
+        # evidence, not an exit.  Keep it open so the pid stays pinned, and
+        # report a state no tier will act on and no receipt will claim.
+        logger.warning(
+            "PID %d has an open handle whose exit state cannot be read; "
+            "it is not signalled and its state is not claimed",
+            pid,
+        )
+        return _WinReapPin(pid, handle, target_state=_PIN_TARGET_UNOBSERVABLE)
+    if not liveness:
+        return _WinReapPin(pid, handle, target_state=_PIN_TARGET_EXITED)
 
+    pin = _WinReapPin(pid, handle, target_state=_PIN_TARGET_RUNNING)
     start_time = _win_handle_start_time(handle)
     if start_time is not None and start_time > requested_at:
         # This process started after we were asked to reap the pid, so it
-        # cannot be the process the caller meant - the number was recycled.
-        # Drop the pin without ever signalling it.
+        # cannot be the process the caller meant - the number was recycled,
+        # or the clock stepped backwards under us.  Either way the process
+        # we can see is not the target, and the target's own state is
+        # therefore unknown.  Drop the pin without signalling it, and claim
+        # nothing: "this is not the process you asked about" is not the same
+        # finding as "the process you asked about has exited".
         logger.warning(
-            "PID %d was recycled before the reap could pin it (started %.3fs after the request); "
-            "refusing to signal an unrelated process",
+            "PID %d does not identify the reap target (the process holding it started "
+            "%.3fs after the request); refusing to signal it and claiming no outcome",
             pid,
             start_time - requested_at,
         )
         pin.close()
-        return _WinReapPin(pid, 0, already_gone=True)
+        return _WinReapPin(pid, 0, target_state=_PIN_TARGET_UNOBSERVABLE)
     return pin
 
 
@@ -1053,7 +1248,10 @@ def _win_taskkill(pid: int, *, force: bool = False, tree: bool = False) -> bool:
         # cannot prove is still the process we were asked to stop.
         return _win_run_taskkill(pid, force=force, tree=tree) == 0
     try:
-        if pin.already_gone:
+        if not pin.signalable:
+            # Either the target was observed gone (nothing to stop) or its
+            # identity could not be established (must not be stopped).
+            # Neither delivered a stop, which is what this bool reports.
             return False
         return _win_stop_pinned(pin, force=force, tree=tree)
     finally:
@@ -1122,7 +1320,10 @@ def _win_stop_pinned(pin: _WinReapPin, *, force: bool, tree: bool) -> bool:
     # hitting an unrelated process, and no external interpreter to time out.
     if pin.terminate():
         return pin.wait_for_exit(_WIN_EXIT_CONFIRM_MS)
-    return not pin.alive()
+    # The terminate request itself was refused.  Report a stop only if the
+    # handle affirmatively says the process exited anyway; a handle that
+    # will not answer is not an exit.
+    return pin.observed_exited()
 
 
 def _win_process_alive(pid: int) -> bool:

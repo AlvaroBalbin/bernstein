@@ -16,14 +16,23 @@ confirmed_dead)``. On Windows the force tier must fall back to the numeric
 what a Windows regression looks like, so we pin it here rather than only on
 a Windows host.
 
-Two properties get dedicated coverage because Windows recycles pids fast
-enough for both to matter in practice:
+Three properties get dedicated coverage because Windows recycles pids fast
+enough for all of them to matter in practice:
 
-* a target that had already exited is a *satisfied* reap, not a failed one
-  - nothing is left running, which is the whole point of the call, and
+* a target that was *observed* to have already exited is a satisfied reap,
+  not a failed one - nothing is left running, which is the whole point of
+  the call;
 * no stop tier may ever act on a pid that might have been recycled into an
   unrelated process, so the reap pins the target with an open handle and
-  refuses a process that started after the reap was requested.
+  refuses a process that started after the reap was requested; and
+* "could not observe" is a third answer, never folded into either of the
+  first two.  ``OpenProcess`` refuses a pid nothing holds and a pid held by
+  a process this user may not touch with different error codes, a handle
+  can be open and still decline to report an exit code, and a mismatched
+  creation time says the number is not the target rather than that the
+  target is gone.  Each of those leaves both ``already_gone`` and
+  ``confirmed_dead`` False: the receipt is signed into the audit chain, so
+  an absence of evidence must not serialise as evidence of absence.
 """
 
 from __future__ import annotations
@@ -156,6 +165,14 @@ class _PinKernel32:
     after the process exits, ``TerminateProcess`` flips it to exited, and
     ``WaitForSingleObject`` reports exited/timed-out rather than a raw
     liveness poll.
+
+    ``exists`` and ``openable`` are separate knobs because the two failures
+    they model are separate findings.  A pid nothing holds fails
+    ``OpenProcess`` with ``ERROR_INVALID_PARAMETER`` and is evidence of an
+    exit.  A pid held by a process this user may not touch fails with
+    ``ERROR_ACCESS_DENIED`` and is evidence of a *live* process we cannot
+    follow.  A world model that returns a bare 0 for both cannot tell them
+    apart, and neither can code written against it.
     """
 
     def __init__(
@@ -178,14 +195,23 @@ class _PinKernel32:
         self.terminated: list[int] = []
         self.closed: list[int] = []
         self.waits: list[tuple[int, int]] = []
+        self.last_error = 0
 
     _HANDLE = 4242
 
     def OpenProcess(self, access: int, _inherit: bool, pid: int) -> int:
         self.opened.append((access, pid))
-        if pid != self.pid or not self.exists or not self.openable:
+        if pid != self.pid or not self.exists:
+            self.last_error = 87  # ERROR_INVALID_PARAMETER: no such pid
             return 0
+        if not self.openable:
+            self.last_error = 5  # ERROR_ACCESS_DENIED: live, but not ours
+            return 0
+        self.last_error = 0
         return self._HANDLE
+
+    def GetLastError(self) -> int:
+        return self.last_error
 
     def GetExitCodeProcess(self, _handle: int, ptr: Any) -> int:
         ptr._obj.value = 259 if self.running else 0
@@ -350,8 +376,15 @@ class TestWinTaskkill:
         assert pc._win_taskkill(123, force=True, tree=True) is True
         assert [c[0] for c in cmds] == ["taskkill"]
 
-    def test_unreadable_handle_state_is_not_alive(self, monkeypatch: Any) -> None:
-        """A handle that will not answer is never reported as running."""
+    def test_unreadable_handle_state_is_not_an_exit(self, monkeypatch: Any) -> None:
+        """A handle that will not answer is neither running nor gone.
+
+        Refusing to signal an unreadable target is right.  Recording it as
+        an observed exit is not: nothing looked at the process, so the
+        receipt has nothing to certify.  ``_win_handle_alive`` collapses the
+        unreadable case into "not alive" for callers that only need to stop
+        waiting, so the pin must read the tri-state directly.
+        """
 
         class _Mute(_PinKernel32):
             def GetExitCodeProcess(self, _handle: int, _ptr: Any) -> int:
@@ -362,13 +395,94 @@ class TestWinTaskkill:
 
         fake = _Mute()
         _install_kernel32(monkeypatch, fake)
+        assert pc._win_handle_liveness(_PinKernel32._HANDLE) is None
         assert pc._win_handle_alive(_PinKernel32._HANDLE) is False
         assert pc._win_handle_start_time(_PinKernel32._HANDLE) is None
-        # Unreadable liveness means "already gone" - the conservative
-        # direction, because the reap then signals nothing.
+
         pin = pc._win_pin_process(123)
         assert pin is not None
-        assert pin.already_gone is True
+        assert pin.target_state == pc._PIN_TARGET_UNOBSERVABLE
+        assert pin.already_gone is False
+        assert pin.signalable is False
+        assert pin.observed_exited() is False
+
+    def test_unreadable_handle_state_claims_nothing_in_the_receipt(self, monkeypatch: Any) -> None:
+        """F2 regression: an unreadable handle must not certify a death.
+
+        Fails if ``already_gone`` is ever derived from "the handle would not
+        answer", which is what made an unobserved process serialise into the
+        audit chain as confirmed dead.
+        """
+
+        class _Mute(_PinKernel32):
+            def GetExitCodeProcess(self, _handle: int, _ptr: Any) -> int:
+                return 0
+
+        fake = _Mute(pid=999, running=True)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(
+                AssertionError("signalled a target nobody could observe")
+            ),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+        assert receipt.delivered is False
+        assert fake.terminated == []
+        assert fake.running is True
+
+    def test_access_denied_live_process_is_not_reported_gone(self, monkeypatch: Any) -> None:
+        """F1 regression: ERROR_ACCESS_DENIED is a live process, not an exit.
+
+        ``OpenProcess`` refuses both for a pid nothing holds and for a pid
+        held by a process this user may not touch.  Only the first is an
+        exit.  Fails if the two refusals are collapsed back into one
+        "already gone" answer.
+        """
+        fake = _PinKernel32(pid=999, running=True, openable=False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(
+                AssertionError("signalled a pid we were refused access to")
+            ),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        # Refused access: not signalled, and nothing claimed about it.
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+        assert receipt.delivered is False
+        assert fake.running is True
+
+    def test_absent_pid_is_still_reported_gone(self, monkeypatch: Any) -> None:
+        """The other half of F1: a pid nothing holds *is* an observed exit.
+
+        Guards the fix against over-correction - if every refusal became
+        "unobservable", the already-exited case this PR exists to report
+        would stop being reported.
+        """
+        fake = _PinKernel32(pid=999, exists=False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        _install_kernel32(monkeypatch, fake)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is True
+        assert receipt.confirmed_dead is True
+        assert receipt.delivered is False
 
 
 class TestWinPidReuseGuard:
@@ -383,10 +497,42 @@ class TestWinPidReuseGuard:
         pin = pc._win_pin_process(123)
 
         assert pin is not None
-        assert pin.already_gone is True
+        assert pin.signalable is False
+        # "That is not the process you asked about" is not "the process you
+        # asked about has exited".  The target's state was never observed.
+        assert pin.already_gone is False
+        assert pin.target_state == pc._PIN_TARGET_UNOBSERVABLE
         # The impostor's handle was released and never terminated.
         assert fake.terminated == []
         assert fake.closed == [_PinKernel32._HANDLE]
+
+    def test_recycled_pid_claims_nothing_in_the_receipt(self, monkeypatch: Any) -> None:
+        """F3 regression: a mismatched identity must not certify a death.
+
+        The same path fires when the wall clock steps backwards between the
+        target's creation and the reap request, so a live process would be
+        certified dead by a clock adjustment alone.  Fails if the recycle
+        guard reports its refusal as an observed exit.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        fake = _PinKernel32(pid=999, running=True, start_time=time.time() + 2.0)
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(
+                AssertionError("signalled a pid whose identity did not match")
+            ),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+        assert receipt.delivered is False
+        assert fake.terminated == []
+        assert fake.running is True
 
     def test_recycled_pid_is_not_handed_to_taskkill(self, monkeypatch: Any) -> None:
         fake = _PinKernel32(start_time=time.time() + 60.0)
