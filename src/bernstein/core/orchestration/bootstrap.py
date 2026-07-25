@@ -42,6 +42,13 @@ from bernstein.core.orchestration.preflight import (
     gemini_has_auth,
     preflight_checks,
 )
+from bernstein.core.orchestration.process_utils import (
+    LIVENESS_UNKNOWN,
+    ORCHESTRATOR_PROCESS_MARKER,
+    WATCHDOG_POLL_S,
+    Liveness,
+    classify_pidfile_liveness,
+)
 from bernstein.core.seed import (
     NotifyConfig,
     SeedConfig,
@@ -896,8 +903,23 @@ def _watchdog_check_process(
     now: float,
     restart_fn: Any,
     post_restart_fn: Any | None = None,
+    liveness: Liveness | None = None,
 ) -> tuple[float | None, int, bool]:
     """Check a single watchdog-monitored process and restart if dead.
+
+    ``liveness`` is the classification of the pidfile this supervisor owns, from
+    :func:`classify_pidfile_liveness` -- the same classifier the CLI's
+    run-completion verdict reads, so the two subsystems cannot disagree about
+    what "gone" means. Only ``LIVENESS_GONE`` authorises a restart. Passing
+    ``LIVENESS_UNKNOWN``, or a ``pid`` of ``None``, means the process could not
+    be attributed to a pidfile this supervisor owns, and the supervisor does
+    nothing: spawning on an unattributable reading either starts a second
+    orchestrator alongside a healthy one (both then drive the same task store)
+    or resurrects a run an operator has already torn down -- teardown deletes
+    the pidfiles, which is exactly the reading that used to trigger a restart.
+
+    Omitting ``liveness`` keeps the plain dead-pid behaviour for callers that
+    have no pidfile to classify.
 
     Returns:
         Updated (alive_since, restarts, give_up_logged) tuple.
@@ -912,6 +934,17 @@ def _watchdog_check_process(
                 now - alive_since,
             )
             return alive_since, 0, False
+        return alive_since, restarts, give_up_logged
+
+    if pid is None or liveness == LIVENESS_UNKNOWN:
+        # Not evidence of death: no pidfile yet, an unreadable one, or one an
+        # operator teardown removed. Keep monitoring, restart nothing.
+        logger.debug(
+            "%s liveness is unattributable (pid=%s liveness=%s) - not restarting",
+            name,
+            pid,
+            liveness,
+        )
         return alive_since, restarts, give_up_logged
 
     # Process is dead
@@ -946,7 +979,7 @@ def _watchdog_check_process(
 def run_watchdog(
     workdir: Path,
     port: int,
-    poll_s: float = 5.0,
+    poll_s: float = WATCHDOG_POLL_S,
     adapter: str | None = None,
     model: str | None = None,
     seed_path: Path | None = None,
@@ -962,6 +995,13 @@ def run_watchdog(
     process its restart budget back. Without this, the watchdog gives up
     forever after 5 transient failures across the entire run (incident
     2026-04-11).
+
+    A dead orchestrator is therefore a RECOVERABLE state, not a terminal one,
+    for as long as this loop is running with restart budget left. Anything else
+    that wants to conclude the orchestrator will not come back has to outwait
+    ``poll_s`` -- which is why that period is a shared constant
+    (``process_utils.WATCHDOG_POLL_S``) rather than a private default here, and
+    why the CLI's run-completion verdict sizes its confirmation window from it.
 
     Args:
         workdir: Project root directory.
@@ -989,7 +1029,7 @@ def run_watchdog(
         now = time.monotonic()
 
         # Check server
-        server_pid = _read_pid(server_pid_path)
+        server_liveness, server_pid = classify_pidfile_liveness(server_pid_path)
         server_alive_since, server_restarts, server_give_up_logged = _watchdog_check_process(
             name="Server",
             pid=server_pid,
@@ -1001,10 +1041,16 @@ def run_watchdog(
             now=now,
             restart_fn=lambda: _start_server(workdir, port),
             post_restart_fn=lambda: _wait_for_server(port),
+            liveness=server_liveness,
         )
 
-        # Check orchestrator/spawner (only restart if server is alive)
-        spawner_pid = _read_pid(spawner_pid_path)
+        # Check orchestrator/spawner (only restart if server is alive). The
+        # command-line marker keeps an unrelated process that inherited a
+        # recycled pid from vouching for a pidfile that is in fact stale.
+        spawner_liveness, spawner_pid = classify_pidfile_liveness(
+            spawner_pid_path,
+            expect_cmdline=ORCHESTRATOR_PROCESS_MARKER,
+        )
 
         def _restart_spawner() -> int:
             cur_server_pid = _read_pid(server_pid_path)
@@ -1023,6 +1069,7 @@ def run_watchdog(
             reset_after_s=restart_reset_after_s,
             now=now,
             restart_fn=_restart_spawner,
+            liveness=spawner_liveness,
         )
 
 

@@ -26,14 +26,13 @@ from bernstein.cli.helpers import (
     auth_headers,
     console,
     find_seed_file,
-    is_alive,
     persist_server_port,
     print_banner,
     print_startup_banner,
-    read_pid,
     server_get,
 )
 from bernstein.cli.run_preflight import (
+    _CLI_RUN_EPOCH,
     _abort_if_default_branch_merge_target,
     _configure_quality_gate_bypass,
     _emit_preflight_runtime_warnings,
@@ -46,6 +45,15 @@ from bernstein.cli.run_preflight import (
 )
 from bernstein.core.cost import estimate_run_cost
 from bernstein.core.manager_parsing import _resolve_depends_on  # pyright: ignore[reportPrivateUsage]
+from bernstein.core.orchestration.process_utils import (
+    LIVENESS_ALIVE,
+    LIVENESS_GONE,
+    LIVENESS_UNKNOWN,
+    ORCHESTRATOR_PROCESS_MARKER,
+    WATCHDOG_POLL_S,
+    Liveness,
+    classify_pidfile_liveness,
+)
 from bernstein.core.plan_loader import PlanLoadError, load_plan, load_plan_from_yaml
 
 logger = logging.getLogger(__name__)
@@ -1045,22 +1053,138 @@ def _signal_orchestrator_shutdown(*, reason: str = "cli detected run completion"
         )
 
 
-def _orchestrator_liveness() -> tuple[bool, bool]:
-    """Return ``(pidfile_present, process_alive)`` for the orchestrator.
+def _spawner_liveness_from_health(health_payload: Any) -> Liveness | None:
+    """Read the task server's own opinion of the orchestrator, or ``None``.
 
-    Reads the same ``.sdd/runtime/spawner.pid`` pidfile the bootstrap
-    supervisor and the demo reap path use, through the same canonical
-    ``is_alive`` check, rather than introducing a second notion of aliveness.
+    ``GET /health`` reports ``components.spawner.status`` by running the same
+    pidfile check the CLI runs, but from inside the server process. That
+    matters because the server and the orchestrator are started together by
+    ``core/orchestration/bootstrap.py`` and therefore share a pid namespace,
+    while the CLI may not: the shipped container image runs the orchestrator in
+    a container, so a CLI outside it cannot see the orchestrator's pid at all
+    and its own probe would report a perfectly healthy orchestrator as dead.
 
-    Both flags are needed because "no pidfile" is ambiguous on its own: it
-    means either "the orchestrator has not started yet" (startup window) or
-    "it exited and cleaned up". A pidfile that is present but points at a dead
-    pid is NOT ambiguous -- the orchestrator ran and is now gone.
+    Returns ``None`` when the server expresses no opinion (older server, no
+    ``sdd_dir`` configured, or no pidfile yet), which leaves the decision to
+    the local probe.
     """
-    pid = read_pid(SDD_PID_SPAWNER)
-    if pid is None or pid <= 0:
-        return False, False
-    return True, is_alive(pid)
+    if not isinstance(health_payload, dict):
+        return None
+    components = health_payload.get("components")
+    if not isinstance(components, dict):
+        return None
+    spawner = components.get("spawner")
+    if not isinstance(spawner, dict):
+        return None
+    status = str(spawner.get("status") or "").strip().lower()
+    if status == "ok":
+        return LIVENESS_ALIVE
+    if status == "down":
+        return LIVENESS_GONE
+    return None
+
+
+def _orchestrator_liveness(
+    health_payload: Any = None,
+    *,
+    pidfile_not_before: float | None = None,
+) -> tuple[Liveness, int | None]:
+    """Classify the orchestrator as ``alive``, ``gone``, or ``unknown``.
+
+    Returns ``(liveness, pid)``. The pid is returned so a caller tracking a
+    streak of observations can tell "still the same dead process" from "a
+    different process, so something restarted it".
+
+    Two observers are consulted, neither of which is trusted alone:
+
+    1. **The task server** (``/health`` -> ``components.spawner``), which shares
+       the orchestrator's pid namespace. It is the only observer that can see
+       the process at all when this CLI is outside that namespace.
+    2. **The local pidfile probe** (:func:`classify_pidfile_liveness` over
+       ``.sdd/runtime/spawner.pid``) -- the same classifier the recovery
+       supervisor in ``core/orchestration/bootstrap.py`` uses, so the two
+       subsystems cannot hold different definitions of "gone". It is the only
+       observer that rejects a zombie, which the server's cruder check reports
+       as running.
+
+    Resolution: agreement decides, one-sided evidence decides, and every
+    disagreement resolves to ``unknown``.
+
+    ==============  ==============  =========
+    server says     local probe     result
+    ==============  ==============  =========
+    ``ok``          ``alive``       ``alive``
+    ``ok``          ``unknown``     ``alive``
+    ``ok``          ``gone``        ``unknown``
+    ``down``        ``gone``        ``gone``
+    ``down``        ``unknown``     ``gone``
+    ``down``        ``alive``       ``unknown``
+    no opinion      ``alive``       ``alive``
+    no opinion      ``gone``        ``gone``
+    no opinion      ``unknown``     ``unknown``
+    ==============  ==============  =========
+
+    Neither disagreement row picks a winner, because each observer is the more
+    reliable one in a different failure mode and nothing here can tell which
+    mode is in play. ``ok``/``gone`` is either a CLI outside the namespace (the
+    server is right) or a zombie orchestrator (the local probe is right).
+    ``down``/``alive`` is either a stale pidfile whose pid has been recycled by
+    an unrelated process (the server is right) or a race (either could be).
+
+    ``pidfile_not_before`` is forwarded to the local probe so a pidfile left
+    behind by a previous run cannot be read as this run's death. Pass ``None``
+    once the orchestrator has actually been observed alive during this wait --
+    at that point the pidfile is known to describe a process of this run
+    regardless of its mtime.
+    """
+    server_view = _spawner_liveness_from_health(health_payload)
+    local_view, pid = classify_pidfile_liveness(
+        Path(SDD_PID_SPAWNER),
+        not_before=pidfile_not_before,
+        expect_cmdline=ORCHESTRATOR_PROCESS_MARKER,
+    )
+    if server_view is None or local_view == LIVENESS_UNKNOWN:
+        return (local_view if server_view is None else server_view), pid
+    if server_view != local_view:
+        return LIVENESS_UNKNOWN, pid
+    return local_view, pid
+
+
+#: Consecutive polls that must ALL observe the orchestrator gone before the
+#: run is declared over. One observation is not evidence: see
+#: ``_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S`` for why.
+_ORCHESTRATOR_GONE_CONFIRMATIONS = 3
+#: Wall-clock the confirming observations must span, derived from the recovery
+#: supervisor's poll period rather than picked: ``run_watchdog`` in
+#: ``core/orchestration/bootstrap.py`` restarts a dead orchestrator, so a dead
+#: pid is a RECOVERABLE state for up to one of its poll periods plus the
+#: restart itself. Three periods leaves the supervisor at least two full
+#: chances to act; if it did, the restarted process is observed alive (or under
+#: a new pid) and the streak resets, so the verdict can never win that race.
+_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S = 3.0 * WATCHDOG_POLL_S
+
+
+def _incomplete_declared_counts(status_payload: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
+    """Return ``(n_incomplete_declared, full_histogram_or_None)`` for the run.
+
+    ``GET /status`` reports only ``open``/``claimed``/``done``/``failed``/
+    ``refused``. Two of the four statuses that mean "declared but never
+    finished" -- ``in_progress`` and ``orphaned`` -- have no bucket in that
+    payload at all, so counting them from it always yields zero no matter how
+    many tasks are stuck in them. ``GET /tasks/counts`` is the full per-status
+    histogram and is the only source that can answer this question.
+
+    The second element is ``None`` when the full histogram was unavailable and
+    the ``/status`` payload had to be used instead. Callers must treat that as
+    "this count may be an undercount" and must not conclude anything terminal
+    from a zero.
+    """
+    from bernstein.core.quality.retrospective import count_incomplete_declared
+
+    full_counts = server_get("/tasks/counts")
+    if isinstance(full_counts, dict):
+        return count_incomplete_declared(full_counts), full_counts
+    return count_incomplete_declared(status_payload), None
 
 
 def _wait_for_run_completion(
@@ -1068,7 +1192,7 @@ def _wait_for_run_completion(
     poll_interval_s: float = 2.0,
     timeout_s: float = 3600.0,
 ) -> dict[str, Any] | None:
-    """Poll the server until the run becomes quiescent.
+    """Poll the server until the run reaches a terminal state.
 
     Args:
         poll_interval_s: Delay between status polls.
@@ -1080,34 +1204,65 @@ def _wait_for_run_completion(
 
         There are two terminal states, and both return a payload:
 
-        * **Quiescent** -- ``open == claimed == 0`` with no live agents: every
-          declared task reached a terminal outcome.
+        * **Quiescent** -- no declared task is still open/claimed/in-progress/
+          orphaned and no agent is live: every declared task reached a terminal
+          outcome.
         * **Orchestrator gone with unfinished tasks** -- the spawner process
-          has exited while declared tasks are still non-terminal. Nothing will
-          ever advance them, so the run is over and its goal was not met
-          (issue #3010).
+          has been observed gone across a confirmation window while declared
+          tasks are still non-terminal, so the run is over and its goal was not
+          met (issue #3010).
 
         A ``None`` return means "no verdict": the deadline expired (or the
         server stayed unreachable) while the run was still genuinely in
         flight. It must NOT be read as a failed run -- callers deriving an
         exit code have to treat it as unknown and stay at 0, because the
-        orchestrator is still working and may complete every task.
+        orchestrator may still be working and may complete every task.
 
         Returning the last observed (non-quiescent) payload for that case
         instead would hand callers a mid-flight snapshot that by definition
-        still has ``open``/``claimed`` > 0 -- exactly why quiescence was never
+        still has work outstanding -- exactly why quiescence was never
         detected -- so a run that merely outlived the wait deadline would be
         misreported as unhealthy. Multi-hour goals are designed for (see the
         scope timeouts in ``core/defaults.py``, up to 7200s against this 3600s
         default deadline), which makes that misread the common case rather
-        than an edge one. Orchestrator liveness -- not the task counts -- is
-        what separates "still starting up" from "ended with work unfinished".
-    """
-    from bernstein.core.quality.retrospective import count_incomplete_declared
+        than an edge one.
 
-    deadline = time.time() + timeout_s
+    What the "orchestrator gone" verdict actually requires, and why:
+
+    This verdict is the input to a non-zero exit code on a run an operator may
+    still be watching, so it is built to be wrong in one direction only. Every
+    condition below must hold on the SAME poll, and all of them must hold on
+    ``_ORCHESTRATOR_GONE_CONFIRMATIONS`` consecutive polls spanning at least
+    ``_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S``:
+
+    * :func:`_orchestrator_liveness` returns ``gone`` -- which needs positive
+      evidence of death from a pidfile attributable to this run, and needs the
+      task server (which shares the orchestrator's pid namespace, unlike this
+      CLI) not to contradict it.
+    * the pid has not changed since the streak began. A different pid means
+      something restarted the orchestrator, which resets the streak.
+    * no agent is reported live.
+    * at least one declared task is still non-terminal, counted from the FULL
+      per-status histogram. A partial histogram cannot support this verdict at
+      all, because its zero is indistinguishable from an undercount.
+
+    Anything short of that -- a single dead-pid reading, a disagreement between
+    the two observers, a pidfile predating this run, an unreachable server, an
+    expired deadline -- yields no verdict and lets the run continue. The cost
+    of that is a healthy run's CLI waiting longer than it had to. The cost of
+    the opposite bias is telling an operator that a run which is still working
+    has failed.
+    """
+    start = time.time()
+    deadline = start + timeout_s
     orchestrator_seen_alive = False
-    while time.time() < deadline:
+    gone_since: float | None = None
+    gone_polls = 0
+    gone_pid: int | None = None
+    while True:
+        now = time.time()
+        if now >= deadline:
+            break
         status_payload = server_get("/status")
         health_payload = server_get("/health")
         if isinstance(status_payload, dict) and isinstance(health_payload, dict):
@@ -1115,7 +1270,27 @@ def _wait_for_run_completion(
             open_count = int(status_payload.get("open", 0) or 0)
             claimed_count = int(status_payload.get("claimed", 0) or 0)
             agent_count = int(health_payload.get("agent_count", 0) or 0)
-            if total > 0 and open_count == claimed_count == 0 and (agent_count == 0):
+            n_incomplete, full_counts = _incomplete_declared_counts(status_payload)
+            counts_are_complete = full_counts is not None
+            if full_counts is not None:
+                # Carry the full histogram with the payload so the caller's
+                # health verdict sees in_progress/orphaned too.
+                status_payload["task_counts"] = full_counts
+
+            # Quiescence. The open/claimed test alone calls a run finished
+            # while a task sits in `in_progress` or `orphaned`, because
+            # /status has no bucket for either -- so the full histogram, when
+            # we have it, gets a veto. This only ever tightens the test.
+            quiescent = total > 0 and open_count == claimed_count == 0 and agent_count == 0
+            if quiescent and counts_are_complete and n_incomplete > 0:
+                logger.info(
+                    "run_not_quiescent: open=0 claimed=0 but %d declared task(s) are still "
+                    "non-terminal in the full histogram (in_progress/orphaned are invisible to "
+                    "/status) - continuing to wait",
+                    n_incomplete,
+                )
+                quiescent = False
+            if quiescent:
                 logger.info(
                     "run_completion_detected: total=%d open=%d claimed=%d agent_count=%d "
                     "- sending belt-and-braces shutdown signal",
@@ -1128,41 +1303,83 @@ def _wait_for_run_completion(
                 return status_payload
 
             # Second terminal state: the orchestrator is gone while declared
-            # tasks are still non-terminal. Nothing will ever advance them, so
-            # this IS a verdict -- and an unhealthy one (issue #3010: the agent
-            # produced no output, its task stayed `open`, the orchestrator
-            # stopped, and the run reported success).
+            # tasks are still non-terminal (issue #3010: the agent produced no
+            # output, its task stayed non-terminal, the orchestrator stopped,
+            # and the run reported success).
             #
-            # Quiescence cannot cover this: it requires open == claimed == 0,
+            # Quiescence cannot cover this: it requires nothing outstanding,
             # which a stuck task never satisfies. Orchestrator liveness is the
             # discriminator that separates it from the STARTUP window, where
-            # tasks are also `open` but the orchestrator is alive (or not yet
-            # started) and about to drive them.
+            # tasks are also outstanding but the orchestrator is alive (or not
+            # yet started) and about to drive them.
             #
-            # "Gone" is only concluded when it is unambiguous: either a pidfile
-            # is present but its pid is dead (it ran and died), or we watched
-            # the orchestrator alive earlier in this wait and it has since
-            # disappeared. A pidfile that simply has not been written yet is
-            # never read as "gone" -- when in doubt this falls through to
-            # "no verdict" and keeps waiting.
-            pid_present, alive = _orchestrator_liveness()
-            orchestrator_seen_alive = orchestrator_seen_alive or alive
-            orchestrator_gone = not alive and (pid_present or orchestrator_seen_alive)
-            if orchestrator_gone and agent_count == 0 and count_incomplete_declared(status_payload) > 0:
-                logger.warning(
-                    "run_ended_with_unfinished_tasks: orchestrator process is gone but "
-                    "total=%d open=%d claimed=%d are still non-terminal (agent_count=%d) -- "
-                    "nothing will advance them. Treating this as a terminal, non-healthy "
-                    "verdict rather than waiting out the deadline (issue #3010).",
-                    total,
-                    open_count,
-                    claimed_count,
-                    agent_count,
+            # Once the orchestrator has been seen alive in THIS wait, its
+            # pidfile is known to belong to this run, so the mtime guard that
+            # protects the startup window is no longer needed.
+            liveness, pid = _orchestrator_liveness(
+                health_payload,
+                pidfile_not_before=None if orchestrator_seen_alive else _CLI_RUN_EPOCH,
+            )
+            if liveness == LIVENESS_ALIVE:
+                orchestrator_seen_alive = True
+
+            terminal_shape = liveness == LIVENESS_GONE and agent_count == 0 and counts_are_complete and n_incomplete > 0
+            if not terminal_shape or (gone_since is not None and pid != gone_pid):
+                # Any non-confirming observation -- including a restart, which
+                # shows up as a different pid -- restarts the window from zero.
+                if gone_polls:
+                    logger.info(
+                        "orchestrator_gone_streak_reset after %d poll(s): liveness=%s pid=%s "
+                        "agent_count=%d incomplete=%d complete_counts=%s",
+                        gone_polls,
+                        liveness,
+                        pid,
+                        agent_count,
+                        n_incomplete,
+                        counts_are_complete,
+                    )
+                gone_since = None
+                gone_polls = 0
+                gone_pid = None
+
+            if terminal_shape:
+                if gone_since is None:
+                    gone_since = now
+                    gone_pid = pid
+                gone_polls += 1
+                confirmed_for = now - gone_since
+                if gone_polls >= _ORCHESTRATOR_GONE_CONFIRMATIONS and (
+                    confirmed_for >= _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S
+                ):
+                    logger.warning(
+                        "run_ended_with_unfinished_tasks: orchestrator pid=%s observed gone on "
+                        "%d consecutive polls over %.0fs (> the %.0fs recovery-supervisor window, "
+                        "so no restart is coming) while %d declared task(s) are still non-terminal "
+                        "(total=%d open=%d claimed=%d agent_count=%d). Treating this as a terminal, "
+                        "non-healthy verdict (issue #3010).",
+                        pid,
+                        gone_polls,
+                        confirmed_for,
+                        _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S,
+                        n_incomplete,
+                        total,
+                        open_count,
+                        claimed_count,
+                        agent_count,
+                    )
+                    return status_payload
+                logger.info(
+                    "orchestrator_gone_unconfirmed: pid=%s seen gone on poll %d/%d after %.0fs of "
+                    "the %.0fs confirmation window - a recovery restart would still pre-empt this",
+                    pid,
+                    gone_polls,
+                    _ORCHESTRATOR_GONE_CONFIRMATIONS,
+                    confirmed_for,
+                    _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S,
                 )
-                return status_payload
         time.sleep(poll_interval_s)
     logger.info(
-        "run_completion_wait_timed_out after %.0fs: quiescence never observed -- the run is "
+        "run_completion_wait_timed_out after %.0fs: no terminal state observed -- the run is "
         "still in flight in the background. Returning no verdict; callers must not treat this "
         "as a failed run.",
         timeout_s,

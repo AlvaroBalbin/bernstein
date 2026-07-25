@@ -23,6 +23,7 @@ Three layers from the bug report are covered:
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -269,11 +270,12 @@ class TestCleanupOrdering:
         """Issue #3010 end-to-end, through the REAL wait + REAL pidfile check.
 
         The exact reported shape: one declared task that never completed, its
-        agent produced nothing, and the orchestrator has exited. Only the
-        server polls and the clock are faked -- ``_wait_for_run_completion``
-        and the orchestrator-liveness check are the real ones, reading a real
-        stale ``spawner.pid``. ``bernstein run --quiet && deploy`` must not
-        deploy on this run.
+        agent produced nothing, and the orchestrator has exited and stayed gone
+        for longer than a recovery restart would have taken. Only the server
+        polls and the clock are faked -- ``_wait_for_run_completion``, the
+        orchestrator-liveness classification and the confirmation window are
+        the real ones, reading a real stale ``spawner.pid``.
+        ``bernstein run --quiet && deploy`` must not deploy on this run.
         """
         from bernstein.core.retrospective import EXIT_RUN_UNHEALTHY
 
@@ -287,14 +289,22 @@ class TestCleanupOrdering:
         monkeypatch.chdir(tmp_path)
 
         stuck = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0}
-        clock = {"t": 0.0}
+        counts = {"total": 1, "open": 1, "claimed": 0, "in_progress": 0, "orphaned": 0, "done": 0, "failed": 0}
+        clock = {"t": time.time()}
 
         def _fake_time() -> float:
-            clock["t"] += 1.0
+            clock["t"] += 2.0
             return clock["t"]
 
+        def _fake_get(path: str) -> object:
+            if path == "/status":
+                return stuck
+            if path == "/tasks/counts":
+                return counts
+            return {"agent_count": 0}
+
         with (
-            patch.object(rb, "server_get", side_effect=lambda p: stuck if p == "/status" else {"agent_count": 0}),
+            patch.object(rb, "server_get", side_effect=_fake_get),
             patch.object(rb.time, "sleep", return_value=None),
             patch.object(rb.time, "time", side_effect=_fake_time),
             patch.object(rb, "_signal_orchestrator_shutdown"),
@@ -325,10 +335,10 @@ class TestCleanupOrdering:
         monkeypatch.chdir(tmp_path)
 
         starting = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0}
-        clock = {"t": 0.0}
+        clock = {"t": time.time()}
 
         def _fake_time() -> float:
-            clock["t"] += 1.0
+            clock["t"] += 10.0
             return clock["t"]
 
         with (

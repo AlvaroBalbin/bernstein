@@ -198,7 +198,12 @@ def _exit_nonzero_on_unhealthy_run(status_payload: object) -> None:
 
     Note that the discriminator between "ended with work unfinished" and
     "still starting up" is orchestrator liveness, not the task counts -- both
-    show ``open`` > 0. See ``_wait_for_run_completion``.
+    show work outstanding. See ``_wait_for_run_completion``.
+
+    The counts are read from the full per-status histogram when the wait
+    attached one (``task_counts``), because a ``/status`` payload has no bucket
+    for ``in_progress`` or ``orphaned`` -- a run left with a task stuck in
+    either would otherwise read as "nothing outstanding" and exit 0.
     """
     if not isinstance(status_payload, dict):
         return
@@ -207,9 +212,13 @@ def _exit_nonzero_on_unhealthy_run(status_payload: object) -> None:
         run_healthy_from_status_counts,
     )
 
-    counts_obj = status_payload.get("summary", status_payload)
-    counts = counts_obj if isinstance(counts_obj, dict) else status_payload
-    if run_healthy_from_status_counts(counts):
+    counts: dict[str, object] = status_payload
+    for key in ("task_counts", "summary"):
+        candidate = status_payload.get(key)
+        if isinstance(candidate, dict):
+            counts = candidate
+            break
+    if run_healthy_from_status_counts(counts):  # type: ignore[arg-type]
         return
     console.print(
         "[red]Run did not meet its goal[/red] -- a declared task never completed or a task "
