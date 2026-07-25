@@ -358,6 +358,7 @@ alwaysApply: false
 | `remote_transport.py` | Streamable HTTP transport for Bernstein MCP server |
 | `routine_tools.py`    | MCP tools for the rt-003 Routine <-> Scenario bridge |
 | `server.py`           | Bernstein MCP server |
+| `signal_paths.py`     | Containment barrier for the MCP shutdown-signal path |
 | `streaming.py`        | In-flight tool-call tracking with cancellation and partial-result preservation |
 | `resources/`          | MCP resource registrars for Bernstein |
 | `tool_schemas/`       | tool_schemas/ sub-package |

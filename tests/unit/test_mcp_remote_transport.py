@@ -481,6 +481,9 @@ class TestToolExecution:
         from pathlib import Path
 
         workdir = Path(str(tmp_path))
+        # The workdir must already be a Bernstein project root: the tool stops
+        # a project that exists, it does not create a tree where it is pointed.
+        (workdir / ".sdd").mkdir()
         body = _jsonrpc_request(
             "tools/call",
             {"name": "bernstein_stop", "arguments": {"workdir": str(workdir)}},
@@ -492,6 +495,32 @@ class TestToolExecution:
         assert text["status"] == "shutdown signal sent"
         signal_file = workdir / ".sdd" / "runtime" / "signals" / "SHUTDOWN"
         assert signal_file.exists()
+
+    @pytest.mark.anyio
+    async def test_stop_tool_refuses_a_workdir_that_is_not_a_project(
+        self, transport: StreamableHTTPTransport, tmp_path: object
+    ) -> None:
+        """The remote surface serves the same tool and needs the same barrier.
+
+        Before the barrier this transport ran ``mkdir(parents=True)`` on any
+        path the caller named, so a stop against an unrelated directory both
+        created a ``.sdd`` tree there and dropped a SHUTDOWN file in it.
+        """
+        from pathlib import Path
+
+        victim = Path(str(tmp_path)) / "victim"
+        victim.mkdir()
+        body = _jsonrpc_request(
+            "tools/call",
+            {"name": "bernstein_stop", "arguments": {"workdir": str(victim)}},
+        )
+        status, _, resp_body = await transport.handle_request("POST", "/mcp", {}, body)
+        assert status == 200
+        data = json.loads(resp_body)
+        text = _tool_result(data["result"]["content"][0]["text"])
+        assert "error" in text
+        assert "status" not in text
+        assert list(victim.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
