@@ -68,10 +68,14 @@ def _safe_log(
     resource_id: str,
     details: dict[str, object],
 ) -> None:
-    """Append one event through the wired audit log; swallow errors.
+    """Append one event through the wired audit log; swallow errors, loudly.
 
     The cluster control plane must never crash because the audit sink is
-    misconfigured - we log at debug and move on.
+    misconfigured, so the failure is still swallowed. It is reported at warning
+    rather than debug: at debug a dropped record is invisible in any default
+    configuration, and "the control plane kept running but stopped recording" is
+    precisely what an operator needs to be told. Chain-lock contention from a
+    stuck writer otherwise looks identical to a healthy cluster.
     """
     log = _audit_log()
     if log is None:
@@ -79,7 +83,7 @@ def _safe_log(
     try:
         log.log(event_type, actor, resource_type, resource_id, details)
     except Exception:
-        logger.debug("Failed to record cluster audit event %s", event_type, exc_info=True)
+        logger.warning("Failed to record cluster audit event %s", event_type, exc_info=True)
 
 
 def record_node_registered(

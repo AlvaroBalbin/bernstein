@@ -24,6 +24,7 @@ Commands:
   bernstein audit slice              Write a deterministic subset.
   bernstein audit query              Query audit log events with filters.
   bernstein audit archive            Safely archive corrupt / pre-rotation jsonl files.
+  bernstein audit ack-tear           Acknowledge a crash-truncated segment.
 
 Operator guide: docs/security/audit-log.md.
 """
@@ -293,6 +294,17 @@ def verify_cmd(merkle_only: bool, hmac_only: bool, receipt_path: str | None, pay
     # chain and the Merkle seal.
     all_passed = _verify_tenant_charters() and all_passed
 
+    # Physical segment damage is a further integrity pillar, and it exists
+    # because sealing a tear is the one repair a writer performs on the log.
+    # When a crash removed only the terminator of an otherwise complete record,
+    # sealing puts that byte back and the segment verifies clean again - so the
+    # HMAC pillar, which had been failing on "missing trailing newline", starts
+    # passing the moment anything appends. Without this pillar a monitoring job
+    # watching the exit code stops alerting on its own, with no operator having
+    # looked. Orthogonal to the HMAC chain: those bytes are authentic, they were
+    # just not all written.
+    all_passed = _verify_chain_tears() and all_passed
+
     console.print()
     raise SystemExit(0 if all_passed else 1)
 
@@ -533,23 +545,32 @@ def _verify_tenant_charters() -> bool:
     concurrency defect.
 
     When no charter events exist the check is a silent no-op.
+
+    One chain read, taken under one transaction, feeds every fold; the folds
+    themselves run after the transaction has been released. Folding per tenant
+    *inside* the transaction re-read the whole chain once per charter, so the
+    exclusive hold grew as (charters x history) and passed the primitive's
+    30s budget on an ordinary multi-tenant deployment - at which point an
+    unrelated ``tenant create`` running alongside a scheduled verify failed
+    outright with nothing created. The snapshot is what makes the verdict
+    consistent; holding the lock past the read adds nothing to that.
     """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER, AuditChainStore
-    from bernstein.core.security.tenant_charter import verify_charter
+    from bernstein.core.security.tenant_charter import verify_charter_from_entries
 
     chain = AuditChainStore(AUDIT_DIR)
-    with chain.transaction():
-        try:
+    try:
+        with chain.transaction():
             entries = chain.query(event_type=EVENT_TENANT_CHARTER, include_archived=True)
-        except OSError as exc:  # pragma: no cover - filesystem race
-            console.print(f"[red]Failed to read tenant charter events: {exc}[/red]")
-            return False
+    except OSError as exc:  # pragma: no cover - filesystem race
+        console.print(f"[red]Failed to read tenant charter events: {exc}[/red]")
+        return False
 
-        tenants = sorted({entry.resource_id for entry in entries if entry.resource_id})
-        if not tenants:
-            return True  # no charters recorded; nothing to fold
+    tenants = sorted({entry.resource_id for entry in entries if entry.resource_id})
+    if not tenants:
+        return True  # no charters recorded; nothing to fold
 
-        results = [verify_charter(chain, tenant_id) for tenant_id in tenants]
+    results = [verify_charter_from_entries(entries, tenant_id) for tenant_id in tenants]
 
     failures = [r for r in results if not r.ok]
     console.print()
@@ -569,6 +590,119 @@ def _verify_tenant_charters() -> bool:
         where = f" at seq {result.seq}" if result.seq is not None else ""
         console.print(f"  [red]![/red] charter {result.tenant_id}: {result.reason}{where}: {result.detail}")
     return False
+
+
+def _tear_key(event: object) -> tuple[str, int]:
+    """Identify one tear by the segment it happened in and the byte it happened at."""
+    details = getattr(event, "details", None) or {}
+    return (str(details.get("segment", "")), int(details.get("byte_offset", 0) or 0))
+
+
+def _unacknowledged_tears() -> list[tuple[str, int, str]]:
+    """Return ``(segment, byte_offset, recorded_at)`` for every tear nobody has signed off.
+
+    Both reads happen under one transaction so the pair is consistent: an
+    acknowledgement landing between them would otherwise clear a tear this call
+    had not yet seen. The set arithmetic runs after the transaction is released.
+    """
+    from bernstein.core.security.audit import EVENT_CHAIN_TEAR_ACKNOWLEDGED, EVENT_CHAIN_TORN_RECORD
+    from bernstein.core.security.audit_chain import AuditChainStore
+
+    chain = AuditChainStore(AUDIT_DIR)
+    with chain.transaction():
+        tears = chain.query(event_type=EVENT_CHAIN_TORN_RECORD, include_archived=True)
+        acks = chain.query(event_type=EVENT_CHAIN_TEAR_ACKNOWLEDGED, include_archived=True)
+
+    acked = {_tear_key(a) for a in acks}
+    return [(key[0], key[1], tear.timestamp) for tear in tears if (key := _tear_key(tear)) not in acked]
+
+
+def _verify_chain_tears() -> bool:
+    """Report segments a crash truncated. Returns True when none is outstanding.
+
+    A tear is recorded when an append finds a segment whose last line lost its
+    terminator and seals it. Sealing is the right repair: it keeps the fragment
+    as its own permanently flagged line instead of letting the next record fuse
+    onto it and swallow a real one. But it is still a repair, and in the case
+    where the crash removed only the terminator of an otherwise complete record
+    it restores a segment that then verifies clean. The HMAC pillar would go
+    from FAILED back to Passed with no operator involved.
+
+    So the tear is reported here until someone acknowledges it with ``bernstein
+    audit ack-tear``, which appends its own chain record naming the same segment
+    and byte offset. The chain stays append-only: nothing is deleted or
+    rewritten to clear the alert, and who cleared it is as tamper-evident as the
+    tear itself.
+    """
+    from bernstein.core.security.audit import ChainLockUnavailable
+
+    try:
+        outstanding = _unacknowledged_tears()
+    except (OSError, ChainLockUnavailable) as exc:  # pragma: no cover - filesystem race
+        console.print(f"[red]Failed to read chain damage records: {exc}[/red]")
+        return False
+
+    if not outstanding:
+        return True  # nothing torn, or every tear acknowledged: stay quiet
+
+    console.print()
+    console.print(Panel("[bold red]Chain Segment Damage UNACKNOWLEDGED[/bold red]", border_style="red", expand=False))
+    for segment, offset, recorded_at in outstanding:
+        console.print(f"  [red]![/red] {segment}: record torn at byte {offset} (sealed {recorded_at})")
+    console.print(
+        "  [dim]A crash truncated the segment mid-record. The fragment is preserved and sealed;\n"
+        "  the record it was going to be is lost. Investigate, then acknowledge with:[/dim]\n"
+        f"  [dim]bernstein audit ack-tear --segment {outstanding[0][0]} --offset {outstanding[0][1]} "
+        '--reason "..."[/dim]'
+    )
+    return False
+
+
+def _os_user() -> str:
+    """Best-effort OS user name, for acknowledgement records."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):  # pragma: no cover - no passwd entry
+        return "unknown"
+
+
+@audit_group.command("ack-tear")
+@click.option("--segment", required=True, help="Segment file name as verify printed it, e.g. 2026-07-25.jsonl.")
+@click.option("--offset", required=True, type=int, help="Byte offset as verify printed it.")
+@click.option("--reason", required=True, help="What was investigated and what was concluded.")
+@click.option("--actor", default=None, help="Who is acknowledging (defaults to the OS user).")
+def ack_tear_cmd(segment: str, offset: int, reason: str, actor: str | None) -> None:
+    """Acknowledge a torn segment so ``audit verify`` stops failing on it.
+
+    The acknowledgement is appended to the chain, not written beside it: nothing
+    about clearing the alert is editable after the fact, and the reason travels
+    with the record. Acknowledging repairs nothing - the torn record is still
+    lost - it records that an operator looked.
+    """
+    from bernstein.core.security.audit import EVENT_CHAIN_TEAR_ACKNOWLEDGED, EVENT_CHAIN_TORN_RECORD
+    from bernstein.core.security.audit_chain import AuditChainStore
+
+    if not AUDIT_DIR.is_dir():
+        raise click.ClickException(f"audit directory not found: {AUDIT_DIR}")
+
+    chain = AuditChainStore(AUDIT_DIR)
+    with chain.transaction():
+        tears = chain.query(event_type=EVENT_CHAIN_TORN_RECORD, include_archived=True)
+        if (segment, offset) not in {_tear_key(t) for t in tears}:
+            raise click.ClickException(
+                f"no recorded tear for segment {segment!r} at byte {offset}. "
+                "Use the segment and offset exactly as 'bernstein audit verify' printed them."
+            )
+        chain.log_with_prev_digest(
+            event_type=EVENT_CHAIN_TEAR_ACKNOWLEDGED,
+            actor=actor or _os_user(),
+            resource_type="audit_segment",
+            resource_id=segment,
+            details={"segment": segment, "byte_offset": offset, "reason": reason},
+        )
+    console.print(f"[green]Acknowledged[/green] tear in {segment} at byte {offset}.")
 
 
 def _verify_merkle_tree() -> bool:

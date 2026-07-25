@@ -423,7 +423,20 @@ def _append_escalation_audit(
     reason: str,
     receipt_digest: str,
 ) -> None:
-    """Append a ``supervisor.escalated`` event to the audit log."""
+    """Append a ``supervisor.escalated`` event to the audit log.
+
+    Chain-lock faults propagate from here. This is an interactive command whose
+    whole product is a chain-anchored escalation record: reporting the
+    escalation as done while the record was never written hands the operator an
+    escalation they cannot later evidence. The CLI boundary turns the fault into
+    ``Error: ...`` naming the holder, which is something an operator can act on
+    and retry.
+
+    Other IO faults stay swallowed - the escalation receipt is already on disk -
+    but at warning rather than debug, so a dropped record is not invisible.
+    """
+    from bernstein.core.security.audit import ChainLockMisuse, ChainLockUnavailable
+
     audit_dir = root / SUPERVISOR_AUDIT_DIR
     try:
         audit_dir.mkdir(parents=True, exist_ok=True)
@@ -440,8 +453,10 @@ def _append_escalation_audit(
                 "receipt_digest": receipt_digest,
             },
         )
+    except (ChainLockUnavailable, ChainLockMisuse):
+        raise
     except Exception:  # pragma: no cover - never block the CLI on audit IO
-        logger.debug("Failed to append supervisor.escalated audit entry", exc_info=True)
+        logger.warning("Failed to append supervisor.escalated audit entry", exc_info=True)
 
 
 def _fire_worker_escalated_event(

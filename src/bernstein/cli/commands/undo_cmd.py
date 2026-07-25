@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-from contextlib import suppress
 from pathlib import Path
 
 import click
@@ -91,8 +90,14 @@ def _execute_reverts(commits: list[tuple[str, str]]) -> int:
 
 
 def _log_undo_audit(task_id: str | None, revert_all: bool, success_count: int) -> None:
-    """Log undo action to audit trail (best-effort)."""
-    with suppress(Exception):
+    """Log undo action to audit trail (best-effort, but never silently).
+
+    The reverts already happened, so failing the command here would report a
+    failure for work that succeeded. The write therefore stays best-effort - but
+    it now says so. A bare ``suppress`` also swallowed chain-lock contention,
+    which left no trace anywhere that the undo went unrecorded.
+    """
+    try:
         from bernstein.core.lifecycle import get_audit_log
 
         audit = get_audit_log()
@@ -109,6 +114,8 @@ def _log_undo_audit(task_id: str | None, revert_all: bool, success_count: int) -
                     "revert_all": revert_all,
                 },
             )
+    except Exception as exc:  # the reverts are done; report and continue
+        console.print(f"[yellow]Warning:[/yellow] the revert was not recorded in the audit chain: {exc}")
 
 
 def _run_post_revert_tests() -> None:

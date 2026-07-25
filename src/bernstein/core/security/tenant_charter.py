@@ -62,6 +62,7 @@ from bernstein.core.identity.delegation_scope import DecisionBinding
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
+    from bernstein.core.security.audit import AuditEvent
     from bernstein.core.security.audit_chain import AuditChainStore
 
 __all__ = [
@@ -80,6 +81,7 @@ __all__ = [
     "CharterState",
     "CharterVerification",
     "canonical_instant",
+    "charter_events_from_entries",
     "dump_charter_segment",
     "fold_charter",
     "load_charter",
@@ -89,6 +91,7 @@ __all__ = [
     "record_charter_event",
     "verify_charter",
     "verify_charter_events",
+    "verify_charter_from_entries",
 ]
 
 #: Schema tag carried by every charter event body.
@@ -625,6 +628,30 @@ def verify_charter(chain: AuditChainStore, tenant_id: str) -> CharterVerificatio
         events = read_charter_events(chain, tenant_id)
     except CharterChainError as exc:
         return CharterVerification(ok=False, tenant_id=tenant_id, reason=exc.reason, detail=str(exc), seq=exc.seq)
+    return _verdict_for(events, tenant_id)
+
+
+def verify_charter_from_entries(entries: Sequence[AuditEvent], tenant_id: str) -> CharterVerification:
+    """Fold one tenant's charter out of a chain snapshot already taken.
+
+    Returns the same verdict as :func:`verify_charter` without reading the
+    chain: *entries* is a snapshot of the charter events taken once, under one
+    transaction, covering every tenant at once. That is what lets a verifier
+    fold N tenants without holding the exclusive chain lock for N reads.
+
+    Args:
+        entries: Charter events read from the chain, in chain order.
+        tenant_id: The tenant to fold.
+    """
+    try:
+        events = charter_events_from_entries(entries, tenant_id)
+    except CharterChainError as exc:
+        return CharterVerification(ok=False, tenant_id=tenant_id, reason=exc.reason, detail=str(exc), seq=exc.seq)
+    return _verdict_for(events, tenant_id)
+
+
+def _verdict_for(events: Sequence[CharterEvent], tenant_id: str) -> CharterVerification:
+    """Turn a tenant's rebuilt event list into a verdict."""
     if not events:
         return CharterVerification(
             ok=False,
@@ -744,9 +771,30 @@ def read_charter_events(chain: AuditChainStore, tenant_id: str) -> list[CharterE
     """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
-    out: list[CharterEvent] = []
     with chain.transaction():
         entries = chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True)
+    return charter_events_from_entries(entries, tenant_id)
+
+
+def charter_events_from_entries(entries: Sequence[AuditEvent], tenant_id: str) -> list[CharterEvent]:
+    """Rebuild one tenant's charter events from chain entries already read.
+
+    Split out of :func:`read_charter_events` so a caller that must fold many
+    tenants pays for one chain read rather than one per tenant, and so the
+    folding - pure CPU over data already in hand - happens after the chain
+    transaction has been released. Folding per tenant *inside* the transaction
+    makes the exclusive hold proportional to (tenants x history), which denies
+    every other writer for as long as that takes.
+
+    Args:
+        entries: Charter events read from the chain, in chain order. May cover
+            several tenants; entries for other tenants are ignored.
+        tenant_id: The tenant whose events to keep.
+
+    Raises:
+        CharterChainError: if a recorded event body cannot be rebuilt.
+    """
+    out: list[CharterEvent] = []
     for entry in entries:
         body = (entry.details or {}).get("charter")
         if not isinstance(body, dict):

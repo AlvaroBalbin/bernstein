@@ -229,6 +229,21 @@ exit codes:
 | 0    | chain intact (and merkle seal matches, if checked) |
 | 1    | one or more verification errors                    |
 
+the command checks several independent pillars and exits non-zero if
+any one of them fails:
+
+| pillar               | answers                                          |
+|----------------------|--------------------------------------------------|
+| hmac chain           | are these bytes authentic and in order           |
+| merkle seal          | does the sealed root still match                 |
+| tenant charters      | does each charter still fold to a readable state |
+| chain segment damage | did a crash truncate a segment (see below)       |
+
+the pillars are orthogonal on purpose. a segment can be byte-perfect
+and authentically signed while a record it was supposed to contain
+was never written, so "the hmac chain passes" is not the same claim
+as "nothing was lost".
+
 a healthy run prints a green panel:
 
 ```
@@ -381,6 +396,50 @@ archive format guarantees: gzipped JSONL, the chain still verifies
 end-to-end across uncompressed + archived files as long as you feed
 both into the verifier.
 
+`archive()` compresses each expired segment *outside* the chain
+transaction and takes the lock only for the two renames that publish
+the result. compression cost is proportional to the bytes in the
+retention window, and holding an exclusive cross-process lock for that
+long would deny every other writer (see below). the source segment's
+size and mtime are re-checked under the lock before the swap, so a
+segment that changed under the compress is skipped rather than
+published from a stale copy.
+
+## Concurrent writers
+
+several processes may append to one audit directory. read-then-append
+sequences - reading the chain head and then writing a record that
+embeds it - are serialised across processes by a lock file,
+`.sdd/audit/.chain.lock`.
+
+what an operator needs to know about it:
+
+- a writer waits up to **30 seconds** for the lock, then gives up.
+- giving up is reported as an ordinary command error:
+
+  ```
+  Error: could not acquire the audit chain transaction on /srv/bernstein/.sdd/audit
+  within 30s. Another process is holding it, ... Identify the holder (e.g. 'lsof
+  /srv/bernstein/.sdd/audit/.chain.lock') rather than removing the lock file: a
+  fresh inode admits a second writer alongside the current one.
+  ```
+
+- **do not delete the lock file** to clear a stuck writer. the lock is
+  held against the file's inode, so replacing it with a fresh one does
+  not evict the holder - it lets a second writer in alongside it,
+  which is the interleaving the lock exists to prevent. use `lsof` to
+  find the holder and deal with that process.
+- a process that forked without `exec` and was then killed can keep
+  the lock alive through the duplicated descriptor. the same `lsof`
+  will show it.
+
+expensive work is deliberately kept out of the locked section. the
+charter pillar of `audit verify` reads the chain once under the lock
+and folds every tenant afterwards; retention compresses outside it.
+anything whose cost grows with history size must not hold this lock,
+or an unrelated `bernstein tenant create` running alongside a
+scheduled verify fails outright with nothing created.
+
 ## Shipping to a SIEM
 
 bernstein ships in-process exporters for splunk HEC, elasticsearch,
@@ -449,10 +508,58 @@ rare benign causes:
 
 - partial write at process kill (last line truncated). expected to be
   unparseable JSON, not an hmac mismatch - both verifier paths log
-  this distinctly.
+  this distinctly. see [crash-truncated segments](#crash-truncated-segments)
+  for what the next append does about it.
 - key rotation done without archive-then-clear (see above).
 - legacy log written under the old `.hmac_key` filename, now read
   with the XDG-default key.
+
+### Crash-truncated segments
+
+a process killed between writing a record and writing its terminating
+newline leaves a segment whose last line is a fragment. left alone,
+the next append concatenates onto that fragment and produces one
+unparseable line holding both - which silently swallows a real record
+and makes the verifier report *fewer* errors than before.
+
+so the next append seals the fragment first: it writes the missing
+newline, so the fragment stays its own isolated line, and records a
+`chain.torn_record` event naming the segment and the byte offset.
+nothing is repaired and nothing is truncated - the log is append-only
+and the half-written record is gone for good.
+
+sealing has a consequence worth stating plainly. when the crash
+removed *only* the terminator of an otherwise complete record, putting
+that byte back leaves a segment with nothing wrong in it, and the hmac
+pillar goes from FAILED back to Passed. a cron job watching the exit
+code would stop alerting on its own, with nobody having looked.
+
+the `chain.torn_record` event is therefore its own durable fact, and
+`bernstein audit verify` keeps failing on it until an operator
+acknowledges it:
+
+```
+╭──────────────────────────────────────╮
+│ Chain Segment Damage UNACKNOWLEDGED  │
+╰──────────────────────────────────────╯
+  ! 2026-07-25.jsonl: record torn at byte 4193 (sealed 2026-07-25T09:12:44Z)
+```
+
+investigate first - the point of the alert is that a record was lost,
+and only you can say which one - then acknowledge it:
+
+```bash
+bernstein audit ack-tear \
+  --segment 2026-07-25.jsonl \
+  --offset 4193 \
+  --reason "kill -9 during host reboot; run r-8841 has no completion record"
+```
+
+the acknowledgement is appended to the chain, not written beside it.
+nothing is deleted or rewritten to clear the alert, so who signed the
+damage off, when, and why is as tamper-evident as the damage itself.
+it is keyed on `(segment, byte offset)`, so acknowledging one tear
+does not silence a later one in the same segment.
 
 ### Recovery procedure
 

@@ -520,6 +520,32 @@ class _RichGroup(click.Group):
             args = ["help-all"]
         return super().parse_args(ctx, args)
 
+    def invoke(self, ctx: click.Context) -> object:
+        """Run the subcommand, turning audit-chain lock faults into operator errors.
+
+        Contention on the audit chain is an operational condition, not a defect:
+        another process is inside a read-modify-append section and this one
+        waited out its budget. Letting the :class:`RuntimeError` subclasses
+        reach the terminal prints a traceback, which on the audit substrate
+        reads as corruption - the opposite of what happened. Every other failure
+        in these commands surfaces as ``Error: ...`` through
+        :class:`click.ClickException`, and so should this one. The message is
+        passed through unchanged: it already names how to find the holder and
+        warns against removing the lock file.
+
+        Handled once here rather than per command, so a command added later
+        cannot forget it. The import sits inside the handler because it is on
+        the error path only.
+        """
+        try:
+            return super().invoke(ctx)
+        except RuntimeError as exc:
+            from bernstein.core.security.audit import ChainLockMisuse, ChainLockUnavailable
+
+            if isinstance(exc, ChainLockUnavailable | ChainLockMisuse):
+                raise click.ClickException(str(exc)) from exc
+            raise
+
 
 def _background_startup(workdir: Path) -> dict[str, object]:
     """Run slow startup tasks + pre-import heavy modules in background thread."""

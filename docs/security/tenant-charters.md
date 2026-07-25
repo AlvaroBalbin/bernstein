@@ -92,10 +92,13 @@ membership key) resolves against full history, but a window reaching past the
 retention boundary yields fewer events than expected. Cut slices inside the
 retention window until that exporter is widened.
 
-Retention itself runs inside the chain transaction described below. Archiving a
+Retention publishes inside the chain transaction described below. Archiving a
 segment is a compress followed by an unlink, and a read landing between the two
 sees either that day's events twice or not at all. Neither needs a concurrent
-writer, and the second one reads as "no charter exists".
+writer, and the second one reads as "no charter exists". Only the publish - the
+rename and the unlink - is held under the transaction; the compress itself runs
+outside it, because its cost grows with the retention window and no exclusive
+lock may be held for that long.
 
 ## Concurrent writes
 
@@ -115,7 +118,7 @@ Two outcomes are reported differently, and the distinction matters:
 | Outcome | What you see | What to do |
 |---|---|---|
 | Another writer got there first | `a charter already exists for tenant 'acme'`, exit 1 | Nothing. This is the same answer you would get running the commands a minute apart. |
-| The transaction could not be acquired | `ChainLockUnavailable`, naming the audit directory | Investigate. Something is holding the lock, commonly a process that forked without `exec` and was then killed, leaving the duplicated descriptor alive. |
+| The transaction could not be acquired | `Error: could not acquire the audit chain transaction on ...`, exit 1 | Investigate. Something is holding the lock, commonly a process that forked without `exec` and was then killed, leaving the duplicated descriptor alive. |
 
 Identify the holder (`lsof .sdd/audit/.chain.lock`) rather than deleting the
 lock file. The lock's identity is the file's inode, so a fresh one admits a

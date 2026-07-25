@@ -32,13 +32,27 @@ from bernstein.core.security.audit import (
     AuditLog,
     ChainLockMisuse,
     ChainLockUnavailable,
-    _current_scope,
     _entry_for,
     _release_entry,
     chain_transaction,
 )
 
 KEY = b"k" * 32
+
+
+def _owned_here(entry: object) -> bool:
+    """Whether *entry* is owned by the scope that calls this.
+
+    Ownership is thread-object identity plus a token the owning thread holds in
+    its thread-local set, never a thread ident: idents are recycled.
+    """
+    from bernstein.core.security.audit import _current_task, _held_tokens
+
+    return (
+        entry.owner_thread is threading.current_thread()  # type: ignore[attr-defined]
+        and entry.owner_task is _current_task()  # type: ignore[attr-defined]
+        and entry.owner_token in _held_tokens()  # type: ignore[attr-defined]
+    )
 
 
 def _os_lock_is_free(audit_dir: Path) -> bool:
@@ -203,7 +217,7 @@ class TestTableDoesNotGrowWithoutBound:
             assert not _os_lock_is_free(held)
             entry = _entry_for(held)
             assert entry is not None
-            assert entry.owner == _current_scope()
+            assert _owned_here(entry)
             assert any(e is entry for e in _CHAIN_TABLE.values())
             _release_entry(entry)
 
@@ -355,6 +369,229 @@ class TestExitScope:
             pass
         assert _os_lock_is_free(audit_dir)
 
+    def test_reentering_one_live_instance_is_refused_rather_than_wedging_the_lock(self, tmp_path: Path) -> None:
+        """Re-entry on the *same object* is misuse, not nesting.
+
+        The instance carries the bookkeeping for exactly one acquisition. A
+        second ``__enter__`` on a live instance overwrote it, so the inner
+        ``__exit__`` cleared the instance and the outer ``__exit__`` became a
+        no-op: the OS lock stayed held for the life of the process with nothing
+        left able to release it. Nesting is done by opening a second instance.
+        """
+        audit_dir = tmp_path / "audit"
+        transaction = chain_transaction(audit_dir, timeout=5)
+        with transaction:
+            with pytest.raises(ChainLockMisuse, match="already open on this instance"):
+                transaction.__enter__()
+            # Refusing must not have disturbed the live section.
+            assert not _os_lock_is_free(audit_dir)
+
+        assert _os_lock_is_free(audit_dir), "the refused re-entry left the lock wedged"
+        # And a second instance still nests correctly.
+        with chain_transaction(audit_dir, timeout=5), chain_transaction(audit_dir, timeout=5):
+            assert not _os_lock_is_free(audit_dir)
+        assert _os_lock_is_free(audit_dir)
+
+    def test_one_instance_can_still_be_used_again_once_its_section_has_closed(self, tmp_path: Path) -> None:
+        """Refusing live re-entry must not refuse sequential reuse."""
+        audit_dir = tmp_path / "audit"
+        transaction = chain_transaction(audit_dir, timeout=5)
+        for _ in range(3):
+            with transaction:
+                assert not _os_lock_is_free(audit_dir)
+            assert _os_lock_is_free(audit_dir)
+
+    def test_exiting_out_of_order_is_refused_and_the_inner_scope_keeps_the_lock(self, tmp_path: Path) -> None:
+        """Reachable through ``ExitStack`` or a generator that holds a transaction.
+
+        The outer scope exiting first would release the lock while the inner
+        section is still running against it, and drive the depth counter to -1.
+        The thread/task check alone does not catch this: both scopes are the
+        same thread and the same task.
+        """
+        audit_dir = tmp_path / "audit"
+        entry = _entry_for(audit_dir)
+        assert entry is not None
+
+        outer = chain_transaction(audit_dir, timeout=5)
+        inner = chain_transaction(audit_dir, timeout=5)
+        outer.__enter__()
+        inner.__enter__()
+        try:
+            with pytest.raises(ChainLockMisuse, match="inner section is still open"):
+                outer.__exit__(None, None, None)
+            assert entry.depth == 2, "the refused exit changed the depth anyway"
+            assert not _os_lock_is_free(audit_dir), "the refused exit released the lock under the inner scope"
+        finally:
+            inner.__exit__(None, None, None)
+            outer.__exit__(None, None, None)
+        _release_entry(entry)
+
+        assert entry.depth == 0
+        assert _os_lock_is_free(audit_dir)
+
+
+# ---------------------------------------------------------------------------
+# Axis: a forked child inheriting the lock table
+# ---------------------------------------------------------------------------
+
+
+_FORK_SOURCE = textwrap.dedent(
+    """
+    import os, sys
+    from pathlib import Path
+    from bernstein.core.security.audit import chain_transaction, ChainLockUnavailable
+
+    audit_dir = Path(sys.argv[1])
+    # Warm the table in the parent, exactly as any prior append would.
+    with chain_transaction(audit_dir, timeout=10):
+        pass
+
+    read_fd, write_fd = os.pipe()
+    with chain_transaction(audit_dir, timeout=10):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with chain_transaction(audit_dir, timeout=0.4):
+                    verdict = b"CHILD-GOT-IN"
+            except ChainLockUnavailable:
+                verdict = b"CHILD-REFUSED"
+            except BaseException as exc:
+                verdict = b"CHILD-ERROR:" + type(exc).__name__.encode()
+            os.write(write_fd, verdict)
+            os._exit(0)
+        os.close(write_fd)
+        out = os.read(read_fd, 64)
+        os.waitpid(pid, 0)
+    print(out.decode(), flush=True)
+    """
+).strip()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() is POSIX-only")
+class TestForkedChild:
+    def test_a_child_forked_with_a_warm_table_cannot_take_the_parents_lock(self, tmp_path: Path) -> None:
+        """``fork`` duplicates the open file description, not merely the descriptor.
+
+        A POSIX ``flock`` belongs to the description, so ``LOCK_EX | LOCK_NB``
+        against a descriptor whose description already holds the lock
+        *succeeds*. A child that inherited a warm lock table therefore re-locked
+        its parent's own descriptor and both believed they held it: two writers
+        inside one read-modify-append section, which is the exact defect the
+        transaction exists to prevent.
+
+        Run out-of-process because the fork has to happen with the table warm
+        and the parent inside a section, which is not a state to leave a pytest
+        worker in.
+        """
+        audit_dir = tmp_path / "audit"
+        audit_dir.mkdir(parents=True)
+        script = tmp_path / "forker.py"
+        script.write_text(_FORK_SOURCE, encoding="utf-8")
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3] / "src")
+        proc = subprocess.run(
+            [sys.executable, str(script), str(audit_dir)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+            check=False,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "CHILD-REFUSED", f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# Axis: a stranded owner whose thread ident is recycled
+# ---------------------------------------------------------------------------
+
+
+_IDENT_REUSE_SOURCE = textwrap.dedent(
+    """
+    import sys, threading
+    from pathlib import Path
+    from bernstein.core.security.audit import chain_transaction, ChainLockUnavailable
+
+    audit_dir = Path(sys.argv[1])
+    stranded = []
+
+    def strand():
+        stranded.append(threading.get_ident())
+        chain_transaction(audit_dir, timeout=10).__enter__()  # entered, never exited
+
+    stranding = threading.Thread(target=strand)
+    stranding.start()
+    stranding.join(10)
+
+    # The successor lands on the dead holder's recycled ident. Presenting the
+    # ident is the whole simulation: it is the only thing a recycled thread
+    # shares with the dead one.
+    real_get_ident = threading.get_ident
+    threading.get_ident = lambda: stranded[0]
+
+    verdict = []
+    done = threading.Event()
+
+    def successor():
+        try:
+            with chain_transaction(audit_dir, timeout=0.4):
+                verdict.append("SUCCESSOR-GOT-IN")
+        except ChainLockUnavailable:
+            verdict.append("SUCCESSOR-REFUSED")
+        except BaseException as exc:
+            verdict.append("SUCCESSOR-ERROR:" + type(exc).__name__)
+        finally:
+            done.set()
+
+    threading.Thread(target=successor).start()
+    done.wait(60)
+    threading.get_ident = real_get_ident
+    print(verdict[0] if verdict else "SUCCESSOR-HUNG", flush=True)
+    """
+).strip()
+
+
+class TestStrandedOwner:
+    def test_a_thread_presenting_a_stranded_owners_ident_is_not_treated_as_the_owner(self, tmp_path: Path) -> None:
+        """Thread idents are recycled, so ownership must not be keyed on one.
+
+        A thread that entered and died without exiting leaves the entry owned
+        and the mutex held. The operating system is free to hand its ident to
+        the next thread, and an ownership check keyed on that ident then
+        matches: the new thread takes the re-entrant path with neither the
+        in-process mutex nor the OS lock, and appends inside a section it never
+        acquired. It was reachable on the first attempt.
+
+        Run out-of-process because presenting a recycled ident means replacing
+        ``threading.get_ident`` process-wide, which is not a state to leave a
+        pytest worker in - and because the stranded holder keeps its lock and
+        its mutex for the life of the process by construction.
+        """
+        audit_dir = tmp_path / "audit"
+        audit_dir.mkdir(parents=True)
+        script = tmp_path / "ident_reuse.py"
+        script.write_text(_IDENT_REUSE_SOURCE, encoding="utf-8")
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3] / "src")
+        proc = subprocess.run(
+            [sys.executable, str(script), str(audit_dir)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+            check=False,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "SUCCESSOR-REFUSED", (
+            f"a thread presenting the stranded owner's ident was admitted on the re-entrant path; "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Axis: how the section unwinds
@@ -371,7 +608,7 @@ class TestUnwind:
             raise RuntimeError("boom")
 
         assert entry.depth == 0
-        assert entry.owner is None
+        assert entry.owner_thread is None
         assert _os_lock_is_free(audit_dir)
 
     def test_an_exception_inside_a_nested_section_leaves_the_outer_holding(self, tmp_path: Path) -> None:
@@ -383,7 +620,7 @@ class TestUnwind:
             with contextlib.suppress(RuntimeError), chain_transaction(audit_dir, timeout=5):
                 raise RuntimeError("boom")
             assert entry.depth == 1
-            assert entry.owner == _current_scope()
+            assert _owned_here(entry)
             assert not _os_lock_is_free(audit_dir)
 
         assert entry.depth == 0
