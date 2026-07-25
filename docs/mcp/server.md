@@ -18,6 +18,14 @@ The streamable HTTP transport binds to loopback by default. Binding to a
 public interface requires a bearer token (see Auth) and is otherwise refused
 at startup.
 
+The streamable HTTP transport is served by a separate implementation
+(`bernstein.mcp.remote_transport`) from the stdio and SSE transports
+(`bernstein.mcp.server`). It exposes 8 tools rather than the full tier
+catalogue, and it enforces weaker argument validation than stdio; see
+[Validation scope](input-validation.md#validation-scope) and
+[Available tools](../cloudflare/cloudflare-mcp.md#available-tools). Unifying
+the two is tracked in issue #3083.
+
 ## Stateless serving
 
 The stateless MCP spec revision (2026-07-28) removes protocol sessions, and
