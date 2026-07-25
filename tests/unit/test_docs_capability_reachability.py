@@ -43,6 +43,7 @@ import ast
 import io
 import tokenize
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -181,17 +182,29 @@ def _matches(path: str, prefixes: tuple[str, ...]) -> bool:
     return any(path == prefix or path.startswith(prefix) for prefix in prefixes)
 
 
+@lru_cache(maxsize=1)
+def _code_only_sources(src_root: Path = _SRC_ROOT) -> tuple[tuple[str, str], ...]:
+    """``(repo-relative path, comment- and docstring-stripped source)`` for src/.
+
+    Cached because every watched capability scans the same tree, and stripping
+    it is the expensive half of this guard.
+    """
+    return tuple(
+        (path.relative_to(_REPO_ROOT).as_posix(), code_only(path.read_text(encoding="utf-8")))
+        for path in _python_files(src_root)
+    )
+
+
 def use_sites(capability: WatchedCapability, src_root: Path = _SRC_ROOT) -> list[str]:
     """Repo-relative files that count as a use site of ``capability.symbol``."""
     found: list[str] = []
-    for path in _python_files(src_root):
-        rel = path.relative_to(_REPO_ROOT).as_posix()
+    for rel, source in _code_only_sources(src_root):
         if capability.reach_paths is not None:
             if not _matches(rel, capability.reach_paths):
                 continue
         elif _matches(rel, capability.definition_paths):
             continue
-        if capability.symbol in code_only(path.read_text(encoding="utf-8")):
+        if capability.symbol in source:
             found.append(rel)
     return found
 
