@@ -194,6 +194,14 @@ _BODY_SCOPED_PROBES: dict[str, dict[str, Any]] = {
     "claim-batch": {"task_ids": ["{task_id}"], "agent_id": "probe-agent"},
 }
 
+# The response field each probe reports its successfully handled ids under, so
+# a permitted request is asserted to have actually run rather than merely to
+# have avoided a 403.
+_BODY_SCOPED_SUCCESS_FIELD: dict[str, str] = {
+    "batch-ops": "succeeded",
+    "claim-batch": "claimed",
+}
+
 
 @pytest.fixture
 def authed_app(tmp_path: Path) -> FastAPI:
@@ -234,6 +242,7 @@ def _probe_body(segment: str, task_id: str) -> dict[str, Any]:
 def test_body_scoped_segments_all_have_a_probe() -> None:
     """Every body-scoped segment is exercised by the tests below."""
     assert set(_BODY_SCOPED_PROBES) == set(TASK_BODY_SCOPED_SEGMENTS)
+    assert set(_BODY_SCOPED_SUCCESS_FIELD) == set(TASK_BODY_SCOPED_SEGMENTS)
 
 
 def test_body_scoped_segments_are_exempt_from_the_path_gate() -> None:
@@ -280,22 +289,26 @@ def test_body_scoped_routes_allow_the_agents_own_task(authed_app: FastAPI) -> No
         )
 
         assert response.status_code == 200, f"/tasks/{segment} -> {response.status_code} {response.text}"
+        assert own_id in response.json()[_BODY_SCOPED_SUCCESS_FIELD[segment]], f"/tasks/{segment} {response.text}"
 
 
 def test_body_scoped_routes_allow_an_unscoped_manager_token(authed_app: FastAPI) -> None:
     """A token with ``task_ids == []`` stays unrestricted, as on the path gate."""
-    victim_id = _create_task(authed_app, 40, "manager-target")
     store: Any = authed_app.state.identity_store
     _, token = store.create_identity("session-manager", "backend", task_ids=[])
 
     for index, segment in enumerate(sorted(TASK_BODY_SCOPED_SEGMENTS)):
+        # A task the manager token was never scoped to, fresh per segment so
+        # one probe cannot leave the next one nothing to act on.
+        target_id = _create_task(authed_app, 40 + index, f"manager-target-{segment}")
         response = _client(authed_app, 50 + index).post(
             f"/tasks/{segment}",
             headers={"Authorization": f"Bearer {token}"},
-            json=_probe_body(segment, victim_id),
+            json=_probe_body(segment, target_id),
         )
 
         assert response.status_code == 200, f"/tasks/{segment} -> {response.status_code} {response.text}"
+        assert target_id in response.json()[_BODY_SCOPED_SUCCESS_FIELD[segment]], f"/tasks/{segment} {response.text}"
 
 
 def test_batch_ops_scope_check_sees_the_normalised_id(authed_app: FastAPI) -> None:
