@@ -20,6 +20,9 @@ name: Required-check name canary
 #      `ci.yml::ci-gate` (real aggregator) and
 #      `ci-gate-stub.yml::ci-gate` (synthetic emitter for PRs whose diff
 #      is entirely paths-ignored by ci.yml). No other emitter allowed.
+#      The stub resolves its name from a guard verdict, so a quoted
+#      `CI gate` branch inside a `${{ ... }}` name counts as an emitter
+#      too - otherwise a third one could hide behind a template.
 #
 # Run modes:
 #   * pull_request -- only when a workflow file under `.github/workflows/`
@@ -76,6 +79,7 @@ jobs:
           from __future__ import annotations
 
           import os
+          import re
           import sys
           from pathlib import Path
 
@@ -170,6 +174,22 @@ jobs:
           # named "CI gate". Two emitters are intentional: ci.yml (real
           # aggregator) and ci-gate-stub.yml (synthetic success for
           # paths-ignored-only PRs).
+          #
+          # The stub resolves its check-run name from a guard verdict, so
+          # a job also counts as an emitter when `CI gate` appears as a
+          # quoted branch of a templated name (the expression markers are
+          # spelled via TEMPLATE_OPEN above so this file stays parseable).
+          # Matching only the bare literal would let a third emitter hide
+          # behind a template.
+          def emits_required_context(name: object) -> bool:
+              if not isinstance(name, str):
+                  return False
+              if name == REQUIRED_CONTEXT:
+                  return True
+              if TEMPLATE_OPEN not in name:
+                  return False
+              return REQUIRED_CONTEXT in re.findall(r"'([^']*)'", name)
+
           seen_emitters: set[tuple[Path, str]] = set()
           for wf_path in sorted(WORKFLOWS_DIR.glob("*.yml")):
               try:
@@ -182,7 +202,7 @@ jobs:
               for key, body in wf_jobs.items():
                   if not isinstance(body, dict):
                       continue
-                  if body.get("name") != REQUIRED_CONTEXT:
+                  if not emits_required_context(body.get("name")):
                       continue
                   seen_emitters.add((wf_path, key))
 
