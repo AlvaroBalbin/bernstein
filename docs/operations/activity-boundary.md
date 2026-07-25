@@ -1,15 +1,33 @@
 # Typed activity boundary
 
-The deterministic scheduler is validated for coding agents, but the same control
-plane runs research, browser/computer-use, data, and ops agents. The typed
-activity boundary is the one contract that lets any modality participate as a
-replayable step: every activity returns an artifact plus the hashes needed to
-replay it, so the scheduler stays deterministic and the agent stays an opaque
-stochastic activity behind a hash-in / hash-out contract.
+The deterministic scheduler is validated for coding agents. The typed activity
+boundary is the one contract another modality -- research, browser/computer-use,
+data, ops -- has to satisfy to participate as a replayable step: every activity
+returns an artifact plus the hashes needed to replay it, so the scheduler stays
+deterministic and the agent stays an opaque stochastic activity behind a
+hash-in / hash-out contract.
 
 ```
 bernstein activity verify <run>
 ```
+
+<!-- scope:activity-boundary-reachability start - delete this section when #2996 and #3110 land -->
+## Reachability today
+
+The boundary, its refusals, and `bernstein activity verify` ship and run on
+every crossing. The operator-facing route to a non-coding activity does not.
+
+| Surface | State on this release |
+|---|---|
+| Bundled adapters | All declare `git-diff` output; no adapter declares `OutputMode.ARTIFACT`. |
+| Worktree allocation | Does not branch on modality, so a non-git activity still gets a git worktree (#2996). |
+| Seed / plan / backlog files | Carry no field for a task's modality or artifact output (#3110). |
+| `agent_kind` on a role | Parsed, validated, and round-tripped by the team manifest. No scheduler code reads it, so setting it does not change how a run executes. |
+| `ResearchWorker` | Needs `fetch_fn` and `synthesise` injected by its caller. Neither a fetcher nor a synthesiser nor a CLI verb ships. |
+| Live browser driver | The `browser` extra is empty (`pyproject.toml`), so a default install gets the recorded-tape driver. Asking for a live driver raises a typed refusal naming the package to install. |
+
+A non-coding activity is therefore constructed through the Python API today.
+<!-- scope:activity-boundary-reachability end -->
 
 ## Why
 
@@ -57,7 +75,7 @@ of the content hash.
 
 ## Declaring a role's modality
 
-A team declares which modality a role runs as via `agent_kind` on its
+A team records which modality a role runs as via `agent_kind` on its
 `[[roles]]` entry (default `coding`, so existing manifests are unchanged):
 
 ```toml
@@ -65,6 +83,13 @@ A team declares which modality a role runs as via `agent_kind` on its
 agent_kind = "research"
 role = "scout"
 ```
+
+<!-- scope:activity-boundary-reachability start - delete this note when #2996 and #3110 land -->
+The key is parsed, validated against the known modalities, and round-tripped
+into the canonical manifest. It is not yet read on the execution path: a role
+that declares `agent_kind = "research"` runs exactly as it would without the
+key. Treat it as a forward-compatible declaration, not a dispatch switch.
+<!-- scope:activity-boundary-reachability end -->
 
 ## How verify reconstructs a run
 

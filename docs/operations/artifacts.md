@@ -78,6 +78,17 @@ completion_signals:
 `output_path` is where the agent writes its deliverable. Leave it empty and the
 task defaults to `.sdd/outbox/<task-id>/artifact`.
 
+<!-- scope:artifact-spec-reachability start - delete this note when #3110 lands -->
+**How to reach this today.** The block above is the shape of the task record,
+not a block a seed, plan, or backlog file parses. `artifact_spec` is accepted by
+`Task.from_dict` and read by the completion and janitor paths, but it is absent
+from the plan schema, the plan loader, the backlog parser, and every CLI option,
+so an operator sets it by constructing the task record directly (for example
+through the task server or `Task.from_dict`). Declaring it from a seed, plan, or
+backlog entry is tracked in #3110, and routing artifact-mode tasks away from the
+git-only paths in #2996.
+<!-- scope:artifact-spec-reachability end -->
+
 The bytes are read in the shape the kind expects: JSONL rows for `dataset` and
 `action_log`, a JSON object for `ops_result`, text for `report` (or a figures
 bundle when the file is one - see [Figure grounding](#figure-grounding-report-artifacts)).
