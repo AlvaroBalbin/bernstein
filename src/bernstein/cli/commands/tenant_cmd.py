@@ -73,7 +73,18 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
     )
 
     chain = _chain(workdir)
-    if read_charter_events(chain, tenant_id):
+    # The duplicate guard reads the *whole* history, archived segments
+    # included. A live-only read would let anyone open a second charter for an
+    # existing tenant once retention archived the opening day - an ownership
+    # takeover requiring no forgery, just patience.
+    try:
+        existing = read_charter_events(chain, tenant_id)
+    except CharterChainError as exc:
+        raise click.ClickException(
+            f"refusing to create {tenant_id!r}: its recorded charter history is unreadable ({exc}). "
+            f"Run 'bernstein tenant verify {tenant_id}' before creating anything."
+        ) from exc
+    if existing:
         raise click.ClickException(f"a charter already exists for tenant {tenant_id!r}")
 
     try:
@@ -136,10 +147,10 @@ def grant_cmd(tenant_id: str, principal: str, role: str, actor: str | None, work
     )
 
     chain = _chain(workdir)
-    events = read_charter_events(chain, tenant_id)
-    if not events:
-        raise click.ClickException(f"no charter for tenant {tenant_id!r}; run 'bernstein tenant create' first")
     try:
+        events = read_charter_events(chain, tenant_id)
+        if not events:
+            raise click.ClickException(f"no charter for tenant {tenant_id!r}; run 'bernstein tenant create' first")
         current = fold_charter(events)
         kind = CHARTER_ROLE_SET if current.is_member(principal) else CHARTER_MEMBER_ADD
         event = next_event(
@@ -183,10 +194,10 @@ def revoke_cmd(tenant_id: str, principal: str, actor: str | None, workdir: Path,
     )
 
     chain = _chain(workdir)
-    events = read_charter_events(chain, tenant_id)
-    if not events:
-        raise click.ClickException(f"no charter for tenant {tenant_id!r}")
     try:
+        events = read_charter_events(chain, tenant_id)
+        if not events:
+            raise click.ClickException(f"no charter for tenant {tenant_id!r}")
         event = next_event(
             events[-1],
             tenant_id=tenant_id,
@@ -250,12 +261,15 @@ def verify_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
     """Verify TENANT_ID's charter chain and report the offending event on failure.
 
     Exits non-zero when the event segment does not fold: a broken hash link, a
-    backdated event, a gap in the sequence, or a spliced foreign tenant.
+    backdated event, a gap in the sequence, a spliced foreign tenant, or a body
+    that cannot be read at all. Every one of those is a FAIL verdict naming the
+    offending event - never a traceback, which an operator cannot distinguish
+    from a broken tool.
     """
-    from bernstein.core.security.tenant_charter import read_charter_events, verify_charter_events
+    from bernstein.core.security.tenant_charter import verify_charter
 
     chain = _chain(workdir)
-    result = verify_charter_events(read_charter_events(chain, tenant_id), tenant_id=tenant_id)
+    result = verify_charter(chain, tenant_id)
     chain_ok, chain_errors = chain.verify()
 
     payload = result.to_dict()

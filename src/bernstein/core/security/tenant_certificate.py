@@ -359,11 +359,15 @@ def record_duty_refusal(chain: AuditChainStore, refusal: DutyRefusal) -> str:
 
 
 def read_duty_refusals(chain: AuditChainStore, tenant_id: str) -> list[DutyRefusal]:
-    """Read one tenant's recorded duty refusals back from the chain."""
+    """Read one tenant's recorded duty refusals back from the chain.
+
+    Archived segments are included: a refusal is evidence, and evidence that
+    disappears when retention runs is not evidence.
+    """
     from bernstein.core.security.audit_chain import EVENT_TENANT_DUTY_REFUSAL
 
     out: list[DutyRefusal] = []
-    for entry in chain.query(event_type=EVENT_TENANT_DUTY_REFUSAL, resource_id=tenant_id):
+    for entry in chain.query(event_type=EVENT_TENANT_DUTY_REFUSAL, resource_id=tenant_id, include_archived=True):
         body = (entry.details or {}).get("refusal")
         if not isinstance(body, dict):
             continue

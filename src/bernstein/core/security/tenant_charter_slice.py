@@ -18,6 +18,19 @@ written by a principal that charter never enrolled - is excluded, so a forged
 string cannot inject rows into someone else's slice. Excluded rows are reported
 rather than dropped silently (:attr:`CharterSlice.excluded_principals`), because
 a slice that quietly loses events is as bad for an audit as one that leaks them.
+
+Retention boundary
+------------------
+The *charter* is read from the full chain history, archived segments included,
+so membership is resolved correctly however long the tenant has existed. The
+*event window* is not: it comes from
+:func:`~bernstein.core.security.audit_multitenant.export_tenant_slice`, which
+reads live ``*.jsonl`` segments only. A window that reaches back past the
+retention boundary therefore yields fewer events than the operator expects.
+This is the shipped exporter's existing behaviour rather than something the
+charter key introduces - widening it changes the bundle contents for every
+caller of the v2 export and belongs in its own change. Until then, cut slices
+inside the retention window.
 """
 
 from __future__ import annotations

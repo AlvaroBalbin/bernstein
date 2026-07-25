@@ -43,6 +43,7 @@ the only way to alter the events behind that hash is to break a chain.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -59,7 +60,7 @@ from bernstein.core.cost.showback_canonical import (
 from bernstein.core.identity.delegation_scope import DecisionBinding
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Iterator, Sequence
 
     from bernstein.core.security.audit_chain import AuditChainStore
 
@@ -86,6 +87,7 @@ __all__ = [
     "next_event",
     "read_charter_events",
     "record_charter_event",
+    "verify_charter",
     "verify_charter_events",
 ]
 
@@ -148,6 +150,31 @@ def canonical_instant(moment: datetime | None = None) -> str:
     """Render *moment* (default: now) as the canonical fixed-width UTC instant."""
     value = (moment or datetime.now(tz=UTC)).astimezone(UTC)
     return value.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+@contextlib.contextmanager
+def _as_chain_error(seq: int | None, what: str, *, reason: str = "malformed_body") -> Iterator[None]:
+    """Convert value-level failures inside the fold into :class:`CharterChainError`.
+
+    A recorded event body is attacker-controlled input: a rewritten
+    ``budget_usd`` reaches :func:`nano_usd_from_decimal_str`, a rewritten quota
+    reaches :func:`int`, and a rewritten principal reaches
+    :func:`~bernstein.core.cost.showback_canonical.require_nfc`. Those raise
+    :class:`MoneyFormatError`, :class:`ValueError`, and
+    :class:`NonCanonicalTextError` respectively - none of which derive from
+    :class:`CharterChainError`.
+
+    Letting them escape would make the *verifier for a tamper-detection
+    feature* crash on tampering, which an operator cannot tell apart from a
+    tool bug. Every such failure is therefore reported as a chain error naming
+    the offending event, exactly like a broken hash link.
+    """
+    try:
+        yield
+    except CharterChainError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise CharterChainError(reason, f"{what}: {type(exc).__name__}: {exc}", seq=seq) from exc
 
 
 def _require_id(value: str, *, what: str) -> str:
@@ -459,9 +486,13 @@ def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
     * ``backdated`` - ``recorded_at`` moves backwards in ``seq`` order.
     * ``gap`` - ``seq`` is not contiguous from zero.
     * ``tenant_mismatch`` - two tenants' events were spliced together.
+    * ``malformed_body`` - a recorded body could not be interpreted at all (a
+      rewritten budget, quota, principal, or role). Reported as a chain error
+      naming the event rather than raised as a bare value error, so a verifier
+      never crashes on the tampering it exists to detect.
 
     Raises:
-        CharterChainError: on any of the above.
+        CharterChainError: on any of the above, and only that.
     """
     if not events:
         raise CharterChainError("empty", "cannot fold an empty charter event segment")
@@ -483,7 +514,8 @@ def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
 
     tenant_id = first.tenant_id
     members: dict[str, str] = {}
-    state = CharterState(tenant_id=tenant_id, version=1, head_event_hash=first.event_hash())
+    with _as_chain_error(first.seq, f"opening event of {tenant_id!r} cannot be hashed"):
+        state = CharterState(tenant_id=tenant_id, version=1, head_event_hash=first.event_hash())
     previous = first
 
     for event in events[1:]:
@@ -499,11 +531,13 @@ def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
                 f"charter events must be contiguous: seq {previous.seq} is followed by {event.seq}",
                 seq=event.seq,
             )
-        if event.prev_event_hash != previous.event_hash():
+        with _as_chain_error(previous.seq, f"event at seq {previous.seq} cannot be hashed"):
+            previous_hash = previous.event_hash()
+        if event.prev_event_hash != previous_hash:
             raise CharterChainError(
                 "broken_link",
                 f"event at seq {event.seq} points at {event.prev_event_hash} but its predecessor hashes to "
-                f"{previous.event_hash()}; the recorded history was altered after the fact",
+                f"{previous_hash}; the recorded history was altered after the fact",
                 seq=event.seq,
             )
         if event.recorded_at < previous.recorded_at:
@@ -519,7 +553,8 @@ def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
                 f"charter {tenant_id!r} was closed at seq {previous.seq}; seq {event.seq} follows it",
                 seq=event.seq,
             )
-        state = _apply(state, event, members)
+        with _as_chain_error(event.seq, f"event at seq {event.seq} ({event.kind}) has an unusable body"):
+            state = _apply(state, event, members)
         previous = event
 
     return state
@@ -549,18 +584,55 @@ class CharterVerification:
 
 
 def verify_charter_events(events: Sequence[CharterEvent], *, tenant_id: str = "") -> CharterVerification:
-    """Fold *events* and report the outcome instead of raising."""
+    """Fold *events* and report the outcome instead of raising.
+
+    This is the surface an operator's verifier calls, so it must return a
+    verdict for *every* input, including a deliberately malformed one. The fold
+    already reports body-level damage as :class:`CharterChainError`; the second
+    handler is a backstop so a path that was missed still yields a FAIL verdict
+    rather than a traceback an operator would read as a broken tool.
+    """
+    fallback_tenant = tenant_id or (events[0].tenant_id if events else "")
     try:
         state = fold_charter(events)
     except CharterChainError as exc:
         return CharterVerification(
             ok=False,
-            tenant_id=tenant_id or (events[0].tenant_id if events else ""),
+            tenant_id=fallback_tenant,
             reason=exc.reason,
             detail=str(exc),
             seq=exc.seq,
         )
+    except (ValueError, TypeError) as exc:  # pragma: no cover - backstop
+        return CharterVerification(
+            ok=False,
+            tenant_id=fallback_tenant,
+            reason="malformed_body",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
     return CharterVerification(ok=True, tenant_id=state.tenant_id, state=state)
+
+
+def verify_charter(chain: AuditChainStore, tenant_id: str) -> CharterVerification:
+    """Read *tenant_id*'s charter from the chain and fold it, reporting either way.
+
+    Reading is inside the guarded path deliberately: rebuilding a
+    :class:`CharterEvent` from a tampered body is itself a place that can fail,
+    so a caller that read first and folded inside a ``try`` would still crash on
+    exactly the input this is meant to diagnose.
+    """
+    try:
+        events = read_charter_events(chain, tenant_id)
+    except CharterChainError as exc:
+        return CharterVerification(ok=False, tenant_id=tenant_id, reason=exc.reason, detail=str(exc), seq=exc.seq)
+    if not events:
+        return CharterVerification(
+            ok=False,
+            tenant_id=tenant_id,
+            reason="no_charter",
+            detail=f"no charter events recorded for tenant {tenant_id!r}",
+        )
+    return verify_charter_events(events, tenant_id=tenant_id)
 
 
 # ---------------------------------------------------------------------------
@@ -590,17 +662,32 @@ def record_charter_event(chain: AuditChainStore, event: CharterEvent) -> str:
 
 
 def read_charter_events(chain: AuditChainStore, tenant_id: str) -> list[CharterEvent]:
-    """Read one tenant's charter events back from the chain, in chain order."""
+    """Read one tenant's charter events back from the chain, in chain order.
+
+    ``include_archived=True`` is not an optimisation knob here, it is a
+    correctness requirement. A charter is a *linkage* structure: every event
+    points at its predecessor, and the opening event is by definition the
+    oldest, so it is the first thing ordinary retention moves into
+    ``archive/``. A live-only read of an archived charter returns nothing,
+    which would make an intact charter look like it never existed - and would
+    let ``tenant create`` reopen a tenant that already has an owner.
+
+    Raises:
+        CharterChainError: if a recorded event body cannot be rebuilt.
+    """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
     out: list[CharterEvent] = []
-    for entry in chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id):
+    for entry in chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True):
         body = (entry.details or {}).get("charter")
         if not isinstance(body, dict):
             continue
         if str(body.get("tenant_id", "")) != tenant_id:
             continue
-        out.append(CharterEvent.from_body(body))
+        raw_seq = body.get("seq")
+        seq = raw_seq if isinstance(raw_seq, int) else None
+        with _as_chain_error(seq, f"recorded charter event for {tenant_id!r} is unreadable", reason="malformed_event"):
+            out.append(CharterEvent.from_body(body))
     return out
 
 

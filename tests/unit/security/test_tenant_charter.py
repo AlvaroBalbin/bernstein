@@ -31,6 +31,7 @@ from bernstein.core.security.tenant_certificate import (
     authorize_duty,
     mint_certificate,
     read_duty_refusals,
+    record_duty_refusal,
     require_duty,
 )
 from bernstein.core.security.tenant_charter import (
@@ -52,6 +53,7 @@ from bernstein.core.security.tenant_charter import (
     next_event,
     read_charter_events,
     record_charter_event,
+    verify_charter,
     verify_charter_events,
 )
 
@@ -713,3 +715,176 @@ class TestChainRoundTrip:
         with pytest.raises(CharterChainError) as excinfo:
             load_charter(chain, "nope")
         assert excinfo.value.reason == "no_charter"
+
+
+# ---------------------------------------------------------------------------
+# Retention: the charter readers must see archived segments
+# ---------------------------------------------------------------------------
+
+
+def _age_and_archive(audit_dir: Path, *, key: bytes = KEY) -> list[str]:
+    """Age the live segment and run ordinary retention over it.
+
+    Retention archives by the date in the filename, so renaming the live
+    segment to an old date and archiving is exactly what happens to a charter
+    that has simply been open for a while.
+    """
+    from bernstein.core.security.audit import AuditLog, RetentionPolicy
+
+    for path in sorted(audit_dir.glob("*.jsonl")):
+        path.rename(audit_dir / "2020-01-01.jsonl")
+    return list(AuditLog(audit_dir=audit_dir, key=key).archive(RetentionPolicy(retention_days=1)).archived)
+
+
+class TestCharterSurvivesRetention:
+    """A charter is a linkage structure, so its oldest event is archived first.
+
+    Reading only the live segment would make an intact charter look like it
+    never existed - and would let a second ``tenant create`` take the tenant.
+    """
+
+    def test_charter_still_folds_after_its_opening_segment_is_archived(self, tmp_path: Path) -> None:
+        audit_dir = tmp_path / "audit"
+        chain = AuditChainStore(audit_dir, key=KEY)
+        events = _segment()
+        for event in events:
+            record_charter_event(chain, event)
+        expected = fold_charter(events).charter_hash()
+
+        assert _age_and_archive(audit_dir) == ["2020-01-01.jsonl"]
+        assert not list(audit_dir.glob("*.jsonl")), "the live segment should be gone"
+
+        reread = AuditChainStore(audit_dir, key=KEY)
+        assert len(read_charter_events(reread, "acme")) == len(events)
+        assert load_charter(reread, "acme").charter_hash() == expected
+        assert verify_charter(reread, "acme").ok is True
+        assert reread.verify()[0] is True
+
+    def test_negative_control_a_live_only_read_loses_the_archived_charter(self, tmp_path: Path) -> None:
+        """The archived read is load-bearing, not defensive decoration."""
+        from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
+
+        audit_dir = tmp_path / "audit"
+        chain = AuditChainStore(audit_dir, key=KEY)
+        for event in _segment():
+            record_charter_event(chain, event)
+        _age_and_archive(audit_dir)
+
+        reread = AuditChainStore(audit_dir, key=KEY)
+        live_only = reread.query(event_type=EVENT_TENANT_CHARTER, resource_id="acme")
+        archived = reread.query(event_type=EVENT_TENANT_CHARTER, resource_id="acme", include_archived=True)
+        assert live_only == []
+        assert len(archived) == 4
+        # ...and the reader we ship uses the second one.
+        assert len(read_charter_events(reread, "acme")) == 4
+
+    def test_duty_refusals_survive_retention_too(self, tmp_path: Path) -> None:
+        charter = fold_charter(_segment())
+        cert = mint_certificate(charter, version="1", duties=frozenset({"spawn"}))
+        audit_dir = tmp_path / "audit"
+        chain = AuditChainStore(audit_dir, key=KEY)
+        refusal = authorize_duty(cert, charter, principal="bob", duty="approve", resource_id="gate-9")
+        assert refusal is not None
+        record_duty_refusal(chain, refusal)
+
+        _age_and_archive(audit_dir)
+        reread = AuditChainStore(audit_dir, key=KEY)
+        recorded = read_duty_refusals(reread, "acme")
+        assert len(recorded) == 1
+        assert recorded[0].certificate_hash == cert.certificate_hash()
+
+
+# ---------------------------------------------------------------------------
+# The verifier reports damage instead of crashing on it
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedBodiesAreReportedNotRaised:
+    """Every recorded body is attacker-controlled, so every parse of one is a
+    place the verifier could crash. A crash is indistinguishable from a broken
+    tool, which is precisely the outcome a tamperer wants."""
+
+    @staticmethod
+    def _record(tmp_path: Path, mutate) -> AuditChainStore:  # type: ignore[no-untyped-def]
+        audit_dir = tmp_path / "audit"
+        chain = AuditChainStore(audit_dir, key=KEY)
+        for event in _segment():
+            record_charter_event(chain, event)
+        log_path = next(iter(sorted(audit_dir.glob("*.jsonl"))))
+        patched: list[str] = []
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            body = (row.get("details") or {}).get("charter") or {}
+            if row.get("event_type") == EVENT_TENANT_CHARTER:
+                mutate(body)
+            patched.append(json.dumps(row))
+        log_path.write_text("\n".join(patched) + "\n", encoding="utf-8")
+        return AuditChainStore(audit_dir, key=KEY)
+
+    def test_a_rewritten_budget_yields_a_fail_verdict(self, tmp_path: Path) -> None:
+        def mutate(body: dict) -> None:  # type: ignore[type-arg]
+            if body.get("kind") == CHARTER_BUDGET_SET:
+                body["body"]["budget_usd"] = "1e9"
+
+        result = verify_charter(self._record(tmp_path, mutate), "acme")
+        assert result.ok is False
+        assert result.reason in {"malformed_body", "broken_link"}
+        assert result.detail
+
+    def test_a_rewritten_quota_yields_a_fail_verdict(self, tmp_path: Path) -> None:
+        def mutate(body: dict) -> None:  # type: ignore[type-arg]
+            if body.get("kind") == CHARTER_BUDGET_SET:
+                body["kind"] = CHARTER_QUOTA_SET
+                body["body"] = {"max_concurrent_tasks": "not-a-number"}
+
+        result = verify_charter(self._record(tmp_path, mutate), "acme")
+        assert result.ok is False
+        assert result.reason in {"malformed_body", "broken_link"}
+
+    def test_a_non_nfc_principal_yields_a_fail_verdict(self, tmp_path: Path) -> None:
+        def mutate(body: dict) -> None:  # type: ignore[type-arg]
+            if body.get("kind") == CHARTER_MEMBER_ADD:
+                body["body"]["principal"] = "alicé"
+
+        result = verify_charter(self._record(tmp_path, mutate), "acme")
+        assert result.ok is False
+        assert result.reason in {"malformed_body", "broken_link"}
+
+    def test_a_mapping_where_a_scalar_belongs_yields_a_fail_verdict(self, tmp_path: Path) -> None:
+        def mutate(body: dict) -> None:  # type: ignore[type-arg]
+            if body.get("kind") == CHARTER_MEMBER_ADD:
+                body["body"]["role"] = {"nested": "mapping"}
+
+        result = verify_charter(self._record(tmp_path, mutate), "acme")
+        assert result.ok is False
+
+    def test_a_corrupt_recorded_principal_is_reported_by_the_reader(self, tmp_path: Path) -> None:
+        """Damage to the event envelope is caught on read, still as a verdict."""
+
+        def mutate(body: dict) -> None:  # type: ignore[type-arg]
+            body["principal"] = "alicé"
+
+        result = verify_charter(self._record(tmp_path, mutate), "acme")
+        assert result.ok is False
+        assert result.reason == "malformed_event"
+
+    def test_fold_never_raises_a_bare_value_error_on_a_damaged_body(self, tmp_path: Path) -> None:
+        """The exception family the fold may raise is exactly CharterChainError."""
+
+        def mutate(body: dict) -> None:  # type: ignore[type-arg]
+            if body.get("kind") == CHARTER_BUDGET_SET:
+                body["body"]["budget_usd"] = "1e9"
+
+        chain = self._record(tmp_path, mutate)
+        try:
+            events = read_charter_events(chain, "acme")
+            fold_charter(events)
+        except CharterChainError:
+            pass  # the only acceptable failure
+        else:
+            pytest.fail("expected the damaged segment to be rejected")
+
+    def test_verify_charter_reports_a_missing_charter(self, tmp_path: Path) -> None:
+        result = verify_charter(AuditChainStore(tmp_path / "audit", key=KEY), "ghost")
+        assert result.ok is False
+        assert result.reason == "no_charter"

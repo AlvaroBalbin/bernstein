@@ -242,3 +242,97 @@ def test_group_is_registered_on_the_root_cli() -> None:
 
     assert "tenant" in cli.commands
     assert os.path.basename(__file__) == "test_tenant_cmd.py"
+
+
+def _age_and_archive(workdir: Path) -> list[str]:
+    """Run ordinary retention over the audit dir, archiving the opening segment."""
+    from bernstein.core.security.audit import AuditLog, RetentionPolicy
+
+    audit_dir = workdir / ".sdd" / "audit"
+    key = (workdir / "audit.key").read_bytes()
+    for path in sorted(audit_dir.glob("*.jsonl")):
+        path.rename(audit_dir / "2020-01-01.jsonl")
+    return list(AuditLog(audit_dir=audit_dir, key=key).archive(RetentionPolicy(retention_days=1)).archived)
+
+
+class TestCharterSurvivesRetentionThroughTheCli:
+    """Retention must not be a governance bypass.
+
+    Every one of these worked before the charter readers included archived
+    segments, which made ordinary log retention - not forgery - the cheapest
+    way to take over an existing tenant.
+    """
+
+    def test_a_second_create_is_refused_after_the_opening_segment_is_archived(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice"], workdir).exit_code == 0
+        assert _age_and_archive(workdir) == ["2020-01-01.jsonl"]
+
+        takeover = _run(["create", "acme", "--principal", "mallory"], workdir)
+        assert takeover.exit_code != 0
+        assert "already exists" in takeover.output
+
+        # The original owner is untouched.
+        shown = _run(["show", "acme", "--json"], workdir)
+        assert shown.exit_code == 0, shown.output
+        assert json.loads(shown.output)["state"]["members"] == [{"principal": "alice", "role": "owner"}]
+
+    def test_show_and_verify_still_work_after_archiving(self, workdir: Path) -> None:
+        created = _run(["create", "acme", "--principal", "alice", "--json"], workdir)
+        charter_hash = json.loads(created.output)["charter_hash"]
+        _age_and_archive(workdir)
+
+        shown = _run(["show", "acme", "--json"], workdir)
+        assert shown.exit_code == 0, shown.output
+        assert json.loads(shown.output)["charter_hash"] == charter_hash
+
+        verified = _run(["verify", "acme", "--json"], workdir)
+        assert verified.exit_code == 0, verified.output
+        payload = json.loads(verified.output)
+        assert payload["ok"] is True
+        assert payload["audit_chain_ok"] is True
+
+    def test_grant_still_extends_an_archived_charter(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice"], workdir).exit_code == 0
+        _age_and_archive(workdir)
+
+        granted = _run(["grant", "acme", "--principal", "bob", "--by", "alice", "--json"], workdir)
+        assert granted.exit_code == 0, granted.output
+        assert {m["principal"] for m in json.loads(granted.output)["state"]["members"]} == {"alice", "bob"}
+
+        revoked = _run(["revoke", "acme", "--principal", "bob", "--by", "alice", "--json"], workdir)
+        assert revoked.exit_code == 0, revoked.output
+        assert {m["principal"] for m in json.loads(revoked.output)["state"]["members"]} == {"alice"}
+
+
+class TestVerifyReportsDamageInsteadOfCrashing:
+    def _corrupt_budget(self, workdir: Path) -> None:
+        log_path = next(iter(sorted((workdir / ".sdd" / "audit").glob("*.jsonl"))))
+        patched: list[str] = []
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            body = (row.get("details") or {}).get("charter") or {}
+            if row.get("event_type") == EVENT_TENANT_CHARTER and body.get("kind") == "charter.budget_set":
+                body["body"]["budget_usd"] = "1e9"
+            patched.append(json.dumps(row))
+        log_path.write_text("\n".join(patched) + "\n", encoding="utf-8")
+
+    def test_a_rewritten_budget_exits_one_with_a_verdict(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice", "--budget-usd", "250.000000000"], workdir).exit_code == 0
+        self._corrupt_budget(workdir)
+
+        result = _run(["verify", "acme", "--json"], workdir)
+        assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["reason"] in {"malformed_body", "broken_link"}
+        assert payload["detail"]
+
+    def test_grant_on_a_damaged_charter_fails_cleanly(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice", "--budget-usd", "250.000000000"], workdir).exit_code == 0
+        self._corrupt_budget(workdir)
+
+        result = _run(["grant", "acme", "--principal", "bob", "--by", "alice"], workdir)
+        assert result.exit_code != 0
+        # A ClickException, not a traceback the operator has to interpret.
+        assert result.exception is None or isinstance(result.exception, SystemExit), result.exception

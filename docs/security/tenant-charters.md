@@ -60,6 +60,38 @@ go unnoticed:
 `bernstein tenant verify <id>` runs both layers and exits non-zero on either,
 printing the reason and the offending sequence number.
 
+A recorded body that cannot be interpreted at all — a rewritten `budget_usd`,
+quota, principal, or role — is reported as `malformed_body` (or
+`malformed_event` when the damage is to the event envelope). It is deliberately
+a FAIL verdict rather than a raised `MoneyFormatError` or `NonCanonicalTextError`:
+the verifier for a tamper-detection feature must report tampering, and an
+operator cannot distinguish a traceback from a broken tool.
+
+## Retention
+
+Charter reads include archived segments (`include_archived=True`), and this is a
+correctness requirement rather than a tuning choice. A charter is a linkage
+structure whose opening event is by definition the oldest, so it is the first
+thing ordinary retention compresses into `archive/`.
+
+A live-only read would mean that once the opening day aged out:
+
+- `tenant show` / `verify` report the charter as non-existent,
+- `grant` / `revoke` / `slice` / `showback` break permanently, and
+- **`tenant create` for the same tenant succeeds** — an ownership takeover of an
+  existing tenant achieved by waiting for retention, with no forgery and no
+  chain break.
+
+The duplicate-charter guard therefore reads the full history too. Duty refusals
+are read the same way: a refusal is evidence, and evidence that disappears when
+retention runs is not evidence.
+
+One boundary remains: `tenant slice`'s *event window* comes from the shipped v2
+exporter, which reads live segments only. The charter (and therefore the
+membership key) resolves against full history, but a window reaching past the
+retention boundary yields fewer events than expected. Cut slices inside the
+retention window until that exporter is widened.
+
 ## Certificates: what a run may do
 
 A charter says who belongs to a tenant. A **tenant certificate** says what a run
