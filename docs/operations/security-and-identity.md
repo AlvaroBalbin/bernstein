@@ -89,7 +89,11 @@ rejected.
    so a task route added later is covered without editing the middleware;
    the only exemptions are the collection routes under `/tasks/`
    (`TASK_COLLECTION_SEGMENTS` in `auth_middleware.py`), which address the
-   collection rather than one task.
+   collection rather than one task. The two collection routes that name
+   existing tasks in their request body (`/tasks/batch-ops`,
+   `/tasks/claim-batch`) apply the same rule at the handler via
+   `enforce_agent_task_scope_for_ids`, so an identity is bound to the same
+   tasks whether the id arrives in the path or in the body.
 4. Returns `JSONResponse(401)` on any verification failure.
 
 **Revocation.**

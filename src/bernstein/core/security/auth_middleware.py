@@ -27,10 +27,14 @@ validates that the task ID appears in the token's ``task_ids`` claim.  The
 check is deny-by-default over the whole ``/tasks/{id}/...`` surface (and its
 ``/api/v1`` mirror) rather than an enumeration of action names, so a task
 route added later is covered without touching this module; only the
-collection routes in ``TASK_COLLECTION_SEGMENTS`` are exempt.  A token
-without a task scope (``task_ids == []``) is treated as unrestricted
-(manager / orchestrator tokens), and non-agent credentials (SSO users, the
-legacy operator bearer, the cluster secret) never reach this check at all.
+collection routes in ``TASK_COLLECTION_SEGMENTS`` are exempt.  The two
+collection routes that name existing tasks in their request body
+(``TASK_BODY_SCOPED_SEGMENTS``) apply the same rule at the handler through
+:func:`enforce_agent_task_scope_for_ids`, so an identity is bound to the same
+tasks whether the id arrives in the path or in the body.  A token without a
+task scope (``task_ids == []``) is treated as unrestricted (manager /
+orchestrator tokens), and non-agent credentials (SSO users, the legacy
+operator bearer, the cluster secret) never reach this check at all.
 
 RFC 8707 resource indicators
 ----------------------------
@@ -58,7 +62,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from fastapi import Request
     from starlette.responses import Response as StarletteResponse
@@ -88,17 +92,37 @@ logger = logging.getLogger(__name__)
 # ``TASK_COLLECTION_SEGMENTS`` are exempt.
 _TASK_ID_PATH_RE = re.compile(r"^(?:/api/v\d+)?/tasks/(?P<task_id>[^/]+)(?:/.*)?$")
 
+# Collection routes registered directly under ``/tasks/`` that name an
+# EXISTING task id in the request body rather than in the path.  The
+# path-level gate cannot see a request body, so these routes carry the same
+# rule at the handler by calling :func:`enforce_agent_task_scope_for_ids` on
+# the ids they are about to act on.  Without that call a token scoped to task
+# A could cancel task B through ``POST /tasks/batch-ops`` while
+# ``POST /tasks/B/cancel`` denied it - the same operation, one path over.
+TASK_BODY_SCOPED_SEGMENTS: Final[frozenset[str]] = frozenset(
+    {
+        "batch-ops",
+        "claim-batch",
+    }
+)
+
 # Segments that sit where a task id would but are NOT task ids: collection
-# routes registered directly under ``/tasks/``.  Each entry is exempt because
-# it addresses the task collection rather than one task, so there is no task
-# id to bind the agent identity to:
+# routes registered directly under ``/tasks/``.  Each entry is exempt from
+# the path-level check because it addresses the task collection rather than
+# one task, so there is no task id in the path to bind the identity to:
 #
 #   archive, counts, graph, search  - read-only collection queries
-#   next                            - ``GET /tasks/next/{role}`` claim-next
-#   batch, claim-batch, batch-ops   - collection writes; the affected ids
-#                                     live in the request body, which this
-#                                     path-level gate cannot inspect
-#   claim-receipt                   - claim receipt lookup for the caller
+#   next                            - ``GET /tasks/next/{role}`` claim-next;
+#                                     the server picks the row, the caller
+#                                     cannot name one
+#   batch                           - creates NEW tasks, so no existing id
+#                                     can be in scope yet
+#   batch-ops, claim-batch          - name existing ids in the body; scoped
+#                                     at the handler, see
+#                                     ``TASK_BODY_SCOPED_SEGMENTS`` above
+#   claim-receipt                   - claims the next eligible backlog row
+#                                     for the caller; like ``next``, the
+#                                     caller cannot name a task
 #   self-create                     - an agent decomposing its own work
 #                                     creates a NEW task, so no existing id
 #                                     can be in scope yet
@@ -108,19 +132,20 @@ _TASK_ID_PATH_RE = re.compile(r"^(?:/api/v\d+)?/tasks/(?P<task_id>[^/]+)(?:/.*)?
 # collection route fails that test until it is exempted deliberately, and a
 # new ``/tasks/{task_id}/...`` route needs no change here because it is
 # covered by default.
-TASK_COLLECTION_SEGMENTS: Final[frozenset[str]] = frozenset(
-    {
-        "archive",
-        "batch",
-        "batch-ops",
-        "claim-batch",
-        "claim-receipt",
-        "counts",
-        "graph",
-        "next",
-        "search",
-        "self-create",
-    }
+TASK_COLLECTION_SEGMENTS: Final[frozenset[str]] = (
+    frozenset(
+        {
+            "archive",
+            "batch",
+            "claim-receipt",
+            "counts",
+            "graph",
+            "next",
+            "search",
+            "self-create",
+        }
+    )
+    | TASK_BODY_SCOPED_SEGMENTS
 )
 
 # ---------------------------------------------------------------------------
@@ -793,3 +818,74 @@ def _check_agent_task_scope(path: str, allowed_task_ids: list[str]) -> str | Non
     if task_id not in allowed_task_ids:
         return f"Task {task_id!r} is not in this agent's task scope (allowed: {allowed_task_ids})"
     return None
+
+
+def check_agent_task_scope_ids(
+    allowed_task_ids: Sequence[str],
+    requested_task_ids: Iterable[str],
+) -> str | None:
+    """Return an error message if any requested task id is out of scope.
+
+    The body-carried counterpart of :func:`_check_agent_task_scope`, applying
+    the same rule to ids a caller names in a request body instead of in the
+    path.  An empty ``allowed_task_ids`` means an unrestricted (manager)
+    token and permits everything, exactly as the path-level gate does.
+
+    Args:
+        allowed_task_ids: Task IDs the agent token is scoped to.
+        requested_task_ids: Task IDs the request is about to act on.
+
+    Returns:
+        Error message string if access should be denied, None otherwise.
+    """
+    if not allowed_task_ids:
+        return None
+    allowed = set(allowed_task_ids)
+    out_of_scope = sorted({task_id for task_id in requested_task_ids if task_id not in allowed})
+    if not out_of_scope:
+        return None
+    return f"Tasks {out_of_scope} are not in this agent's task scope (allowed: {list(allowed_task_ids)})"
+
+
+def enforce_agent_task_scope_for_ids(request: Request, requested_task_ids: Iterable[str]) -> None:
+    """Deny a task-scoped agent that names a task outside its scope in a body.
+
+    Collection routes under ``/tasks/`` take the affected ids from the request
+    body, which the path-level middleware gate cannot inspect.  Handlers for
+    the segments in :data:`TASK_BODY_SCOPED_SEGMENTS` call this with the ids
+    they are about to act on, so the same identity is bound to the same tasks
+    whichever route names them.
+
+    Pass the ids the handler will actually use, after any normalisation it
+    applies - checking the raw input while acting on a rewritten value would
+    let a rewrite carry an id past the check.
+
+    No-op for every credential that is not a task-scoped agent identity:
+    operator bearer tokens, SSO users, the cluster secret, unscoped manager
+    agent tokens (``task_ids == []``), and requests served with auth disabled
+    never set (or never populate) ``request.state.agent_identity``.
+
+    Args:
+        request: The active request, carrying the resolved agent identity.
+        requested_task_ids: Task IDs the handler is about to act on.
+
+    Raises:
+        HTTPException: 403 when any requested id is outside the agent's scope.
+    """
+    identity = getattr(request.state, "agent_identity", None)
+    if identity is None:
+        return
+    error = check_agent_task_scope_ids(getattr(identity, "task_ids", None) or [], requested_task_ids)
+    if error is None:
+        return
+    from fastapi import HTTPException
+
+    from bernstein.core.security.sanitize import sanitize_log
+
+    logger.warning(
+        "Agent %s denied task-scope access to %s: %s",
+        sanitize_log(str(getattr(identity, "id", "unknown"))),
+        sanitize_log(request.url.path),
+        sanitize_log(error),
+    )
+    raise HTTPException(status_code=403, detail=error)

@@ -29,6 +29,7 @@ from bernstein.core.eu_ai_act import (
 from bernstein.core.lifecycle import IllegalTransitionError
 from bernstein.core.role_classifier import classify_role
 from bernstein.core.routes._rate_limit_headers import rate_limit_exception
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 from bernstein.core.security.sanitize import sanitize_log
 
 # Import Pydantic models from server - this works because server.py's
@@ -1090,6 +1091,11 @@ async def claim_batch(body: BatchClaimRequest, request: Request) -> BatchClaimRe
             detail=_DRAINING_DETAIL,
         )
     with start_span("task.claim_batch", {"agent_id": body.agent_id, "task_count": len(body.task_ids)}):
+        # The ids arrive in the body, so the path-level agent task-scope gate
+        # in the middleware cannot see them: a token scoped to task A would
+        # otherwise claim task B here after being denied on
+        # ``POST /tasks/B/claim``.
+        enforce_agent_task_scope_for_ids(request, body.task_ids)
         store = _get_store(request)
         tenant_id = _resolve_request_tenant_scope(request)
         # Tenant authorization is enforced inside store.claim_batch under
