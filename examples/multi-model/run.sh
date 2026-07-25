@@ -38,7 +38,7 @@ if [[ ${#AGENTS[@]} -eq 0 ]]; then
     echo "  npm install -g @anthropic-ai/claude-code   # Claude Code"
     echo "  npm install -g @openai/codex               # Codex"
     echo "  npm install -g @google/gemini-cli          # Gemini"
-    echo "  npm install -g qwen-code                   # Qwen"
+    echo "  npm install -g @qwen-code/qwen-code        # Qwen"
     exit 1
 fi
 
