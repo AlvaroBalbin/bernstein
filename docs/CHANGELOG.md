@@ -16,6 +16,15 @@ All notable project changes are tracked here (code + docs).
   structured tool error instead of a `status`. Both the stdio server and the
   remote HTTP transport route through the same barrier. See
   [`docs/mcp/server.md`](mcp/server.md). Refs #3080.
+- `bernstein_stop` screens the `workdir` for shape before it reads the
+  filesystem. Resolving a path stats one entry per component, and the remote
+  HTTP transport applies no tool schema, so the caller previously chose how
+  many components the barrier walked. **Behaviour change:** a `workdir` that
+  is not text, or is longer than a path may be on this filesystem, is now
+  refused on its byte count with the same structured tool error, before any
+  resolve. An input the filesystem cannot represent, such as an embedded NUL,
+  is reported as that error too rather than as a raw filesystem message.
+  Refs #3080.
 
 ### Added
 

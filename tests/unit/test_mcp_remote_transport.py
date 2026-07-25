@@ -522,6 +522,34 @@ class TestToolExecution:
         assert "status" not in text
         assert list(victim.iterdir()) == []
 
+    @pytest.mark.anyio
+    async def test_stop_tool_refuses_a_workdir_the_filesystem_cannot_address(
+        self, transport: StreamableHTTPTransport, tmp_path: object
+    ) -> None:
+        """This surface applies no tool schema, so the barrier owns the refusal.
+
+        The stdio server bounds ``workdir`` in its tool schema before the
+        handler runs. This transport serves the tool straight from the
+        JSON-RPC arguments, so a workdir that cannot name a directory reaches
+        the barrier unfiltered and must come back as the barrier's own
+        refusal rather than a raw filesystem message.
+        """
+        from pathlib import Path
+
+        unaddressable = f"{Path(str(tmp_path))}/pro\x00ject"
+        body = _jsonrpc_request(
+            "tools/call",
+            {"name": "bernstein_stop", "arguments": {"workdir": unaddressable}},
+        )
+        status, _, resp_body = await transport.handle_request("POST", "/mcp", {}, body)
+        assert status == 200
+        data = json.loads(resp_body)
+        text = _tool_result(data["result"]["content"][0]["text"])
+        assert "error" in text
+        assert "status" not in text
+        assert "workdir" in text["error"]
+        assert "lstat" not in text["error"]
+
 
 # ---------------------------------------------------------------------------
 # CORS headers tests

@@ -268,6 +268,9 @@ and drains on. The `workdir` arrives from the caller, so the tool applies the
 same containment barrier the run-journal readers use before it touches the
 filesystem:
 
+- The workdir is screened for shape first, with no filesystem call: a value
+  that is not text, or that is longer than a path may be on this filesystem
+  (`MAX_PATH_BYTES`), cannot address a directory and is refused up front.
 - The workdir is resolved, and the signal path is rebuilt through the shared
   containment helper. A `.sdd`, `runtime`, `signals`, or `SHUTDOWN` entry that
   is a symlink pointing out of the resolved root is refused, because the write
@@ -288,6 +291,15 @@ Resolving the path is not the barrier on its own: `resolve()` follows symlinks
 but does not fold case, so on a case-insensitive filesystem a resolved path is
 normalised rather than canonical. Containment against the root as resolved in
 that same call is what decides whether the write stays inside.
+
+Resolving is also not free. It stats one entry per path component, and the
+remote HTTP transport serves this tool straight from the JSON-RPC arguments
+with no tool schema in front of it, so the caller picks the length. That is
+why the shape screen runs first: an over-long `workdir` is refused on its byte
+count rather than walked component by component on the serving event loop.
+Every refusal, including one from an input the filesystem cannot represent
+such as an embedded NUL, comes back as the same structured tool error rather
+than a raw filesystem message.
 
 ## Running the pull-worker loop over MCP
 

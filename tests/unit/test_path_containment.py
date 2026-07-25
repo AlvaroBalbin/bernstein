@@ -1089,3 +1089,76 @@ async def test_bernstein_stop_refuses_a_symlinked_sdd_and_leaves_the_target_alon
 
     assert "error" in payload
     assert not (victim / ".sdd" / "runtime").exists()
+
+
+# ---------------------------------------------------------------------------
+# The barrier must refuse before it walks the filesystem
+# ---------------------------------------------------------------------------
+#
+# ``workdir`` reaches the barrier unbounded on the remote HTTP surface: that
+# transport serves the tool straight from the JSON-RPC arguments and applies
+# no tool schema, so the caller picks the length. Resolving a path stats one
+# entry per component, so an over-long workdir turns a single request into
+# an unbounded run of blocking syscalls on the serving event loop. The length
+# a path may occupy is already decided by ``MAX_PATH_BYTES``, so a workdir
+# past it can never address a directory and there is nothing to learn from
+# walking it.
+
+
+def _counting_lstat(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count ``os.lstat`` calls made while resolving a path."""
+    import os
+
+    seen = {"calls": 0}
+    real = os.lstat
+
+    def counted(path: Any, *args: Any, **kwargs: Any) -> Any:
+        seen["calls"] += 1
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", counted)
+    return seen
+
+
+def test_shutdown_signal_path_refuses_an_over_long_workdir_without_walking_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workdir past the path limit is refused before any filesystem call.
+
+    Deliberately not a timing assertion: the property is that the barrier
+    consults no filesystem entry at all for an input that cannot name one.
+    """
+    from bernstein.mcp.signal_paths import ShutdownSignalPathError, shutdown_signal_path
+
+    over_long = "/" + "/".join(["a"] * MAX_PATH_BYTES)
+    seen = _counting_lstat(monkeypatch)
+
+    with pytest.raises(ShutdownSignalPathError):
+        shutdown_signal_path(over_long)
+
+    assert seen["calls"] == 0, f"resolved {seen['calls']} components of a workdir that cannot name a directory"
+
+
+def test_shutdown_signal_path_still_accepts_a_workdir_at_the_addressable_limit(tmp_path: Path) -> None:
+    """The bound refuses only what cannot exist, not ordinary deep projects."""
+    from bernstein.mcp.signal_paths import shutdown_signal_path
+
+    project = _make_project(tmp_path / ("d" * 200) / ("e" * 200))
+
+    resolved = shutdown_signal_path(str(project))
+
+    assert resolved.is_relative_to(project.resolve())
+
+
+def test_shutdown_signal_path_refuses_a_workdir_the_filesystem_cannot_address(tmp_path: Path) -> None:
+    """A workdir carrying a NUL is refused as a containment error.
+
+    The barrier documents one refusal type. A raw ``ValueError`` from the
+    resolve escapes the ``except ShutdownSignalPathError`` both handlers
+    guard with, so the caller sees an unhandled failure instead of the
+    structured tool error.
+    """
+    from bernstein.mcp.signal_paths import ShutdownSignalPathError, shutdown_signal_path
+
+    with pytest.raises(ShutdownSignalPathError):
+        shutdown_signal_path(f"{tmp_path}/pro\x00ject")
