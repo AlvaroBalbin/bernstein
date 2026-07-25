@@ -280,6 +280,8 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "sla",
         # Bot-added: drift autofix (regen_contract_drift.py)
         "team",
+        # Chain-governed team boundaries: charter fold + showback (issue #2554)
+        "tenant",
         # Audited webhook-node receipts: signed inbound + outbound (issue #2310)
         "webhook",
         # Typed activity boundary: verify any-modality activity crossings (issue #2311)

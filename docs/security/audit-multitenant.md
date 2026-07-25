@@ -277,6 +277,41 @@ operators can enforce the policy themselves.
 - **ISO 27001:2022 A.12.4** - the head signature lets the audit log
   artefact be archived independently of the orchestrator runtime.
 
+## Charter-governed boundary
+
+`export_tenant_slice` keys on `details.tenant_id`. That field is free-form:
+any caller may write it, so on its own the slice boundary is a string rather
+than a governed record.
+
+A [tenant charter](tenant-charters.md) supplies the governed record.
+`bernstein tenant slice <id>` (or `export_charter_slice`) produces the same v2
+bundle through the same exporter, and adds one filter: the event's attributed
+principal — `details.principal`, falling back to `actor` — must be a member of
+the folded charter.
+
+```python
+from bernstein.core.security.tenant_charter import load_charter
+from bernstein.core.security.tenant_charter_slice import export_charter_slice
+
+charter = load_charter(chain, "acme")
+result = export_charter_slice(audit_dir, charter, since=..., until=..., key=key)
+result.excluded_principals  # (("mallory", 1),)
+```
+
+Consequences:
+
+- An event that merely *claims* `tenant_id: acme`, written by a principal the
+  acme charter never enrolled, does not enter the acme slice.
+- Excluded principals are reported with their event counts rather than dropped
+  silently, so a service identity that was never enrolled surfaces as a warning
+  instead of a short slice.
+- The bundle format is unchanged: the slice still re-chains, still anchors, and
+  still verifies with `verify_tenant_slice` against the shared head.
+
+`export_tenant_slice` takes the membership set through an optional `principals`
+argument. Omitting it preserves the historical tenant-id-only behaviour, so
+existing callers and bundles are unaffected.
+
 ## References
 
 - W3C Verifiable Credentials Data Model 2.0
