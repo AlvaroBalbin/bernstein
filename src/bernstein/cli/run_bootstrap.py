@@ -1573,13 +1573,6 @@ def exec_restart() -> None:
         "cache policy are unaffected."
     ),
 )
-@click.option(
-    "--fresh",
-    "force_fresh",
-    is_flag=True,
-    default=False,
-    help="Ignore any saved session and start from scratch.",
-)
 def run(
     plan_file: Path | None,
     goal: str | None,
