@@ -1018,7 +1018,7 @@ def anchor_admission_receipt_in_lineage(
     """Seal one admission receipt as a signed lineage entry. Returns its hash.
 
     Anchors the receipt the way every other Bernstein receipt subsystem does
-    -- through :func:`bernstein.core.lineage.recorder.seal_write` -- so the
+    -- through :func:`bernstein.core.lineage.signed_write.seal_write` -- so the
     receipt carries an Ed25519 detached-JWS signature and an operator-HMAC
     envelope on top of its content address. The artefact path is derived from
     the adapter key and the fingerprint, so successive receipts for one
@@ -1042,7 +1042,7 @@ def anchor_admission_receipt_in_lineage(
     Returns:
         The lineage entry hash.
     """
-    from bernstein.core.lineage.recorder import seal_write
+    from bernstein.core.lineage.signed_write import seal_write
 
     view = AdapterAdmissionReceipt(receipt)
     sha = view.sha256

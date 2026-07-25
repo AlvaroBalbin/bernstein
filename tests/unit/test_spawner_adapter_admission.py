@@ -130,6 +130,29 @@ def test_off_policy_skips_the_gate_entirely(
     assert _admission_events(tmp_path) == []
 
 
+def test_unregistered_adapter_name_is_refused_not_crashed(
+    tmp_path: Path,
+    mock_adapter_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawner can hold an adapter that was injected, not registry-resolved.
+
+    Test doubles and third-party adapters are both constructed directly and
+    handed to the spawner, so their name need not resolve in ``_ADAPTERS``.
+    The gate must record a refusal for such a name rather than raising the
+    registry's "unknown adapter" ``ValueError`` out of an unrelated preflight.
+    """
+    monkeypatch.delenv(_POLICY_ENV, raising=False)
+    spawner = _spawner(tmp_path, mock_adapter_factory())
+
+    spawner._preflight_adapter_admission("mockcli")
+
+    events = _admission_events(tmp_path)
+    assert len(events) == 1
+    assert events[0].details["adapter"] == "mockcli"  # type: ignore[attr-defined]
+    assert events[0].details["verdict"] == VERDICT_REFUSE  # type: ignore[attr-defined]
+
+
 def test_mock_adapter_is_never_gated(
     tmp_path: Path,
     mock_adapter_factory,
