@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import json
 import logging
 import os
@@ -76,10 +77,10 @@ from bernstein.core.protocols.mcp.tool_tiers import (
 )
 from bernstein.mcp.cost_meter import measure_call, wrap_envelope
 from bernstein.mcp.input_validation import (
-    ValidatedPayload,
     ValidationError,
-    to_jsonrpc_error,
-    validate_tool_call,
+    get_registry,
+    validate_or_error,
+    validation_error_response,
 )
 
 _orig_convert_result = FuncMetadata.convert_result
@@ -120,6 +121,12 @@ _SERVER_INSTRUCTIONS = (
 # Timeout for all httpx calls to the task server (seconds).
 _HTTP_TIMEOUT = 5.0
 
+# Advisory delay a caller should wait before its first poll of a run handle,
+# reported as ``poll_after_ms`` on the ``bernstein_run`` response. Matches the
+# ``pollInterval`` carried on the projected Tasks-extension task, so a client
+# that reads either field paces itself the same way.
+_POLL_AFTER_MS = 5000
+
 # Env var holding the bearer token the task server expects when auth is
 # enabled. When unset, MCP tools fall back to sending no Authorization
 # header so the default unauth task-server mode keeps working.
@@ -157,29 +164,13 @@ def _error_response(exc: Exception, *, hint: str = "Task server may be restartin
 
 
 def _validation_error_response(err: ValidationError) -> str:
-    """Render a validation failure as the JSON string FastMCP tools return.
-
-    Carries the full structured error so MCP clients can show users which
-    field failed and why, without leaking server internals.
-    """
-    payload = {"error": err.message, "jsonrpc_error": to_jsonrpc_error(err)}
-    return json.dumps(payload)
+    """Render a validation failure as the JSON string FastMCP tools return."""
+    return validation_error_response(err)
 
 
 def _validate_or_error(tool_name: str, params: dict[str, Any]) -> ValidationError | None:
-    """Validate ``params`` against ``tool_name``'s schema.
-
-    Returns ``None`` when the call is allowed, or a ``ValidationError`` the
-    caller should render via :func:`_validation_error_response`. Stripping
-    ``None`` values from the params dict keeps every tool's optional-arg
-    convention working; the schema can still mark them as nullable when
-    that's the intended contract.
-    """
-    cleaned = {k: v for k, v in params.items() if v is not None}
-    result = validate_tool_call(tool_name, cleaned)
-    if isinstance(result, ValidatedPayload):
-        return None
-    return result
+    """Validate ``params`` against ``tool_name``'s schema."""
+    return validate_or_error(tool_name, params)
 
 
 def _register_health_tool(mcp: FastMCP[None]) -> None:
@@ -214,6 +205,57 @@ def _get_journal_head(task_id: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _resolve_run_journal(sdd_dir: Path, run_id: str) -> tuple[str, Path]:
+    """Return the ``(run id, journal path)`` a poll identifier resolves to.
+
+    A caller of ``bernstein_task_handle`` holds whichever identifier
+    ``bernstein_run`` handed it: the task id, or the journal run id that
+    :func:`bernstein.core.tasks.checkpoint_retry.task_run_id` derives from
+    the task id. Both must reach the same journal, and the order is fixed so
+    an identifier can never resolve two ways:
+
+    1. ``run_id`` read as a journal run id, when that journal exists on disk.
+    2. ``task_run_id(run_id)``, when that journal exists on disk.
+    3. ``run_id`` as given, so an identifier with no journal at all keeps
+       projecting the empty working handle it projects today.
+
+    Rule 1 before rule 2 is what makes a task id already shaped like
+    ``task-*`` unambiguous: it names its own journal if one exists, and only
+    otherwise is it slugified a second time.
+
+    Every candidate goes through ``run_journal_path``, so the containment
+    barrier stays the single check on both forms and neither can address a
+    journal outside the runs root.
+
+    Args:
+        sdd_dir: The project ``.sdd`` directory.
+        run_id: The identifier the caller polled with.
+
+    Returns:
+        The resolved run id and its containment-checked journal path.
+
+    Raises:
+        JournalPathError: ``run_id`` cannot safely name a journal directory.
+    """
+    from bernstein.core.replay.journal import JournalPathError, run_journal_path
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+
+    direct = run_journal_path(sdd_dir, run_id)
+    if direct.is_file():
+        return run_id, direct
+
+    derived_id = task_run_id(run_id)
+    if derived_id != run_id:
+        try:
+            derived = run_journal_path(sdd_dir, derived_id)
+        except JournalPathError:
+            derived = None
+        if derived is not None and derived.is_file():
+            return derived_id, derived
+
+    return run_id, direct
 
 
 def _project_task_helper(data: dict[str, Any]) -> Any:
@@ -312,6 +354,14 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
     ) -> str:
         """Start an orchestration run by posting a task to the Bernstein server.
 
+        A run executes real work and takes minutes to hours. This call
+        returns as soon as the run is queued, not when it finishes. Do not
+        re-issue it while waiting: that starts a second run. To follow the
+        run, wait ``poll_after_ms`` and then call ``bernstein_task_handle``,
+        passing either the returned ``task_id`` or the returned ``run_id``.
+        Poll it until ``status`` is terminal (``completed``, ``failed`` or
+        ``cancelled``).
+
         Args:
             goal: Description of what you want Bernstein to accomplish.
             role: Specialist role to assign (backend, frontend, qa, security, …).
@@ -321,7 +371,9 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
             estimated_minutes: Rough time estimate in minutes.
 
         Returns:
-            JSON with the created task ID, title, and status.
+            JSON with the created task ID, title and status, plus the
+            ``run_id`` naming the run journal and the advisory
+            ``poll_after_ms`` delay before the first poll.
         """
         err = _validate_or_error(
             "bernstein_run",
@@ -383,8 +435,16 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 task_obj = _project_task_helper(data)
                 return CreateTaskResult(task=task_obj)
 
+            from bernstein.core.tasks.checkpoint_retry import task_run_id
+
             return json.dumps(
-                {"task_id": data["id"], "title": data["title"], "status": data["status"]},
+                {
+                    "task_id": data["id"],
+                    "title": data["title"],
+                    "status": data["status"],
+                    "run_id": task_run_id(data["id"]),
+                    "poll_after_ms": _POLL_AFTER_MS,
+                },
                 indent=2,
             )
         except Exception as exc:
@@ -503,7 +563,11 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
         instance reprojects the same handle from the on-disk journal.
 
         Args:
-            run_id: The run identifier whose journal to project. Must be a
+            run_id: The run to project. Either identifier ``bernstein_run``
+                returned is accepted: the ``task_id``, or the ``run_id``
+                naming the journal. Resolution is journal run id first, then
+                the task id slugified into a journal run id, so the two forms
+                reach one journal and project an identical handle. Must be a
                 plain identifier - path separators and traversal are refused.
             workdir: Project root directory (default: current directory).
 
@@ -520,14 +584,14 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
             from bernstein.core.replay.journal import (
                 JournalPathError,
                 load_events,
-                run_journal_path,
             )
 
             base = Path(workdir).resolve()
             # Shared barrier rather than a local containment check, so this
             # surface cannot drift from the rest of the run-journal readers.
+            # _resolve_run_journal applies it to every candidate id.
             try:
-                journal_path = run_journal_path(base / ".sdd", run_id)
+                resolved_id, journal_path = _resolve_run_journal(base / ".sdd", run_id)
             except JournalPathError as exc:
                 return _error_response(
                     exc,
@@ -535,9 +599,11 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
                 )
             events = load_events(journal_path)
             chain_head = _read_audit_chain_head(base / ".sdd" / "audit")
+            # Both id forms project the identical handle: the handle is a
+            # projection of the journal, not of how the caller addressed it.
             handle = RunHandle.from_journal(
-                task_id=run_id,
-                run_id=run_id,
+                task_id=resolved_id,
+                run_id=resolved_id,
                 events=events,
                 chain_head=chain_head,
             )
@@ -788,38 +854,33 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
             JSON of the chain-anchored artifact record (``key``, ``version``,
             ``content_hash``, ``spine_entry_hash``, ``journal_index``, ...).
         """
-        err = _validate_or_error(
-            "bernstein_post_artifact",
-            {
-                "task_id": task_id,
-                "key": key,
-                "artifact_type": artifact_type,
-                "poster": poster,
-                "body": body,
-                "columns": columns,
-                "rows": rows,
-                "url": url,
-                "link_kind": link_kind,
-            },
-        )
+        # An argument left at its empty-string default means "not supplied for
+        # this artifact type", so it must not reach the validator: the schema
+        # constrains ``body`` / ``url`` / ``link_kind`` to the values a caller
+        # that actually supplies them would send. Validate exactly the fields
+        # that get posted, so the conditional shape advertised to the caller is
+        # the shape the call is judged against.
+        args: dict[str, Any] = {
+            "task_id": task_id,
+            "key": key,
+            "artifact_type": artifact_type,
+            "poster": poster,
+        }
+        if body:
+            args["body"] = body
+        if columns is not None:
+            args["columns"] = columns
+        if rows is not None:
+            args["rows"] = rows
+        if url:
+            args["url"] = url
+        if link_kind:
+            args["link_kind"] = link_kind
+        err = _validate_or_error("bernstein_post_artifact", args)
         if err is not None:
             return _validation_error_response(err)
         try:
-            payload: dict[str, Any] = {
-                "key": key,
-                "artifact_type": artifact_type,
-                "poster": poster,
-            }
-            if body:
-                payload["body"] = body
-            if columns is not None:
-                payload["columns"] = columns
-            if rows is not None:
-                payload["rows"] = rows
-            if url:
-                payload["url"] = url
-            if link_kind:
-                payload["link_kind"] = link_kind
+            payload: dict[str, Any] = {k: v for k, v in args.items() if k != "task_id"}
             # Carry the caller identity in the request header (the server's
             # authorization principal), not only in the body. The server refuses
             # posts against a task this identity does not hold the claim for.
@@ -854,10 +915,21 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
         err = _validate_or_error("bernstein_stop", {"workdir": workdir})
         if err is not None:
             return _validation_error_response(err)
+        from bernstein.mcp.signal_paths import ShutdownSignalPathError, shutdown_signal_path
+
+        # Shared barrier rather than a local containment check, so this
+        # surface cannot drift from the other workdir-derived writers. The
+        # path is resolved and proven contained before any directory is
+        # created, so a refused call leaves nothing behind.
         try:
-            signals_dir = Path(workdir) / ".sdd" / "runtime" / "signals"
-            signals_dir.mkdir(parents=True, exist_ok=True)
-            shutdown_file = signals_dir / "SHUTDOWN"
+            shutdown_file = shutdown_signal_path(workdir)
+        except ShutdownSignalPathError as exc:
+            return _error_response(
+                exc,
+                hint="workdir must be an existing Bernstein project root",
+            )
+        try:
+            shutdown_file.parent.mkdir(parents=True, exist_ok=True)
             shutdown_file.write_text("mcp-stop\n", encoding="utf-8")
             return json.dumps({"status": "shutdown signal sent", "path": str(shutdown_file)})
         except Exception as exc:
@@ -1086,6 +1158,41 @@ def _apply_cost_meter(mcp: FastMCP[None]) -> None:
         tool.fn = metered
 
 
+def _apply_advertised_schemas(mcp: FastMCP[None]) -> None:
+    """Advertise each tool's enforced schema as its ``inputSchema``.
+
+    FastMCP derives the advertised schema from the Python signature, which
+    carries none of the constraints the input firewall enforces: a caller is
+    shown ``scope: string`` while ``validate_tool_call`` requires one of
+    ``small`` / ``medium`` / ``large``. The caller sends a plausible value and
+    gets a rejection it had no way to predict. Replacing the derived schema
+    with the schema from ``tool_schemas/<tool>.json`` gives a tool one schema
+    instead of two, so a constrained argument can be filled correctly on the
+    first call.
+
+    Only the advertised copy is replaced. Argument coercion still runs through
+    FastMCP's signature-derived model, and enforcement still runs through
+    ``validate_tool_call`` inside each handler.
+
+    Args:
+        mcp: The FastMCP server whose tools should advertise their schemas.
+    """
+    registry = get_registry()
+    # FastMCP exposes no public per-tool schema override, so patch the tool
+    # manager's registry after registration (same access pattern as
+    # _apply_tool_tier).
+    for name, tool in mcp._tool_manager._tools.items():  # pyright: ignore[reportPrivateUsage]
+        schema = registry.get(name)
+        if schema is None:
+            # Deny-by-default means such a tool is registered but not callable.
+            # Leave the derived schema alone and make the mismatch visible.
+            logger.warning("MCP tool %s has no schema file; advertising the derived schema", name)
+            continue
+        # Deep-copy so a client-side mutation of the advertised schema cannot
+        # reach the process-wide registry the validator reads.
+        tool.parameters = copy.deepcopy(schema)
+
+
 def _apply_tool_tier(mcp: FastMCP[None], active_tier: ToolTier) -> None:
     """Drop every registered tool that is outside ``active_tier``.
 
@@ -1284,6 +1391,7 @@ def create_mcp_server(
         register_lineage_resources(mcp, lineage_root=root, enabled=True)
 
     _apply_tool_tier(mcp, active_tier)
+    _apply_advertised_schemas(mcp)
     _apply_cost_meter(mcp)
     return mcp
 

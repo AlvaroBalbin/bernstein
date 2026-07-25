@@ -46,6 +46,7 @@ Every transition that surrenders a held claim appends the matching
 | --- | --- |
 | `POST /tasks/{id}/force-claim` | `force_claim` |
 | `POST /tasks/{id}/reopen` | `reopen` |
+| `POST /tasks/{id}/release` | `release` |
 | `POST /tasks/{id}/cancel` | `cancel_cascade` (root and descendants) |
 | `TaskStore.cancel` | `cancel` |
 | `POST /tasks/{id}/fail` | `fail` / `fail_contract_violation` |
@@ -80,10 +81,9 @@ because every path back to the pool records a release first.
 
 ## Worker mailbox
 
-`POST /tasks/{task_id}/messages` hands a structured payload to another
-worker's task mid-run. This is not chat: payloads are typed, size-capped,
-and addressed to exactly one task - no freeform threads, no undeclared
-fan-out.
+`POST /tasks/{task_id}/messages` hands a structured payload to a worker's
+task mid-run. This is not chat: payloads are typed, size-capped, and
+addressed to exactly one task - no freeform threads, no undeclared fan-out.
 
 | Field | Constraint |
 | --- | --- |
@@ -95,8 +95,28 @@ fan-out.
 Per task, at most 128 messages are held (`429` beyond that). Unknown kinds
 and oversize bodies are rejected with `422`.
 
+### Who may post to which mailbox
+
+Posting is a write against the addressed task, so it carries the same task
+scope as every other per-task write. The credential decides the reach:
+
+| Credential | May post to |
+| --- | --- |
+| Operator bearer token, SSO user, cluster shared secret or cluster JWT | any task's mailbox |
+| Agent JWT with an empty `task_ids` claim (manager / orchestrator) | any task's mailbox |
+| Agent JWT scoped to specific tasks | only the mailboxes of the tasks in its own `task_ids` |
+
+A task-scoped agent posting to a task outside its scope receives `403` and
+the mailbox is not written. Fan-out between tasks is therefore an
+orchestrator-level operation: a worker cannot address a sibling task's
+mailbox with the session token it was spawned with. Route the handoff
+through the orchestrator, or mint a token scoped to both tasks. The MCP
+`bernstein_update` tool authenticates with `BERNSTEIN_AUTH_TOKEN`, so it is
+unaffected.
+
 ```bash
 curl -s -X POST http://127.0.0.1:8052/tasks/<task-id>/messages \
+  -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"sender": "reviewer-1", "kind": "finding",
        "body": "Error mapping duplicated; use the shared helper in core/errors."}'

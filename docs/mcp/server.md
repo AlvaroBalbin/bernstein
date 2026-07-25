@@ -18,6 +18,14 @@ The streamable HTTP transport binds to loopback by default. Binding to a
 public interface requires a bearer token (see Auth) and is otherwise refused
 at startup.
 
+The streamable HTTP transport is served by a separate implementation
+(`bernstein.mcp.remote_transport`) from the stdio and SSE transports
+(`bernstein.mcp.server`). It exposes 8 tools rather than the full tier
+catalogue, and it enforces weaker argument validation than stdio; see
+[Validation scope](input-validation.md#validation-scope) and
+[Available tools](../cloudflare/cloudflare-mcp.md#available-tools). Unifying
+the two is tracked in issue #3083.
+
 ## Stateless serving
 
 The stateless MCP spec revision (2026-07-28) removes protocol sessions, and
@@ -221,10 +229,30 @@ free-standing server state: its status is a pure projection of the run
 journal, and it embeds the run's audit-chain head so the host can later prove
 the task it watched corresponds to the audited run.
 
-1. Start a run with `bernstein_run`; note the returned `task_id` (the run id).
-2. Poll `bernstein_task_handle` with that run id. The tool reprojects the
-   handle from the on-disk run journal and the audit-chain head, so any server
-   instance answers identically and the host holds no session:
+1. Start a run with `bernstein_run`. The response body carries everything the
+   poll loop needs:
+
+   ```json
+   {
+     "task_id": "abc123",
+     "title": "Add auth",
+     "status": "open",
+     "run_id": "task-abc123",
+     "poll_after_ms": 5000
+   }
+   ```
+
+   `task_id` names the task on the task server; `run_id` names its run
+   journal (the task id slugified, see `task_run_id`). `poll_after_ms` is the
+   advisory delay before the first poll. A run takes minutes to hours, so a
+   host waits and polls rather than re-issuing `bernstein_run`.
+
+2. Poll `bernstein_task_handle` with **either** identifier from that body.
+   The tool resolves the journal run id first and the slugified task id
+   second, so both forms reach one journal and project an identical handle.
+   It reprojects the handle from the on-disk run journal and the audit-chain
+   head, so any server instance answers identically and the host holds no
+   session:
 
    ```json
    {
@@ -259,6 +287,47 @@ run produces, so a trace from the calling host connects to the run's outputs.
 The ingested `traceparent` is carried as the lineage entry's `step_id`
 cross-link; a verifier holding the lineage spine reads the host trace off the
 artefact's provenance row.
+
+## Stopping a run: which project `bernstein_stop` can reach
+
+`bernstein_stop` takes a `workdir` and writes
+`<workdir>/.sdd/runtime/signals/SHUTDOWN`, which the orchestrator picks up
+and drains on. The `workdir` arrives from the caller, so the tool applies the
+same containment barrier the run-journal readers use before it touches the
+filesystem:
+
+- The workdir is screened for shape first, with no filesystem call: a value
+  that is not text, or that is longer than a path may be on this filesystem
+  (`MAX_PATH_BYTES`), cannot address a directory and is refused up front.
+- The workdir is resolved, and the signal path is rebuilt through the shared
+  containment helper. A `.sdd`, `runtime`, `signals`, or `SHUTDOWN` entry that
+  is a symlink pointing out of the resolved root is refused, because the write
+  would land outside the project the caller named.
+- The resolved root must already contain a `.sdd` directory. The tool stops a
+  Bernstein project that exists; it does not create a project tree at a path it
+  is handed.
+- A refused call creates no directory and writes no file. It returns the
+  structured tool error (`error` plus `hint`), never a `status`.
+
+Naming a root is allowed. An absolute path to a second Bernstein project on
+the same machine is a legitimate stop target; the barrier is against a
+`workdir` that reaches past the root it names. Both the stdio server and the
+remote HTTP transport serve the tool through the same helper, so the two
+surfaces cannot drift apart.
+
+Resolving the path is not the barrier on its own: `resolve()` follows symlinks
+but does not fold case, so on a case-insensitive filesystem a resolved path is
+normalised rather than canonical. Containment against the root as resolved in
+that same call is what decides whether the write stays inside.
+
+Resolving is also not free. It stats one entry per path component, and the
+remote HTTP transport serves this tool straight from the JSON-RPC arguments
+with no tool schema in front of it, so the caller picks the length. That is
+why the shape screen runs first: an over-long `workdir` is refused on its byte
+count rather than walked component by component on the serving event loop.
+Every refusal, including one from an input the filesystem cannot represent
+such as an embedded NUL, comes back as the same structured tool error rather
+than a raw filesystem message.
 
 ## Running the pull-worker loop over MCP
 

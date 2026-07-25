@@ -150,6 +150,7 @@ from bernstein.cli.workspace_cmd import config_group, workspace_group
 from bernstein.cli.worktrees_cmd import worktrees_group
 from bernstein.cli.wrap_up_cmd import wrap_up
 from bernstein.core.json_logging import setup_json_logging
+from bernstein.eval.bench.bench_cli import bench_group
 
 # ---------------------------------------------------------------------------
 # Re-export shared state so existing imports like
@@ -954,6 +955,7 @@ cli.add_command(plan)
 cli.add_command(plan, "tasks")
 cli.add_command(spec_group)
 cli.add_command(backlog_group, "backlog")
+cli.add_command(bench_group)
 cli.add_command(logs_group, "logs")
 cli.add_command(decisions_group, "decisions")
 cli.add_command(consensus_group, "consensus")

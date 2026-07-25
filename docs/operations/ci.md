@@ -239,6 +239,57 @@ intentional-skip allow-lists. The aggregator understands:
 If you add a new conditionally-gated job, register it in the
 appropriate allow-list inside the `roll-up` step of `ci-gate`.
 
+### The two emitters of `CI gate`
+
+`ci.yml` is `paths-ignore`-filtered, so a pull request whose diff is
+entirely inside that list never triggers it and never publishes the
+required context. `ci-gate-stub.yml` exists to publish a synthetic
+success for exactly those pull requests.
+
+`paths` and `paths-ignore` are evaluated per file with OR semantics: a
+workflow fires when *at least one* changed file matches. On a mixed diff
+both workflows therefore fire, and for a while both published `CI gate`.
+The stub finished in seconds; the real matrix was still queued. PR #3016
+merged that way, with no test run against its code.
+
+The stub now derives a verdict in-job (`scripts/ci_gate_stub_guard.py`,
+which reads `ci.yml`'s own `paths-ignore` list) and takes its check-run
+name from it:
+
+| verdict | check-run name | effect |
+| --- | --- | --- |
+| every changed path ignored | `CI gate` | unblocks the PR, real CI will never report |
+| any changed path not ignored | `CI gate stub (not applicable)` | cannot satisfy branch protection |
+
+Two rules follow for anyone editing that workflow:
+
+- Do not gate the emitting job with `if:`. GitHub counts a **skipped**
+  required check as passing, so an `if:` skip looks like a fix and is
+  not one. It also posts the unresolved `name:` template as the
+  check-run name when the job is skipped.
+- Do not give the stub a second, unconditional `CI gate` job. The
+  required-check canary rejects any emitter outside the two allow-listed
+  ones, including one hidden behind a name template.
+
+### Reading the required check is not the same as reading CI
+
+A rerun **resets** the check-run of the job it reruns. After a rerun the
+newest instance of `CI gate` on a head SHA can be a stale success from an
+earlier attempt while the real run is still in flight. A probe that reads
+"the latest instance of the required context" will report ready on a pull
+request whose tests are unfinished or failing.
+
+When scripting a readiness check against a head SHA:
+
+- Enumerate **every** check run named `CI gate` on that SHA, not the
+  newest one. Treat any instance with `status != completed` as not ready.
+- Require `status == completed` **and** `conclusion == success`. A
+  `queued` run has no conclusion, which is easy to read as "not failing".
+- Confirm the run that produced the success is the real `CI` workflow
+  when the diff contains a non-ignored path. The stub's own check is
+  named `CI gate stub (not applicable)` in that case, so a `CI gate`
+  success there must have come from `ci.yml`.
+
 ## Gate evaluation coverage
 
 A green gate is only evidence of correctness when the gate evaluated the
