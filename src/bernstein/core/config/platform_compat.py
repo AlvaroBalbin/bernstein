@@ -876,7 +876,7 @@ def _win_open_process(pid: int, access: int) -> int | None:
         return None
     try:
         return int(kernel32.OpenProcess(access, False, pid))
-    except Exception as exc:
+    except Exception as exc:  # pragma: no cover - defensive
         logger.debug("OpenProcess failed for PID %d: %s", pid, exc)
         return None
 

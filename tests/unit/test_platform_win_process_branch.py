@@ -317,6 +317,59 @@ class TestWinTaskkill:
         monkeypatch.setattr(pc.subprocess, "run", _run)
         assert pc._win_taskkill(123) is False
 
+    def test_nonpositive_pid_is_never_signalled(self, monkeypatch: Any) -> None:
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            raise AssertionError("stopped a non-positive pid")
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(0) is False
+        assert pc._win_taskkill(-1) is False
+
+    def test_taskkill_not_found_falls_back_to_the_handle(self, monkeypatch: Any) -> None:
+        """taskkill 128 means the lead is gone; the handle settles it."""
+        fake = _PinKernel32()
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(pc.subprocess, "run", lambda cmd, **_kw: _Result(128))
+        assert pc._win_taskkill(123, tree=True) is True
+        assert fake.terminated == [_PinKernel32._HANDLE]
+
+    def test_without_a_kernel_boundary_only_taskkill_runs(self, monkeypatch: Any) -> None:
+        """No pin means no bare-pid force kill, just the tree stop."""
+
+        def _boom() -> Any:
+            raise AttributeError("no windll on this host")
+
+        monkeypatch.setattr(pc, "_win_kernel32", _boom)
+        cmds: list[list[str]] = []
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            cmds.append(cmd)
+            return _Result(0)
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(123, force=True, tree=True) is True
+        assert [c[0] for c in cmds] == ["taskkill"]
+
+    def test_unreadable_handle_state_is_not_alive(self, monkeypatch: Any) -> None:
+        """A handle that will not answer is never reported as running."""
+
+        class _Mute(_PinKernel32):
+            def GetExitCodeProcess(self, _handle: int, _ptr: Any) -> int:
+                return 0
+
+            def GetProcessTimes(self, _handle: int, *_rest: Any) -> int:
+                return 0
+
+        fake = _Mute()
+        _install_kernel32(monkeypatch, fake)
+        assert pc._win_handle_alive(_PinKernel32._HANDLE) is False
+        assert pc._win_handle_start_time(_PinKernel32._HANDLE) is None
+        # Unreadable liveness means "already gone" - the conservative
+        # direction, because the reap then signals nothing.
+        pin = pc._win_pin_process(123)
+        assert pin is not None
+        assert pin.already_gone is True
+
 
 class TestWinPidReuseGuard:
     """The pin refuses to act on a pid that was recycled under it."""
