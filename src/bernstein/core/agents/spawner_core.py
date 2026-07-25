@@ -239,6 +239,7 @@ def emit_process_reap_receipt(
             method=receipt.method,
             delivered=receipt.delivered,
             escalated=receipt.escalated,
+            already_gone=receipt.already_gone,
             grace_seconds=receipt.grace_seconds,
             reason=reason,
             actor=actor,

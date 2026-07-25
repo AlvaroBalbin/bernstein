@@ -81,11 +81,41 @@ class TestReapProcessGroup:
         assert receipt.escalated is False
         assert receipt.pgid == 0
 
-    def test_undeliverable_term_receipt(self) -> None:
-        with patch(f"{_PC}.kill_process_group", return_value=False) as mock_kpg:
+    def test_undeliverable_term_on_live_target_is_not_delivered(self) -> None:
+        """TERM undeliverable while the group is still alive -> genuine failure.
+
+        A live group that could not be signalled is a real failure to stop it:
+        ``delivered`` and ``already_gone`` are both False so the caller does
+        not mistake it for a successful reap.
+        """
+        with (
+            patch(f"{_PC}.kill_process_group", return_value=False) as mock_kpg,
+            patch(f"{_PC}.process_group_alive", return_value=True),
+            # Stable identity across the reap: the same process holds the pid,
+            # so it is a genuine failure to stop, not a recycled/gone pid.
+            patch(f"{_PC}._process_identity", return_value=4242),
+        ):
             receipt = reap_process_group(12345)
         assert receipt.delivered is False
         assert receipt.escalated is False
+        assert receipt.already_gone is False
+        mock_kpg.assert_called_once_with(12345, signal.SIGTERM)
+
+    def test_undeliverable_term_but_target_gone_is_already_gone(self) -> None:
+        """TERM undeliverable because the target already exited -> already_gone.
+
+        The stop goal is satisfied (nothing is running), so the receipt records
+        ``already_gone=True`` instead of a misleading bare ``delivered=False``.
+        """
+        with (
+            patch(f"{_PC}.kill_process_group", return_value=False) as mock_kpg,
+            patch(f"{_PC}.process_group_alive", return_value=False),
+        ):
+            receipt = reap_process_group(12345)
+        assert receipt.delivered is False
+        assert receipt.escalated is False
+        assert receipt.already_gone is True
+        assert receipt.stopped is True
         mock_kpg.assert_called_once_with(12345, signal.SIGTERM)
 
     def test_clean_exit_receipt(self) -> None:
@@ -155,6 +185,7 @@ class TestReapProcessGroup:
             "method": "posix_process_group",
             "delivered": True,
             "escalated": False,
+            "already_gone": False,
             "grace_seconds": 3.0,
         }
         # Frozen dataclass: two identical receipts project identically.

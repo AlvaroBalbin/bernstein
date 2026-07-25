@@ -338,6 +338,43 @@ _REAP_METHOD_POSIX = "posix_process_group"
 _REAP_METHOD_WINDOWS = "windows_process_tree"
 
 
+# Sentinels returned by :func:`_process_identity` when it cannot produce a
+# concrete identity token for a pid.  ``_IDENTITY_GONE`` means the pid maps to
+# no live process; ``_IDENTITY_UNAVAILABLE`` means the mechanism itself is not
+# available (POSIX, or the Win32 query could not run), so callers fall back to
+# a plain liveness check and preserve prior behaviour.
+_IDENTITY_GONE: object = object()
+_IDENTITY_UNAVAILABLE: object = object()
+
+
+def _process_identity(pid: int) -> object:
+    """Return a stable identity token for the live process at *pid*.
+
+    On Windows the token is the process creation time (a 64-bit ``FILETIME``),
+    which - paired with the pid - uniquely identifies a single process
+    instance.  Comparing tokens therefore distinguishes the original spawn
+    from a later process that recycled the same pid, so a reap never signals
+    or escalates onto an unrelated process.
+
+    Returns:
+        * an ``int`` creation-time token when the process is alive and
+          identifiable,
+        * :data:`_IDENTITY_GONE` when the pid maps to no live process,
+        * :data:`_IDENTITY_UNAVAILABLE` on non-Windows platforms, or when the
+          Win32 query is unavailable or fails (callers then fall back to a
+          plain liveness check).
+    """
+    if not IS_WINDOWS:
+        return _IDENTITY_UNAVAILABLE
+    try:
+        create_time = _win_process_create_time(pid)
+    except Exception:  # ctypes/Win32 unavailable - degrade to liveness-only.
+        return _IDENTITY_UNAVAILABLE
+    if create_time is None:
+        return _IDENTITY_GONE
+    return create_time
+
+
 @dataclass(frozen=True)
 class ProcessReapReceipt:
     """Structured outcome of a process-tree reap.
@@ -353,8 +390,14 @@ class ProcessReapReceipt:
         os_name: Normalised OS name (``"linux"``, ``"macos"``, ``"windows"``).
         method: Delivery mechanism identifier
             (``"posix_process_group"`` or ``"windows_process_tree"``).
-        delivered: Whether the initial graceful stop was delivered.
+        delivered: Whether the initial graceful stop was delivered to a live
+            target.
         escalated: Whether a force-kill was required after the grace window.
+        already_gone: Whether the target was confirmed not running without a
+            stop being delivered (it had already exited, or its pid had been
+            recycled to an unrelated process). For a stop the target being
+            gone is success, so ``delivered=False`` alone must not be read as
+            failure: ``delivered or already_gone`` is the stop guarantee.
         grace_seconds: The grace window that applied to this reap.
     """
 
@@ -364,6 +407,19 @@ class ProcessReapReceipt:
     delivered: bool
     escalated: bool
     grace_seconds: float
+    already_gone: bool = False
+
+    @property
+    def stopped(self) -> bool:
+        """Whether the target is no longer running after the reap.
+
+        The guarantee callers actually care about: either a graceful stop was
+        delivered (escalated to a force-kill if needed), or the target was
+        already gone. Distinguishes the outcome from the raw ``delivered``
+        bool, which is False both when a live target could not be stopped and
+        when there was nothing left to stop.
+        """
+        return self.delivered or self.already_gone
 
     def to_details(self) -> dict[str, object]:
         """Return the receipt as a plain dict for audit-chain payloads."""
@@ -373,6 +429,7 @@ class ProcessReapReceipt:
             "method": self.method,
             "delivered": self.delivered,
             "escalated": self.escalated,
+            "already_gone": self.already_gone,
             "grace_seconds": self.grace_seconds,
         }
 
@@ -403,21 +460,51 @@ def reap_process_group(
     os_name = _detect_os_name()
     method = _REAP_METHOD_WINDOWS if IS_WINDOWS else _REAP_METHOD_POSIX
 
-    def _receipt(*, delivered: bool, escalated: bool) -> ProcessReapReceipt:
+    def _receipt(*, delivered: bool, escalated: bool, already_gone: bool = False) -> ProcessReapReceipt:
         return ProcessReapReceipt(
             pgid=pgid,
             os_name=os_name,
             method=method,
             delivered=delivered,
             escalated=escalated,
+            already_gone=already_gone,
             grace_seconds=grace_seconds,
         )
 
     if pgid <= 0:
         return _receipt(delivered=False, escalated=False)
 
-    # Best-effort TERM first; if it fails the group is already gone.
+    # Bind to the target's identity up front so a pid recycled during the reap
+    # is recognised as "the original is gone", never mistaken for - or
+    # signalled as - the original spawn.  On POSIX (and wherever identity is
+    # unavailable) this is a no-op sentinel and the reap behaves as before.
+    start_identity = _process_identity(pgid)
+
+    def _original_gone() -> bool:
+        """Whether the original process/group at *pgid* is no longer running.
+
+        True when the group has no live members, or when the lead pid maps to
+        a *different* process than the one seen at reap start (Windows recycled
+        the pid).  When identity cannot be bound (POSIX / unavailable), a live
+        group is treated as the same target, preserving prior semantics.
+        """
+        if not process_group_alive(pgid):
+            return True
+        if start_identity is _IDENTITY_UNAVAILABLE:
+            return False
+        current = _process_identity(pgid)
+        if current is _IDENTITY_UNAVAILABLE:
+            return False
+        return current != start_identity
+
+    # Best-effort graceful stop.
     if not kill_process_group(pgid, signal.SIGTERM):
+        # TERM could not be delivered.  The goal of a reap is that the target
+        # stops running, so distinguish "already gone" (it exited, or its pid
+        # was recycled) from a genuine failure to stop a live target, instead
+        # of always reporting a bare not-delivered.
+        if _original_gone():
+            return _receipt(delivered=False, escalated=False, already_gone=True)
         return _receipt(delivered=False, escalated=False)
 
     # Poll for graceful exit.  Probe the whole process *group* rather than the
@@ -664,6 +751,59 @@ def _win_process_alive(pid: int) -> bool:
         if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):  # type: ignore[union-attr]
             return bool(exit_code.value == _STILL_ACTIVE)
         return False
+    finally:
+        kernel32.CloseHandle(handle)  # type: ignore[union-attr]
+
+
+def _win_process_create_time(pid: int) -> int | None:
+    """Return the process creation time for *pid* on Windows, or ``None``.
+
+    The creation time (a 64-bit ``FILETIME``) paired with the pid uniquely
+    identifies a single process instance: two processes that reuse the same
+    pid at different times have different creation times.  Used by
+    :func:`_process_identity` to detect a recycled pid so a reap never signals
+    a process it did not spawn.
+
+    This function is only called on Windows (via :func:`_process_identity`,
+    which is guarded by the ``IS_WINDOWS`` check).  ``None`` is returned when
+    the process does not exist or its handle cannot be opened or queried, so
+    an unopenable/recycled pid reads as "not our process".
+
+    Args:
+        pid: Process ID.
+
+    Returns:
+        The creation-time ``FILETIME`` as an ``int``, or ``None`` if the
+        process is gone or cannot be identified.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    kernel32: object = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle: int = kernel32.OpenProcess(  # type: ignore[union-attr]
+        _PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        pid,
+    )
+    if not handle:
+        return None
+    try:
+        creation = ctypes.wintypes.FILETIME()
+        exit_t = ctypes.wintypes.FILETIME()
+        kernel_t = ctypes.wintypes.FILETIME()
+        user_t = ctypes.wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(  # type: ignore[union-attr]
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_t),
+            ctypes.byref(kernel_t),
+            ctypes.byref(user_t),
+        )
+        if not ok:
+            return None
+        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
     finally:
         kernel32.CloseHandle(handle)  # type: ignore[union-attr]
 

@@ -66,6 +66,33 @@ def test_record_process_reap_receipt_windows_method(tmp_path: Path) -> None:
     assert rows[0].actor == "orchestrator"
 
 
+def test_record_process_reap_receipt_already_gone(tmp_path: Path) -> None:
+    """An already-gone stop is mirrored as a distinct forensic outcome.
+
+    The audit event distinguishes "the target was already gone" from a
+    delivered stop, so a verifier can tell that no signal was sent while the
+    reap still succeeded.
+    """
+    chain = AuditChainStore(tmp_path / "audit", key=b"0" * 32)
+    record_process_reap_receipt(
+        chain=chain,
+        session_id="agent-3",
+        pgid=2904,
+        os_name="windows",
+        method="windows_process_tree",
+        delivered=False,
+        escalated=False,
+        already_gone=True,
+        grace_seconds=3.0,
+        reason="kill_requested",
+    )
+    rows = chain.query(event_type=EVENT_PROCESS_REAP_RECEIPT)
+    assert rows[0].details["already_gone"] is True
+    assert rows[0].details["delivered"] is False
+    ok, errors = chain.verify()
+    assert ok, errors
+
+
 def test_audit_chain_stays_verifiable_after_reap_receipt(tmp_path: Path) -> None:
     chain = AuditChainStore(tmp_path / "audit", key=b"0" * 32)
     record_process_reap_receipt(

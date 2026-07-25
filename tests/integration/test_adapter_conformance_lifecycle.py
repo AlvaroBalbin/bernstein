@@ -112,8 +112,13 @@ def test_adapter_stop_terminates_a_hung_spawn(
     pid = int(getattr(result, "pid", 0))
     assert pid > 0
     receipt = reap_process_group(pid, grace_seconds=3.0)
-    assert receipt.delivered
-    # The worker must actually be gone after the reap.
+    # Assert the real guarantee -- the hung spawn is stopped -- not the raw
+    # ``delivered`` bool. On Windows a hung spawn can exit before the reap
+    # runs and its pid may be recycled, so a graceful stop is never delivered
+    # to it; ``stopped`` (delivered or already_gone) is the honest, flake-free
+    # projection of "no longer running".
+    assert receipt.stopped, f"reap did not stop the spawn: {receipt}"
+    # ...and prove it independently: the worker must actually be gone.
     proc = getattr(result, "proc", None)
     if proc is not None and hasattr(proc, "wait"):
         with contextlib.suppress(subprocess.TimeoutExpired):

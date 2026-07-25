@@ -322,15 +322,21 @@ class TestReapReceiptWindowsProjection:
         assert sigs[0] == signal.SIGTERM
         assert sigs[-1] == 9
 
-    def test_undeliverable_term_projects_not_delivered(self, monkeypatch: Any) -> None:
+    def test_undeliverable_term_on_live_original_is_genuine_failure(self, monkeypatch: Any) -> None:
+        """TERM undeliverable while the *original* still runs -> not delivered.
+
+        When the graceful stop cannot be delivered and the pid still maps to
+        the same live process that was there at reap start, the reap genuinely
+        failed to stop it: the receipt must report ``delivered=False`` and must
+        NOT claim the process was already gone.
+        """
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
         monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
-        monkeypatch.setattr(
-            pc,
-            "process_alive",
-            lambda pid: (_ for _ in ()).throw(AssertionError("polled")),
-        )
+        # The pid holds the same live process throughout: the group stays alive
+        # and its identity token is stable.
+        monkeypatch.setattr(pc, "process_group_alive", lambda pid: True)
+        monkeypatch.setattr(pc, "_process_identity", lambda pid: 4242)
 
         receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
 
@@ -338,3 +344,60 @@ class TestReapReceiptWindowsProjection:
         assert receipt.method == "windows_process_tree"
         assert receipt.delivered is False
         assert receipt.escalated is False
+        assert receipt.already_gone is False
+
+
+# ---------------------------------------------------------------------------
+# reap_process_group - "already gone" is a successful stop, not a failure
+# ---------------------------------------------------------------------------
+
+
+class TestReapAlreadyGoneWindows:
+    """A stop whose target is already gone must project onto success.
+
+    On Windows a reap of a hung spawn can find that the process has already
+    exited (and its pid may have been recycled by the kernel). The stop goal
+    -- the hung spawn is no longer running -- is satisfied, so the receipt
+    records ``already_gone=True`` instead of a misleading ``delivered=False``.
+    A recycled pid must never be signalled as if it were the original spawn.
+    """
+
+    def test_undeliverable_term_but_pid_gone_projects_already_gone(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
+        # The original process is gone: taskkill could not deliver, and the
+        # pid no longer maps to any live process.
+        monkeypatch.setattr(pc, "process_group_alive", lambda pid: False)
+
+        receipt = pc.reap_process_group(2904, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.method == "windows_process_tree"
+        assert receipt.delivered is False
+        assert receipt.escalated is False
+        assert receipt.already_gone is True
+        # The stop guarantee holds even though nothing was delivered.
+        assert receipt.stopped is True
+
+    def test_undeliverable_term_but_pid_recycled_projects_already_gone(self, monkeypatch: Any) -> None:
+        """A recycled pid (different creation time) reads as already-gone.
+
+        The pid still hosts a *live* process, but it is a different process
+        than the one seen at reap start -- Windows recycled the pid. The
+        original spawn is therefore gone, and the reap must not have signalled
+        (or escalated onto) the unrelated process.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
+        monkeypatch.setattr(pc, "process_group_alive", lambda pid: True)
+        # Identity token captured at reap start (111) differs from the token
+        # observed after the failed TERM (222): the pid was recycled.
+        identities = iter([111, 222])
+        monkeypatch.setattr(pc, "_process_identity", lambda pid: next(identities))
+
+        receipt = pc.reap_process_group(2904, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.delivered is False
+        assert receipt.escalated is False
+        assert receipt.already_gone is True

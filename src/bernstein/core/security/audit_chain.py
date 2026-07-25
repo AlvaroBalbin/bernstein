@@ -4576,6 +4576,7 @@ def record_process_reap_receipt(
     escalated: bool,
     grace_seconds: float,
     reason: str,
+    already_gone: bool = False,
     actor: str = "spawner",
 ) -> AuditEvent:
     """Append a ``process.reap_receipt`` event into *chain* (#2367).
@@ -4599,6 +4600,10 @@ def record_process_reap_receipt(
         grace_seconds: The grace window that applied to this reap.
         reason: Why the reap ran (e.g. ``"kill_requested"``,
             ``"heartbeat_stale"``, ``"wall_clock_timeout"``).
+        already_gone: Whether the target was confirmed already gone (exited,
+            or its pid recycled) so no stop had to be delivered; the reap
+            still succeeded. Recorded so a verifier can distinguish "we
+            stopped it" from "it was already gone".
         actor: Recorded actor; defaults to ``"spawner"``.
 
     Returns:
@@ -4617,6 +4622,7 @@ def record_process_reap_receipt(
             "method": method,
             "delivered": delivered,
             "escalated": escalated,
+            "already_gone": already_gone,
             "grace_seconds": grace_seconds,
             "reason": reason,
         },
