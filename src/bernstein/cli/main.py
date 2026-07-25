@@ -83,6 +83,7 @@ from bernstein.cli.compliance_cmd import compliance_group
 from bernstein.cli.config_path_cmd import config_path_cmd
 from bernstein.cli.cost import cost_cmd, cost_envelopes_group, estimate_cmd
 from bernstein.cli.debug_bundle import debug_group
+from bernstein.eval.bench.bench_cli import bench_group
 from bernstein.cli.debug_cmd import debug_cmd
 from bernstein.cli.dep_impact_cmd import dep_impact_cmd
 from bernstein.cli.diff_cmd import diff_cmd
@@ -954,6 +955,7 @@ cli.add_command(plan)
 cli.add_command(plan, "tasks")
 cli.add_command(spec_group)
 cli.add_command(backlog_group, "backlog")
+cli.add_command(bench_group)
 cli.add_command(logs_group, "logs")
 cli.add_command(decisions_group, "decisions")
 cli.add_command(consensus_group, "consensus")

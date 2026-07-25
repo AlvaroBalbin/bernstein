@@ -567,16 +567,19 @@ class TestDocs:
         assert "bernstein bench verify" in content
 
 
+
 # ===========================================================================
 # CLI smoke tests
 # ===========================================================================
 
 class TestCLI:
     def test_cmd_run_golden_suite(self, tmp_path: Path) -> None:
-        from bernstein.eval.bench.bench_cli import cmd_run
+        from click.testing import CliRunner
+        from bernstein.eval.bench.bench_cli import bench_group
         out = tmp_path / "bundle.json"
-        rc = cmd_run(["golden-v1", "--out", str(out), "--stub-signer"])
-        assert rc == 0
+        runner = CliRunner()
+        result = runner.invoke(bench_group, ["run", "golden-v1", "--out", str(out), "--stub-signer"])
+        assert result.exit_code == 0, result.output
         assert out.exists()
         loaded = SubmissionBundle.load(out)
         assert loaded.suite_version == "golden-v1"
@@ -585,23 +588,24 @@ class TestCLI:
     def test_cmd_verify_passes_on_honest_bundle(
         self, tmp_path: Path, simple_suite: BenchSuite, adapter: MockReplayAdapter
     ) -> None:
-        from bernstein.eval.bench.bench_cli import cmd_verify
+        from click.testing import CliRunner
+        from bernstein.eval.bench.bench_cli import bench_group
         bundle = _make_bundle(simple_suite, adapter)
         signed = StubSigner().sign(bundle)
-        # Save suite so verify can load it
         suite_path = tmp_path / "suite.json"
         simple_suite.save(suite_path)
         bundle_path = tmp_path / "bundle.json"
         signed.save(bundle_path)
-        rc = cmd_verify([str(bundle_path), "--suite", str(suite_path)])
-        assert rc == 0
+        runner = CliRunner()
+        result = runner.invoke(bench_group, ["verify", str(bundle_path), "--suite", str(suite_path)])
+        assert result.exit_code == 0, result.output
 
     def test_cmd_verify_fails_on_fabricated_bundle(
         self, tmp_path: Path, simple_suite: BenchSuite, adapter: MockReplayAdapter
     ) -> None:
-        from bernstein.eval.bench.bench_cli import cmd_verify
+        from click.testing import CliRunner
+        from bernstein.eval.bench.bench_cli import bench_group
         bundle = _make_bundle(simple_suite, adapter)
-        # Flip verdict
         tampered = TaskResult(
             task_id=bundle.task_results[0].task_id,
             task_hash=bundle.task_results[0].task_hash,
@@ -620,5 +624,6 @@ class TestCLI:
         simple_suite.save(suite_path)
         bundle_path = tmp_path / "bundle.json"
         bad.save(bundle_path)
-        rc = cmd_verify([str(bundle_path), "--suite", str(suite_path)])
-        assert rc == 1
+        runner = CliRunner()
+        result = runner.invoke(bench_group, ["verify", str(bundle_path), "--suite", str(suite_path)])
+        assert result.exit_code == 1
