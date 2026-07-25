@@ -171,7 +171,7 @@ class AgentDefaults:
     # `heartbeat_stale_s` to produce its first turn used to be flagged stale
     # and reaped while still working (issue #3012). The starting phase gets a
     # larger, separately-configurable window sized above a realistic slow
-    # first turn. Override via `tuning.orchestrator.heartbeat_starting_timeout_s`.
+    # first turn. Override via `tuning.agent.heartbeat_starting_timeout_s`.
     heartbeat_starting_timeout_s: float = 300.0  # 5 min
     # A log/git-tree mtime fresher than this window is a POSITIVE liveness
     # signal: the agent is demonstrably alive regardless of heartbeat age, so

@@ -246,8 +246,15 @@ _INCOMPLETE_DECLARED_STATUSES: frozenset[str] = frozenset({"open", "claimed", "i
 EXIT_RUN_HEALTHY = 0
 #: Distinct non-zero code for a completed-but-not-HEALTHY run (goal unmet:
 #: forced kills dominated, a task failed, work was discarded, or a declared
-#: task was never finished). Distinct from CLI usage/connection errors (1).
-EXIT_RUN_UNHEALTHY = 2
+#: task was never finished).
+#:
+#: Deliberately NOT 1 or 2: 1 is the generic CLI/bootstrap error code, and 2 is
+#: already taken twice over -- click raises ``UsageError``/``NoSuchOption`` with
+#: exit code 2, and ``cli/run_bootstrap.py`` itself raises ``SystemExit(2)`` on
+#: seed/config failures. Reusing either would make "you passed a bad flag" and
+#: "the run did not meet its goal" indistinguishable to a script, defeating the
+#: machine-readable outcome signal this constant exists to provide.
+EXIT_RUN_UNHEALTHY = 3
 
 
 def run_health_exit_code(healthy: bool) -> int:
@@ -293,6 +300,25 @@ def count_incomplete_declared(full_status_counts: dict[str, int] | None) -> int:
     return sum(
         int(count or 0) for status, count in full_status_counts.items() if status in _INCOMPLETE_DECLARED_STATUSES
     )
+
+
+def count_never_terminal(n_unresolved: int, n_incomplete_declared: int) -> int:
+    """Combine the two never-reached-a-terminal-outcome signals without double-counting.
+
+    ``n_unresolved`` (collector-derived: started via ``start_task()``, absent
+    from done/failed, ``end_time is None``) and ``n_incomplete_declared``
+    (histogram-derived: open/claimed/in-progress/orphaned at shutdown) are two
+    independent *estimates of the same population* -- tasks that were declared
+    and never terminated -- read from two different sources. The same reaped
+    no-output task typically appears in BOTH, so summing them counts it twice
+    and makes the Run Health totals disagree with the Overview.
+
+    Taking the maximum keeps whichever source saw more such tasks (neither is
+    strictly a superset: the collector misses tasks it never started, the
+    histogram misses tasks the server already dropped) while never counting one
+    task twice.
+    """
+    return max(int(n_unresolved), int(n_incomplete_declared))
 
 
 def classify_task_terminator(task: Task) -> str:
@@ -473,7 +499,7 @@ def compute_run_health(
     if n_refused_merges > 0:
         return False, counts.copy()
 
-    total = len(all_tasks) + n_unresolved + n_incomplete_declared
+    total = len(all_tasks) + count_never_terminal(n_unresolved, n_incomplete_declared)
     if total == 0:
         return True, counts.copy()
 
@@ -501,7 +527,10 @@ def _write_run_health_section(
         n_refused_merges=n_refused_merges,
         n_incomplete_declared=n_incomplete_declared,
     )
-    total = len(all_tasks) + n_unresolved + n_incomplete_declared
+    # Same de-duplicated total the Overview section uses: n_unresolved and
+    # n_incomplete_declared describe the same never-terminated tasks seen from
+    # two sources, so they are combined by max(), not summed.
+    total = len(all_tasks) + count_never_terminal(n_unresolved, n_incomplete_declared)
     agent_completed = counts.get(TERMINATOR_AGENT_COMPLETED, 0)
     watchdog_killed = counts.get(TERMINATOR_WATCHDOG_KILLED, 0)
     janitor_rejected = counts.get(TERMINATOR_JANITOR_REJECTED, 0)
@@ -954,9 +983,15 @@ def generate_retrospective(
             full_status_counts,
         )
 
+    # The Overview and the Run Health section must agree, so both count the
+    # never-terminated tasks the same de-duplicated way: n_unresolved and
+    # n_incomplete_declared are two views of one population (see
+    # count_never_terminal), and summing them reported the same reaped task
+    # twice -- "2/2 terminations were NOT genuine" against "0 done / 1 total".
+    n_never_terminal = count_never_terminal(n_unresolved, n_incomplete_declared)
     n_done = len(done_tasks)
-    n_failed = len(failed_tasks) + n_unresolved
-    total = len(all_tasks) + n_unresolved
+    n_failed = len(failed_tasks) + n_never_terminal
+    total = len(all_tasks) + n_never_terminal
     completion_rate = (n_done / total * 100) if total else 0.0
 
     _status_histogram = full_status_counts if full_status_counts is not None else {"done": n_done, "failed": n_failed}

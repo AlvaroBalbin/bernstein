@@ -1494,7 +1494,7 @@ class OrchestratorConfig:
     # separate from (and larger than) ``heartbeat_timeout_s`` so a slow/free
     # model that takes >120s to its first turn is not reaped mid-work while a
     # non-heartbeat adapter has only its spawn-time heartbeat on disk (issue
-    # #3012). Overridable via ``tuning.orchestrator.heartbeat_starting_timeout_s``.
+    # #3012). Overridable via ``tuning.agent.heartbeat_starting_timeout_s``.
     heartbeat_starting_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_starting_timeout_s))
     heartbeat_enabled: bool = True
     # Derived from ORCHESTRATOR.max_agent_runtime_s (canonical) so

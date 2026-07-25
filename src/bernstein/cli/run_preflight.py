@@ -185,9 +185,26 @@ def _exit_nonzero_on_unhealthy_run(status_payload: object) -> None:
     or a declared task never terminated (e.g. the manager agent produced no
     model output and was reaped) -- must not exit 0, so an operator scripting
     ``bernstein run && deploy`` never deploys on a run that accomplished
-    nothing (issue #3010). Only the synchronous (quiescence-wait) path can
-    know the outcome; a non-dict payload (server unreachable / detached) is
-    left as exit 0 rather than guessing.
+    nothing (issue #3010).
+
+    The verdict is applied ONLY when quiescence was actually detected.
+    ``_wait_for_run_completion`` returns ``None`` for every "no verdict" case
+    (wait deadline expired with the run still in flight, or the server was
+    unreachable), and this function maps that to exit 0 rather than guessing:
+    a long-running-but-healthy run must never be reported as a failure just
+    for outliving the CLI's wait deadline.
+
+    Scope (deliberate, do not over-read): this covers runs whose end the CLI
+    can actually observe. Quiescence is defined as ``open == claimed == 0``
+    with no live agents, so a run that ends with a task still sitting in
+    ``open`` -- the shape in issue #3010, where the orchestrator stops but the
+    task was never re-driven -- is never reported quiescent and reaches the
+    deadline instead, exiting 0 here. Widening the quiescence definition to
+    cover it would risk declaring a run finished during the startup window
+    (``open`` > 0 with no agents spawned yet) and is a separate change. The
+    retrospective's own verdict is not subject to this: it is computed at
+    shutdown from the full task-status histogram and correctly reports such a
+    run UNHEALTHY (see ``compute_run_health``).
     """
     if not isinstance(status_payload, dict):
         return

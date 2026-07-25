@@ -107,6 +107,50 @@ def test_wait_for_run_completion_timeout_does_not_signal_shutdown() -> None:
     shutdown_signal.assert_not_called()
 
 
+def test_wait_for_run_completion_timeout_returns_no_verdict() -> None:
+    """A wait that times out with the run still in flight returns None.
+
+    Returning the last observed payload instead would hand the caller a
+    mid-flight snapshot (open/claimed > 0 -- precisely why quiescence was never
+    detected), and the run-outcome exit mapping would misreport a healthy
+    long-running run as unhealthy. None is the explicit "no verdict" signal.
+    """
+    clock = {"now": 0.0}
+
+    def _fake_time() -> float:
+        clock["now"] += 10.0
+        return clock["now"]
+
+    with (
+        patch("bernstein.cli.run_bootstrap.server_get", return_value={"total": 2, "open": 1, "claimed": 1}),
+        patch("bernstein.cli.run_bootstrap.time.sleep", return_value=None),
+        patch("bernstein.cli.run_bootstrap.time.time", side_effect=_fake_time),
+        patch("bernstein.cli.run_bootstrap._signal_orchestrator_shutdown"),
+    ):
+        result = _wait_for_run_completion(timeout_s=5.0)
+
+    assert result is None
+
+
+def test_wait_for_run_completion_unreachable_server_returns_no_verdict() -> None:
+    """An unreachable server for the whole wait is also "no verdict", not a failure."""
+    clock = {"now": 0.0}
+
+    def _fake_time() -> float:
+        clock["now"] += 10.0
+        return clock["now"]
+
+    with (
+        patch("bernstein.cli.run_bootstrap.server_get", return_value=None),
+        patch("bernstein.cli.run_bootstrap.time.sleep", return_value=None),
+        patch("bernstein.cli.run_bootstrap.time.time", side_effect=_fake_time),
+        patch("bernstein.cli.run_bootstrap._signal_orchestrator_shutdown"),
+    ):
+        result = _wait_for_run_completion(timeout_s=5.0)
+
+    assert result is None
+
+
 def test_signal_orchestrator_shutdown_posts_to_shutdown_endpoint() -> None:
     """Happy path: orchestrator still up, POST /shutdown is sent and acknowledged."""
     fake_response = type(

@@ -197,16 +197,23 @@ class TestCleanupOrdering:
 
     def test_quiet_run_exits_nonzero_when_task_never_completed(self) -> None:
         """Issue #3010: the synchronous (quiet) completion path must exit
-        non-zero when the run ended with a declared task neither done nor
-        failed -- an operator scripting ``bernstein run && deploy`` must not
-        deploy on a run that produced nothing."""
+        non-zero when QUIESCENCE WAS DETECTED and the run still ended with a
+        declared task neither done nor failed -- an operator scripting
+        ``bernstein run && deploy`` must not deploy on a run that produced
+        nothing.
+
+        ``_wait_for_run_completion`` returns a payload only when quiescence was
+        actually observed, so a returned payload here means "the run really
+        ended in this state", not "it was still working". The still-in-flight
+        case is covered by the timeout test below.
+        """
         from bernstein.core.retrospective import EXIT_RUN_UNHEALTHY
 
         from bernstein.cli.run_preflight import _finalize_run_output
 
-        stuck_status = {"total": 1, "done": 0, "failed": 0, "open": 1}
+        ended_stuck_status = {"total": 1, "done": 0, "failed": 0, "open": 1}
         with (
-            patch("bernstein.cli.run_bootstrap._wait_for_run_completion", return_value=stuck_status),
+            patch("bernstein.cli.run_bootstrap._wait_for_run_completion", return_value=ended_stuck_status),
             patch("bernstein.cli.run_preflight._show_run_summary"),
             patch("bernstein.cli.run_preflight._drain_completed_backlog_files") as drain,
         ):
@@ -215,6 +222,45 @@ class TestCleanupOrdering:
         assert exc_info.value.code == EXIT_RUN_UNHEALTHY
         assert exc_info.value.code != 0
         # Cleanup still runs on the non-zero-exit path.
+        drain.assert_called_once()
+
+    def test_quiet_run_exits_nonzero_on_quiescent_run_with_failed_task(self) -> None:
+        """The exit mapping fires on any observable bad outcome, not just the
+        never-terminated case: a quiescent run with a failed task exits
+        non-zero."""
+        from bernstein.core.retrospective import EXIT_RUN_UNHEALTHY
+
+        from bernstein.cli.run_preflight import _finalize_run_output
+
+        failed_status = {"total": 2, "done": 1, "failed": 1, "open": 0}
+        with (
+            patch("bernstein.cli.run_bootstrap._wait_for_run_completion", return_value=failed_status),
+            patch("bernstein.cli.run_preflight._show_run_summary"),
+            patch("bernstein.cli.run_preflight._drain_completed_backlog_files"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _finalize_run_output(quiet=True)
+        assert exc_info.value.code == EXIT_RUN_UNHEALTHY
+
+    def test_quiet_run_exits_zero_when_wait_times_out_still_in_flight(self) -> None:
+        """A healthy run that simply outlives the CLI wait deadline must exit 0.
+
+        ``_wait_for_run_completion`` returns None when quiescence was never
+        observed (the run is still working in the background). That is a
+        "no verdict" case, NOT a failure: multi-hour goals are designed for
+        (scope timeouts reach 7200s against a 3600s default wait), so treating
+        the timeout as unhealthy would break ``bernstein run && deploy`` in the
+        opposite direction from the bug this PR fixes.
+        """
+        from bernstein.cli.run_preflight import _finalize_run_output
+
+        with (
+            patch("bernstein.cli.run_bootstrap._wait_for_run_completion", return_value=None),
+            patch("bernstein.cli.run_preflight._show_run_summary"),
+            patch("bernstein.cli.run_preflight._drain_completed_backlog_files") as drain,
+        ):
+            # Must return normally (exit 0), not raise SystemExit.
+            _finalize_run_output(quiet=True)
         drain.assert_called_once()
 
     def test_quiet_run_exits_zero_when_all_done(self) -> None:

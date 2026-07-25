@@ -1054,15 +1054,29 @@ def _wait_for_run_completion(
         timeout_s: Maximum total time to wait.
 
     Returns:
-        Final ``/status`` payload when quiescent, else the last observed payload.
+        The final ``/status`` payload IF AND ONLY IF quiescence was actually
+        detected, else ``None``.
+
+        A ``None`` return means "no verdict": the deadline expired (or the
+        server stayed unreachable) while the run was still in flight. It must
+        NOT be read as a failed run -- callers deriving an exit code from the
+        outcome have to treat it as unknown and stay at 0, because the
+        orchestrator keeps running in the background and may still complete
+        every task successfully.
+
+        Returning the last observed (non-quiescent) payload here instead would
+        hand callers a mid-flight snapshot that by definition still has
+        ``open``/``claimed`` > 0 -- that is exactly why quiescence was never
+        detected -- so a run that merely outlived the wait deadline would be
+        misreported as unhealthy. Multi-hour goals are designed for (see the
+        scope timeouts in ``core/defaults.py``, up to 7200s against this 3600s
+        default deadline), which makes that misread the common case rather
+        than an edge one.
     """
     deadline = time.time() + timeout_s
-    last_status: dict[str, Any] | None = None
     while time.time() < deadline:
         status_payload = server_get("/status")
         health_payload = server_get("/health")
-        if isinstance(status_payload, dict):
-            last_status = status_payload
         if isinstance(status_payload, dict) and isinstance(health_payload, dict):
             total = int(status_payload.get("total", 0) or 0)
             open_count = int(status_payload.get("open", 0) or 0)
@@ -1080,7 +1094,13 @@ def _wait_for_run_completion(
                 _signal_orchestrator_shutdown(reason="cli detected run completion (quiescent)")
                 return status_payload
         time.sleep(poll_interval_s)
-    return last_status
+    logger.info(
+        "run_completion_wait_timed_out after %.0fs: quiescence never observed -- the run is "
+        "still in flight in the background. Returning no verdict; callers must not treat this "
+        "as a failed run.",
+        timeout_s,
+    )
+    return None
 
 
 #: How long the exiting CLI waits for the first spawn outcome (roughly one
