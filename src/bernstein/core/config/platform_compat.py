@@ -1108,7 +1108,10 @@ def _win_stop_pinned(pin: _WinReapPin, *, force: bool, tree: bool) -> bool:
     # lead pid steady while it runs, so /T resolves children of the process
     # we meant and not of a namesake.
     returncode = _win_run_taskkill(pid, force=force, tree=tree)
-    if returncode == 0 and pin.wait_for_exit(_WIN_EXIT_CONFIRM_MS):
+    if returncode == 0:
+        # taskkill accepted the stop.  Return without waiting: the grace
+        # window belongs to the caller, and the reap's own poll loop is what
+        # decides whether the tree needs the force tier.
         return True
     if returncode == _WIN_TASKKILL_NOT_FOUND:
         logger.debug("taskkill reports PID %d is not running", pid)
