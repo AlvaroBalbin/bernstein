@@ -92,6 +92,40 @@ membership key) resolves against full history, but a window reaching past the
 retention boundary yields fewer events than expected. Cut slices inside the
 retention window until that exporter is widened.
 
+Retention itself runs inside the chain transaction described below. Archiving a
+segment is a compress followed by an unlink, and a read landing between the two
+sees either that day's events twice or not at all. Neither needs a concurrent
+writer, and the second one reads as "no charter exists".
+
+## Concurrent writes
+
+Every command that appends to a charter first reads the recorded history and
+decides from it. That read and the append run inside one cross-process
+transaction, so two operators running `tenant create` for the same tenant at the
+same moment produce one charter, not two.
+
+Without it both processes observe "no charter exists" and each append an opening
+event. Both records are individually well-formed, so the HMAC chain still
+verifies while the fold reports a duplicate `seq`, and because the log is
+append-only the duplicate cannot be removed. The charter is unreadable
+permanently.
+
+Two outcomes are reported differently, and the distinction matters:
+
+| Outcome | What you see | What to do |
+|---|---|---|
+| Another writer got there first | `a charter already exists for tenant 'acme'`, exit 1 | Nothing. This is the same answer you would get running the commands a minute apart. |
+| The transaction could not be acquired | `ChainLockUnavailable`, naming the audit directory | Investigate. Something is holding the lock, commonly a process that forked without `exec` and was then killed, leaving the duplicated descriptor alive. |
+
+Identify the holder (`lsof .sdd/audit/.chain.lock`) rather than deleting the
+lock file. The lock's identity is the file's inode, so a fresh one admits a
+second writer alongside the current holder.
+
+Independently of the lock, appending an event whose declared predecessor is no
+longer the recorded tail is refused with `stale_predecessor`. A caller that
+bypasses the transaction gets a deterministic refusal rather than a silently
+broken charter.
+
 ## Certificates: what a run may do
 
 A charter says who belongs to a tenant. A **tenant certificate** says what a run
@@ -165,6 +199,17 @@ principal. There is no implicit allowlist.
 
 The verb is `tenant` because `team` is taken by agent role manifests and
 `workspace` by multi-repo management.
+
+`bernstein audit verify` folds every recorded charter as one of its integrity
+pillars, so a broken charter fails the top-level verifier rather than passing
+it. That check is orthogonal to `--hmac-only` and `--merkle-only` and runs
+regardless of either: the HMAC verdict answers whether the bytes are authentic,
+which is not the same question as whether the history they record is
+consistent. A fold failure keeps its own reason (`gap`, `bad_seq`,
+`stale_predecessor`, `malformed_body`, ...) rather than being reported as a
+chain error, because the two have different causes and different remedies:
+altered bytes on one side, an inconsistent history of authentic records on the
+other.
 
 ## Related
 

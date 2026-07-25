@@ -573,24 +573,70 @@ class TestChainReconstruction:
         assert [e.details["call_index"] for e in events] == [0, 1, 2]
         assert events == chain.query(event_type=EVENT_MCP_STATELESS_CALL)
 
-    def test_verify_and_query_holds_the_append_lock(self, tmp_path: Path) -> None:
-        """AC6: an append cannot interleave between the verify and the query --
-        the operation holds the store's append lock across both reads, so a
-        concurrent ``log_with_prev_digest`` would block."""
+    def test_verify_and_query_holds_the_chain_transaction(self, tmp_path: Path) -> None:
+        """AC6: an append cannot interleave between the verify and the query.
+
+        The operation holds the chain transaction across both reads. That
+        guarantee is now cross-process rather than per-store: the probe below
+        opens a *fresh* descriptor on the lock file, which is exactly what a
+        second process's descriptor is - ``flock`` state belongs to the open
+        file description, not to the process - so a failed acquisition on it
+        proves a second process would block too.
+        """
+        import os
+        import threading
+
+        from bernstein.core.persistence.file_locks import os_try_lock_fd, os_unlock_fd
+        from bernstein.core.security.audit import (
+            _CHAIN_LOCK_NAME,
+            ChainLockUnavailable,
+            chain_transaction,
+        )
+
+        audit_dir = tmp_path / "audit"
         chain = self._seed(tmp_path)
         observed: dict[str, bool] = {}
         real_verify = chain._log.verify
 
+        def _probe_os_lock_is_held() -> bool:
+            """True when a fresh descriptor cannot take the OS lock."""
+            fd = os.open(str(audit_dir / _CHAIN_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                if os_try_lock_fd(fd):
+                    os_unlock_fd(fd)
+                    return False
+                return True
+            finally:
+                os.close(fd)
+
+        def _probe_foreign_thread_blocked() -> bool:
+            """True when another thread cannot enter the transaction."""
+            blocked: list[bool] = []
+
+            def _attempt() -> None:
+                try:
+                    with chain_transaction(audit_dir, timeout=0):
+                        blocked.append(False)
+                except ChainLockUnavailable:
+                    blocked.append(True)
+
+            thread = threading.Thread(target=_attempt)
+            thread.start()
+            thread.join(timeout=30)
+            return bool(blocked and blocked[0])
+
         def _spy_verify() -> tuple[bool, list[str]]:
-            observed["locked_during_verify"] = chain._append_lock.locked()
+            observed["os_lock_held_during_verify"] = _probe_os_lock_is_held()
+            observed["foreign_thread_blocked_during_verify"] = _probe_foreign_thread_blocked()
             return real_verify()
 
         chain._log.verify = _spy_verify  # type: ignore[method-assign]
         ok, _, _ = chain.verify_and_query(event_type=EVENT_MCP_STATELESS_CALL)
         assert ok
-        assert observed["locked_during_verify"] is True
-        # The lock is released once the operation returns.
-        assert not chain._append_lock.locked()
+        assert observed["os_lock_held_during_verify"] is True
+        assert observed["foreign_thread_blocked_during_verify"] is True
+        # Released once the operation returns, so the next caller is not wedged.
+        assert _probe_os_lock_is_held() is False
 
 
 # ---------------------------------------------------------------------------

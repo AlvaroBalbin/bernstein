@@ -25,7 +25,6 @@ is treated as the stable surface. Helpers MUST:
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -39,8 +38,11 @@ from bernstein.core.security.audit import (
 from bernstein.core.security.audit import (
     AuditEvent,
     AuditLog,
+    ChainLockMisuse,
+    ChainLockUnavailable,
     ChainScanCursor,
     ChainScanResult,
+    chain_transaction,
 )
 
 # ---------------------------------------------------------------------------
@@ -921,19 +923,42 @@ class AuditChainStore:
         key_path: Path | None = None,
     ) -> None:
         self._log = AuditLog(audit_dir=audit_dir, key=key, key_path=key_path)
-        # Serialise read-prev-then-append so two concurrent attaches
-        # never embed the same predecessor in their details payload.
-        # The underlying AuditLog also writes to disk under this same
-        # lock, keeping the on-disk chain order consistent with the
-        # ``prev_chain_digest`` each event embedded.
+        self._audit_dir = audit_dir
+        # No per-store lock. Read-prev-then-append is serialised by
+        # ``chain_transaction``, which holds across processes; a second
+        # in-process lock over the same resource would only add an acquisition
+        # order to invert. The previous per-store ``threading.Lock`` claimed to
+        # keep two concurrent calls on distinct ``prev_chain_digest`` values,
+        # which held within one process and not at all across the separate
+        # processes the CLI actually runs as.
         # (bot-ack: 3284182792 -- CodeRabbit major.)
-        self._append_lock = threading.Lock()
 
     # -- public surface -----------------------------------------------------
 
     @property
+    def audit_dir(self) -> Path:
+        """Directory this store's chain lives in (the transaction's identity)."""
+        return self._audit_dir
+
+    def transaction(self, *, timeout: float | None = None) -> chain_transaction:
+        """Open a cross-process transaction over this store's chain.
+
+        Wrap read + decide + append in one of these whenever the append depends
+        on what the read returned. Nesting is safe: every append inside takes
+        the same transaction and re-enters it.
+        """
+        return chain_transaction(self._audit_dir, timeout=timeout)
+
+    @property
     def prev_chain_digest(self) -> str:
-        """Return the HMAC of the most recent event (the chain head)."""
+        """Return the HMAC of the most recent event (the chain head).
+
+        This is the *cached* head. It is only refreshed inside
+        :meth:`AuditLog.log`, so a caller reading it outside a
+        :class:`chain_transaction` can get a value another process has already
+        superseded. Use :meth:`log_with_prev_digest`, which re-syncs first,
+        rather than reading this and appending separately.
+        """
         # AuditLog tracks _prev_hmac internally; exposing it here gives
         # callers the value to embed inside the next event's payload
         # without breaking the chain (the embedded value is part of the
@@ -951,14 +976,24 @@ class AuditChainStore:
     ) -> AuditEvent:
         """Embed the prior chain digest into *details* and append the event.
 
-        The read-and-append is performed under a per-store lock so
-        two concurrent calls always see distinct ``prev_chain_digest``
-        values and the underlying chain stays linear.
+        Read-head-then-append is a read-modify-append, so it runs inside
+        :class:`chain_transaction`: the head is re-synced from disk under the
+        cross-process lock and the append that consumes it happens before the
+        lock is released. The nested :meth:`AuditLog.log` re-enters the same
+        transaction.
+
+        The re-sync is what makes the embedded value true. Without it the head
+        is read from a per-instance cache that only :meth:`AuditLog.log`
+        refreshes, so a second process's append is invisible and the record
+        states - under a valid HMAC - that the chain head it observed was
+        something it was not. ``verify()`` cannot catch that: the embedded
+        digest is opaque payload to the HMAC, so a false claim signs exactly as
+        cleanly as a true one.
         (bot-ack: 3284182792 -- CodeRabbit major.)
         """
-        with self._append_lock:
+        with chain_transaction(self._audit_dir):
             merged: dict[str, Any] = details.copy()
-            merged["prev_chain_digest"] = self.prev_chain_digest
+            merged["prev_chain_digest"] = self._log.resync_head()
             return self._log.log(
                 event_type=event_type,
                 actor=actor,
@@ -1047,16 +1082,18 @@ class AuditChainStore:
         :meth:`verify` and :meth:`query` are otherwise two independent reads: a
         concurrent append landing between them lets a caller act on a
         projection the verification never covered (a verify/query TOCTOU).
-        Holding the append lock across both reads pins a single snapshot -- the
-        events returned are exactly the events that were verified -- because
-        chained appends acquire the same lock before touching the log.
+        Holding :class:`chain_transaction` across both reads pins a single
+        snapshot -- the events returned are exactly the events that were
+        verified -- because every append takes the same transaction before
+        touching the log. The guarantee is now cross-process: previously an
+        append from a *second* process could still land between the two reads.
 
         Returns:
             ``(ok, errors, events)``: the verification verdict and its per-entry
             errors alongside the events matching the filters, all read under
             one lock.
         """
-        with self._append_lock:
+        with chain_transaction(self._audit_dir):
             ok, errors = self._log.verify()
             events = self._log.query(
                 event_type=event_type,
@@ -7774,6 +7811,8 @@ __all__ = [
     "GATE_RESOLUTIONS",
     "GATE_TERMINAL_RESOLUTIONS",
     "AuditChainStore",
+    "ChainLockMisuse",
+    "ChainLockUnavailable",
     "ClearanceResolutionRefusal",
     "ComputerUseActionDetails",
     "CostProfileReportDetails",
@@ -7786,6 +7825,7 @@ __all__ = [
     "SkillInstallReceiptDetails",
     "SkillVerificationRefusalDetails",
     "ThreadApprovalDetails",
+    "chain_transaction",
     "reconstruct_mcp_call_order",
     "record_a2a_message_receipt",
     "record_activity_result",

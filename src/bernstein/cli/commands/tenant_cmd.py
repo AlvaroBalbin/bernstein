@@ -77,43 +77,52 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
     # included. A live-only read would let anyone open a second charter for an
     # existing tenant once retention archived the opening day - an ownership
     # takeover requiring no forgery, just patience.
-    try:
-        existing = read_charter_events(chain, tenant_id)
-    except CharterChainError as exc:
-        raise click.ClickException(
-            f"refusing to create {tenant_id!r}: its recorded charter history is unreadable ({exc}). "
-            f"Run 'bernstein tenant verify {tenant_id}' before creating anything."
-        ) from exc
-    if existing:
-        raise click.ClickException(f"a charter already exists for tenant {tenant_id!r}")
+    #
+    # The read, the decision, and every append of the batch run inside ONE
+    # transaction. Reading first and locking only for the appends is the same
+    # defect with extra latency: the decision was already taken from a snapshot
+    # the other writer has since invalidated, and two processes each conclude
+    # "no charter exists". Both appends are individually valid, so the HMAC
+    # chain still verifies while the fold reports a duplicate seq - permanently,
+    # because the log is append-only.
+    with chain.transaction():
+        try:
+            existing = read_charter_events(chain, tenant_id)
+        except CharterChainError as exc:
+            raise click.ClickException(
+                f"refusing to create {tenant_id!r}: its recorded charter history is unreadable ({exc}). "
+                f"Run 'bernstein tenant verify {tenant_id}' before creating anything."
+            ) from exc
+        if existing:
+            raise click.ClickException(f"a charter already exists for tenant {tenant_id!r}")
 
-    try:
-        events = [next_event(None, tenant_id=tenant_id, kind=CHARTER_OPEN, principal=principal)]
-        events.append(
-            next_event(
-                events[-1],
-                tenant_id=tenant_id,
-                kind=CHARTER_MEMBER_ADD,
-                principal=principal,
-                body={"principal": principal, "role": role},
-            )
-        )
-        if budget_usd is not None:
+        try:
+            events = [next_event(None, tenant_id=tenant_id, kind=CHARTER_OPEN, principal=principal)]
             events.append(
                 next_event(
                     events[-1],
                     tenant_id=tenant_id,
-                    kind=CHARTER_BUDGET_SET,
+                    kind=CHARTER_MEMBER_ADD,
                     principal=principal,
-                    body={"budget_usd": budget_usd},
+                    body={"principal": principal, "role": role},
                 )
             )
-        state = fold_charter(events)
-    except CharterChainError as exc:
-        raise click.ClickException(str(exc)) from exc
+            if budget_usd is not None:
+                events.append(
+                    next_event(
+                        events[-1],
+                        tenant_id=tenant_id,
+                        kind=CHARTER_BUDGET_SET,
+                        principal=principal,
+                        body={"budget_usd": budget_usd},
+                    )
+                )
+            state = fold_charter(events)
+        except CharterChainError as exc:
+            raise click.ClickException(str(exc)) from exc
 
-    for event in events:
-        record_charter_event(chain, event)
+        for event in events:
+            record_charter_event(chain, event)
 
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
@@ -147,24 +156,29 @@ def grant_cmd(tenant_id: str, principal: str, role: str, actor: str | None, work
     )
 
     chain = _chain(workdir)
-    try:
-        events = read_charter_events(chain, tenant_id)
-        if not events:
-            raise click.ClickException(f"no charter for tenant {tenant_id!r}; run 'bernstein tenant create' first")
-        current = fold_charter(events)
-        kind = CHARTER_ROLE_SET if current.is_member(principal) else CHARTER_MEMBER_ADD
-        event = next_event(
-            events[-1],
-            tenant_id=tenant_id,
-            kind=kind,
-            principal=actor or principal,
-            body={"principal": principal, "role": role},
-        )
-        state = fold_charter([*events, event])
-    except CharterChainError as exc:
-        raise click.ClickException(str(exc)) from exc
+    # Read, decide, and append inside one transaction: the event is minted
+    # against the tail this read observed, so another writer must not append
+    # between the two.
+    with chain.transaction():
+        try:
+            events = read_charter_events(chain, tenant_id)
+            if not events:
+                raise click.ClickException(f"no charter for tenant {tenant_id!r}; run 'bernstein tenant create' first")
+            current = fold_charter(events)
+            kind = CHARTER_ROLE_SET if current.is_member(principal) else CHARTER_MEMBER_ADD
+            event = next_event(
+                events[-1],
+                tenant_id=tenant_id,
+                kind=kind,
+                principal=actor or principal,
+                body={"principal": principal, "role": role},
+            )
+            state = fold_charter([*events, event])
+        except CharterChainError as exc:
+            raise click.ClickException(str(exc)) from exc
 
-    record_charter_event(chain, event)
+        record_charter_event(chain, event)
+
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
         payload,
@@ -194,22 +208,25 @@ def revoke_cmd(tenant_id: str, principal: str, actor: str | None, workdir: Path,
     )
 
     chain = _chain(workdir)
-    try:
-        events = read_charter_events(chain, tenant_id)
-        if not events:
-            raise click.ClickException(f"no charter for tenant {tenant_id!r}")
-        event = next_event(
-            events[-1],
-            tenant_id=tenant_id,
-            kind=CHARTER_MEMBER_REMOVE,
-            principal=actor or principal,
-            body={"principal": principal},
-        )
-        state = fold_charter([*events, event])
-    except CharterChainError as exc:
-        raise click.ClickException(str(exc)) from exc
+    # Read, decide, and append inside one transaction (see ``grant``).
+    with chain.transaction():
+        try:
+            events = read_charter_events(chain, tenant_id)
+            if not events:
+                raise click.ClickException(f"no charter for tenant {tenant_id!r}")
+            event = next_event(
+                events[-1],
+                tenant_id=tenant_id,
+                kind=CHARTER_MEMBER_REMOVE,
+                principal=actor or principal,
+                body={"principal": principal},
+            )
+            state = fold_charter([*events, event])
+        except CharterChainError as exc:
+            raise click.ClickException(str(exc)) from exc
 
-    record_charter_event(chain, event)
+        record_charter_event(chain, event)
+
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
         payload,
@@ -269,8 +286,14 @@ def verify_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
     from bernstein.core.security.tenant_charter import verify_charter
 
     chain = _chain(workdir)
-    result = verify_charter(chain, tenant_id)
-    chain_ok, chain_errors = chain.verify()
+    # Both reads under one transaction. Retention alone can make a charter read
+    # as a duplicated or missing day for the width of an archive operation, and
+    # an operator cannot tell such a transient FAIL from a real one - so the
+    # verifier must not be able to observe that window at all. It also pins the
+    # fold verdict and the HMAC verdict to the same snapshot.
+    with chain.transaction():
+        result = verify_charter(chain, tenant_id)
+        chain_ok, chain_errors = chain.verify()
 
     payload = result.to_dict()
     payload["audit_chain_ok"] = chain_ok

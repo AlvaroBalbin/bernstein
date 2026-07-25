@@ -16,6 +16,7 @@ error at load time.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import gzip
 import hashlib
@@ -27,18 +28,40 @@ import secrets
 import shutil
 import stat
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable
 
-if sys.platform == "win32":
-    fcntl = None  # type: ignore[assignment]
-else:
-    import fcntl  # type: ignore[no-redef]
+
+# The OS-level lock primitives are the ones the file-lock manager already ships
+# and exercises on both platforms (``fcntl.flock`` on POSIX, ``msvcrt.locking``
+# on Windows). Reusing them keeps the audit chain's cross-process guarantee
+# identical on every platform instead of leaving Windows on a no-op path that
+# would report a green chain while providing no exclusion at all.
+#
+# ``cross_process_lock`` itself is deliberately NOT reused: it opens a fresh
+# handle per call, which carries the same self-deadlock this module's
+# transaction exists to remove, and it has no in-process ownership layer.
+#
+# ``None`` is the one preserved degradation path: on a build with neither
+# ``fcntl`` nor ``msvcrt`` the transaction becomes a pass-through rather than
+# raising or hanging. Every supported platform ships one of the two.
+def _load_lock_shims() -> tuple[Callable[[int], bool], Callable[[int], None]] | None:
+    """Resolve the platform's OS-level lock primitives, or ``None`` if it has none."""
+    try:
+        from bernstein.core.persistence.file_locks import os_try_lock_fd, os_unlock_fd
+    except ImportError:  # pragma: no cover - platform with neither fcntl nor msvcrt
+        return None
+    return (os_try_lock_fd, os_unlock_fd)
+
+
+_CHAIN_LOCK_SHIMS = _load_lock_shims()
 
 _JSONL_GLOB = "*.jsonl"
 
@@ -329,37 +352,378 @@ def _compute_hmac(key: bytes, prev_hmac: str, entry: dict[str, Any]) -> str:
     return _hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
 
 
-@contextlib.contextmanager
-def _chain_append_lock(audit_dir: Path) -> Iterator[None]:
-    """Serialise daily-log appends across processes via ``flock(LOCK_EX)``.
+# ---------------------------------------------------------------------------
+# Cross-process chain transaction
+# ---------------------------------------------------------------------------
 
-    The task server, the spawner, the orchestrator, and CLI commands are
-    separate processes that append to the same ``.sdd/audit/<day>.jsonl``.
-    In-process ``threading.Lock``s only serialise threads within one process;
-    without an OS-level lock two processes recover the same chain tail in
-    ``AuditLog.__init__`` and each append a record embedding the same stale
-    ``prev_hmac``, forking the HMAC chain and breaking ``verify()`` for the
-    whole daily log (issue #2791).
+#: Seconds a caller waits for the chain transaction before giving up. Matches
+#: ``WRITE_LOCK_TIMEOUT_S`` in the recipe registry: the same shape of bounded
+#: cross-process wait, so an operator meets one number rather than two. An
+#: unbounded wait is not an option here because a stale holder is reachable -
+#: ``os.fork()`` without ``exec`` duplicates the open file description, so the
+#: OS lock survives the parent being killed.
+CHAIN_LOCK_TIMEOUT_S: float = 30.0
 
-    A single stable lock file per audit dir serialises across day rollovers
-    (a writer that has rolled to the next day still contends with one still on
-    the previous day). Falls back to a no-op on platforms without ``fcntl``
-    (Windows); the in-process locks callers may hold remain the only ordering
-    there, matching how the lineage spine degrades.
+#: How long a waiter sleeps between acquisition attempts. Short enough that an
+#: uncontended handoff is not perceptibly delayed, long enough that a contended
+#: wait does not spin a core.
+_CHAIN_LOCK_POLL_S: float = 0.002
+
+#: Name of the per-audit-dir lock sentinel. Stable across day rollovers, so a
+#: writer that has rolled to the next day still contends with one still on the
+#: previous day.
+_CHAIN_LOCK_NAME = ".chain.lock"
+
+
+class ChainLockUnavailable(RuntimeError):
+    """The chain transaction could not be acquired within its budget.
+
+    This is an operational fault, not a semantic outcome: something is holding
+    the lock and did not let go. The common cause is a process that forked
+    without ``exec`` and was then killed, leaving the duplicated open file
+    description - and therefore the OS lock - alive.
+
+    Deliberately distinct from a caller losing a benign race (for example, a
+    second ``tenant create`` finding the charter already opened). Collapsing the
+    two would turn "you lost a race, re-read and retry" into a page.
     """
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    if fcntl is None:  # pragma: no cover - Windows path
-        yield
-        return
-    lock_path = audit_dir / ".chain.lock"
-    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+
+
+class ChainLockMisuse(RuntimeError):
+    """The chain transaction was entered or exited from the wrong scope.
+
+    Raised when a second asyncio task on the same thread tries to enter a
+    transaction the first task holds, and when a context manager instance is
+    exited from a thread or task other than the one that entered it.
+    """
+
+
+#: How many idle audit directories the lock table keeps descriptors for. A
+#: process normally works against exactly one audit directory, so this only
+#: binds in harnesses that sweep through many: at roughly one descriptor per
+#: directory an unbounded table is an eventual ``EMFILE``, which in a long-lived
+#: task server is an outage. Entries above the cap are reclaimed only when no
+#: caller holds or is acquiring them (see :func:`_reclaim_idle_entries`).
+CHAIN_LOCK_TABLE_CAP: int = 256
+
+
+@dataclass
+class _ChainLockEntry:
+    """Per-audit-dir lock state: one OS descriptor plus the in-process ownership layer.
+
+    Attributes:
+        mutex: In-process exclusion. A plain :class:`threading.Lock`, never an
+            ``RLock``: re-entrancy is decided by the explicit ``owner``
+            comparison, and an ``RLock`` would grant same-thread re-entry to a
+            *different* asyncio task, which is the very interleaving the
+            transaction exists to forbid.
+        fd: The single descriptor whose lock state is this entry's cross-process
+            identity. While the entry is in the table this descriptor stays
+            open: on POSIX a ``flock`` belongs to the open file description, so
+            re-opening the path would produce a descriptor that blocks on this
+            process's own lock. Keeping it open also pins the inode, which is
+            what makes ``(st_dev, st_ino)`` a safe table key - an inode number
+            cannot be recycled by another file while a descriptor holds it.
+        try_lock: Non-blocking OS-level acquire for this platform.
+        unlock: OS-level release for this platform.
+        depth: Re-entrancy counter for the owning scope.
+        owner: ``(thread_ident, id(current_task))`` of the scope holding the
+            lock, or ``None`` when free.
+        users: How many live :class:`chain_transaction` instances have this
+            entry: holders, and callers between lookup and acquisition. Only an
+            entry at zero may be reclaimed.
+    """
+
+    mutex: threading.Lock
+    fd: int
+    try_lock: Callable[[int], bool]
+    unlock: Callable[[int], None]
+    depth: int = 0
+    owner: tuple[int, int] | None = None
+    users: int = 0
+
+
+#: Lock table keyed on ``(st_dev, st_ino)`` of the lock file, never on the
+#: ``Path`` used to reach it. One audit dir is routinely spelled several ways in
+#: one process - a relative path from a CLI default, an absolute path from a
+#: service, a symlinked checkout - and on a case-insensitive filesystem even
+#: ``Path.resolve()`` does not fold ``.CHAIN.LOCK`` onto ``.chain.lock``. Two
+#: table entries for one inode would each hand out the in-process mutex
+#: independently while contending for the same OS lock, which is a self-deadlock
+#: rather than exclusion.
+#:
+#: The table's invariant, which is what makes the inode key safe: an entry is
+#: either present *and* holding its descriptor open (pinning the inode), or
+#: absent entirely. There is never a present entry whose inode could have been
+#: recycled underneath it.
+_CHAIN_TABLE: dict[tuple[int, int], _ChainLockEntry] = {}
+_CHAIN_TABLE_GUARD = threading.Lock()
+
+
+def _current_scope() -> tuple[int, int]:
+    """Identify the caller as ``(thread_ident, id(current_task))``.
+
+    The asyncio half matters because two tasks on one event loop share a thread
+    ident. Treating them as the same holder would let task B append inside a
+    section task A opened, which is exactly the read-modify-append interleaving
+    the transaction forbids.
+    """
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
+        task = asyncio.current_task()
+    except (RuntimeError, ImportError):  # no running loop, or asyncio unavailable
+        task = None
+    return (threading.get_ident(), id(task))
+
+
+def _reclaim_idle_entries() -> None:
+    """Drop descriptors for audit dirs nothing is using. Caller holds the table guard.
+
+    Reclamation is gated on ``users == 0``, not on ``owner is None``. Those are
+    different: a caller sits between :func:`_entry_for` and its mutex
+    acquisition with ``owner`` still ``None``, and closing the descriptor in
+    that window would leave it locking a closed descriptor. The user count
+    covers exactly that window.
+
+    Closing an unused descriptor cannot release anything: this process is not
+    holding the lock, and another process's lock lives on its own open file
+    description. A later caller for the same directory simply re-opens and
+    re-registers, contending correctly with everyone else.
+    """
+    if len(_CHAIN_TABLE) <= CHAIN_LOCK_TABLE_CAP:
+        return
+    for key, entry in list(_CHAIN_TABLE.items()):
+        if len(_CHAIN_TABLE) <= CHAIN_LOCK_TABLE_CAP:
+            return
+        if entry.users:
+            continue
+        # Remove before closing so no lookup can ever reach an entry whose
+        # descriptor is gone. Both happen under the guard, so the intermediate
+        # state is unobservable either way.
+        del _CHAIN_TABLE[key]
         with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(entry.fd)
+
+
+def _entry_for(audit_dir: Path) -> _ChainLockEntry | None:
+    """Return the lock entry for *audit_dir* with a user reference taken.
+
+    Returns ``None`` when the platform offers no OS lock primitive - the one
+    preserved degradation path, on which the transaction becomes a pass-through
+    rather than raising or hanging. Every supported platform has one of the two.
+
+    The caller owns the returned entry's user reference and must release it via
+    :func:`_release_entry`.
+    """
+    if _CHAIN_LOCK_SHIMS is None:  # pragma: no cover - no OS lock primitive
+        return None
+    try_lock, unlock = _CHAIN_LOCK_SHIMS
+
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = audit_dir / _CHAIN_LOCK_NAME
+    # Read+write because Windows ``msvcrt.locking`` cannot take an exclusive
+    # lock on a write-only descriptor; ``0o600`` because the sentinel lives
+    # inside the audit directory.
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        st = os.fstat(fd)
+    except OSError:
         os.close(fd)
+        raise
+
+    key = (st.st_dev, st.st_ino)
+    with _CHAIN_TABLE_GUARD:
+        entry = _CHAIN_TABLE.get(key)
+        if entry is not None:
+            # This descriptor was only ever a probe for the inode. Closing it
+            # cannot disturb a lock held on the stored one: that lock belongs to
+            # a different open file description.
+            os.close(fd)
+            entry.users += 1
+            return entry
+
+        entry = _ChainLockEntry(mutex=threading.Lock(), fd=fd, try_lock=try_lock, unlock=unlock)
+        _CHAIN_TABLE[key] = entry
+        # Take the reference BEFORE sweeping. A brand-new entry is idle by
+        # definition, so a sweep that ran first could evict the very entry it is
+        # about to hand back - closing its descriptor and dropping it from the
+        # table - and the caller would then lock a closed descriptor.
+        entry.users += 1
+        _reclaim_idle_entries()
+        return entry
+
+
+def _release_entry(entry: _ChainLockEntry) -> None:
+    """Drop one user reference taken by :func:`_entry_for`."""
+    with _CHAIN_TABLE_GUARD:
+        entry.users -= 1
+
+
+class chain_transaction:
+    """Serialise a read-modify-append on the audit chain across processes.
+
+    Anything that reads the chain, decides from what it read, and then appends
+    needs the read and the append inside one section. Holding a lock only for
+    the append is not enough: the decision was already taken from a snapshot
+    another writer has since invalidated. Two ``bernstein tenant create``
+    processes each read "no charter exists", each append an opening event, and
+    the resulting segment carries two events claiming ``seq == 0``. Both records
+    are individually well-formed, so the HMAC chain still verifies while the
+    charter fold is permanently unreadable - and the log is append-only, so the
+    duplicate can never be removed.
+
+    Usage::
+
+        with chain_transaction(audit_dir):
+            events = read_charter_events(chain, tenant_id)
+            if not events:
+                record_charter_event(chain, opening)
+
+    Nesting is safe: :meth:`AuditLog.log` takes the same transaction internally,
+    so an append inside a caller's section re-enters rather than deadlocking.
+
+    **This is exclusion, not atomicity.** The OS lock guarantees that no other
+    holder runs concurrently. It does not make a batch of appends all-or-nothing:
+    a crash midway commits the prefix already written, and an append-only log has
+    no rollback. Callers that batch appends should be written so that a partial
+    batch is diagnosable, not silently taken for a complete one.
+
+    Deliberately **not** implemented with ``@contextlib.contextmanager``. A
+    generator-backed context manager is single-shot: a foreign ``__exit__``
+    advances the generator past the release point before any ownership check in
+    the ``finally`` can fire, so the check raises while the OS lock is already
+    unreleasable by its true owner - and every later transaction in the process
+    then matches the stale ``owner`` and takes the re-entrant path against a
+    depth that never reaches zero. An explicit class checks the scope at the top
+    of :meth:`__exit__` and returns without touching lock state. Do not
+    "simplify" this back into a generator.
+
+    Args:
+        audit_dir: The audit directory whose chain is being guarded.
+        timeout: Seconds to wait before raising :class:`ChainLockUnavailable`.
+            Defaults to :data:`CHAIN_LOCK_TIMEOUT_S`. One deadline covers the
+            in-process wait and the cross-process wait together; bounding only
+            the second lets a caller wait twice the budget.
+
+    Raises:
+        ChainLockUnavailable: The lock was not acquired within *timeout*.
+        ChainLockMisuse: Entered by a second asyncio task on a thread that
+            already holds it, or exited from a different thread or task.
+    """
+
+    __slots__ = ("_audit_dir", "_entered", "_entry", "_outermost", "_scope", "_timeout")
+
+    def __init__(self, audit_dir: Path, *, timeout: float | None = None) -> None:
+        self._audit_dir = Path(audit_dir)
+        self._timeout = CHAIN_LOCK_TIMEOUT_S if timeout is None else timeout
+        self._entry: _ChainLockEntry | None = None
+        self._scope: tuple[int, int] | None = None
+        self._outermost = False
+        self._entered = False
+
+    def __enter__(self) -> None:
+        self._outermost = False
+        self._entered = False
+        entry = _entry_for(self._audit_dir)
+        self._entry = entry
+        if entry is None:  # pragma: no cover - no OS lock primitive
+            self._entered = True
+            return
+
+        try:
+            self._acquire(entry)
+        except BaseException:
+            # The user reference taken by ``_entry_for`` belongs to a live
+            # instance only. A failed entry has none, so hand it back or the
+            # entry is pinned for the life of the process.
+            self._entry = None
+            _release_entry(entry)
+            raise
+        self._entered = True
+
+    def _acquire(self, entry: _ChainLockEntry) -> None:
+        scope = _current_scope()
+        self._scope = scope
+
+        if entry.owner == scope:
+            entry.depth += 1
+            return
+
+        if entry.owner is not None and entry.owner[0] == scope[0]:
+            # Same thread, different asyncio task. Waiting here is nonsense: the
+            # context that must run to release the lock is the one being
+            # blocked, so a wait would burn the whole budget and then fail
+            # anyway - with the wrong error. Fail immediately and name the
+            # misuse.
+            raise ChainLockMisuse(
+                f"chain transaction on {self._audit_dir} is held by another asyncio task on this "
+                "thread; a second task must not enter it. Complete or await the holding task's "
+                "section before opening another."
+            )
+
+        deadline = time.monotonic() + self._timeout
+        while not entry.mutex.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise ChainLockUnavailable(self._timeout_message())
+            time.sleep(_CHAIN_LOCK_POLL_S)
+
+        try:
+            while not entry.try_lock(entry.fd):
+                if time.monotonic() >= deadline:
+                    raise ChainLockUnavailable(self._timeout_message())
+                time.sleep(_CHAIN_LOCK_POLL_S)
+        except BaseException:
+            # Mandatory. Without it a cross-process timeout leaves the
+            # in-process mutex held forever, and the next caller in this process
+            # fails with ChainLockUnavailable for a lock nobody holds.
+            entry.mutex.release()
+            raise
+
+        entry.owner = scope
+        entry.depth = 1
+        self._outermost = True
+
+    def __exit__(self, *exc: object) -> None:
+        entry = self._entry
+        if entry is None or not self._entered:
+            return
+
+        # Checked before any state is touched. An exit from a foreign scope must
+        # leave the lock exactly as it found it, so the true owner can still
+        # release it afterwards.
+        if _current_scope() != self._scope:
+            raise ChainLockMisuse(
+                f"chain transaction on {self._audit_dir} was entered by another thread or task; "
+                "it must be exited by the scope that entered it. The lock is untouched and still "
+                "held by its owner."
+            )
+
+        self._entered = False
+        try:
+            if not self._outermost:
+                entry.depth -= 1
+                return
+
+            entry.depth = 0
+            entry.owner = None
+            try:
+                with contextlib.suppress(OSError):
+                    entry.unlock(entry.fd)
+            finally:
+                # Released even if the OS unlock raised, so one failed unlock
+                # cannot wedge the process.
+                entry.mutex.release()
+        finally:
+            self._entry = None
+            _release_entry(entry)
+
+    def _timeout_message(self) -> str:
+        return (
+            f"could not acquire the audit chain transaction on {self._audit_dir} within "
+            f"{self._timeout}s. Another process is holding it, or a process forked without exec "
+            f"and was killed while inside it - the duplicated descriptor keeps the OS lock alive. "
+            f"Identify the holder (e.g. 'lsof {self._audit_dir / _CHAIN_LOCK_NAME}') rather than "
+            f"removing the lock file: a fresh inode admits a second writer alongside the current one."
+        )
 
 
 def _path_size(path: Path) -> int:
@@ -826,6 +1190,9 @@ class AuditLog:
         # ``-1`` force a re-sync on the first append.
         self._synced_path: Path | None = None
         self._synced_size = -1
+        # Guards the one-level recursion in ``_seal_torn_tail``: sealing a torn
+        # final line records an event, which re-enters ``log``.
+        self._sealing = False
 
     # -- chain recovery -----------------------------------------------------
 
@@ -892,7 +1259,7 @@ class AuditLog:
         Returns:
             The newly created AuditEvent with computed HMAC.
         """
-        with _chain_append_lock(self._audit_dir):
+        with chain_transaction(self._audit_dir):
             # One clock reading feeds both the timestamp and the daily-file
             # name: two readings can straddle a UTC midnight and file an event
             # under a day that disagrees with its own timestamp, and the append
@@ -903,14 +1270,21 @@ class AuditLog:
             day = now.strftime("%Y-%m-%d")
             log_path = self._audit_dir / f"{day}.jsonl"
 
+            # A crash can leave the day file without its trailing newline. The
+            # next record would then concatenate onto the fragment, producing
+            # one unparseable line holding both and silently swallowing a real
+            # record - and ``verify()`` would report *fewer* errors than before.
+            # Seal the fragment first so it stays one isolated, permanently
+            # flagged line.
+            self._seal_torn_tail(log_path)
+
             # Re-sync the chain tail from disk under the cross-process lock so a
             # concurrent writer's appended head is chained onto rather than a
             # stale tail captured at construction (issue #2791). Fast path: when
             # the current day file is byte-length-identical to what our own last
             # append left it at, no other process has appended and the cached
             # head still stands, so the re-read (a full-file scan) is skipped.
-            if log_path != self._synced_path or _path_size(log_path) != self._synced_size:
-                self._prev_hmac = self._recover_chain_tail()
+            self._resync_head_for(log_path)
 
             entry_dict: dict[str, Any] = {
                 "timestamp": ts,
@@ -942,6 +1316,14 @@ class AuditLog:
             # verifier reads bytes and re-canonicalises against ``\n``-only
             # frames; without this the ``\r`` stays inside each split line and
             # the byte-equality tamper check trips.
+            #
+            # The record MUST be handed to a single ``write()`` call, terminator
+            # included. One write is what keeps a concurrent cross-process read
+            # tear-free: a reader either sees the whole record or none of it,
+            # never a prefix. Splitting this into chunked or streaming writes -
+            # payload then newline, or a per-field writer - reintroduces torn
+            # reads for every reader of the log. Do not change the shape of this
+            # write.
             with log_path.open("a", encoding="utf-8", newline="") as fh:
                 fh.write(json.dumps(entry_dict, sort_keys=True) + "\n")
 
@@ -949,6 +1331,80 @@ class AuditLog:
             self._synced_path = log_path
             self._synced_size = _path_size(log_path)
         return event
+
+    def _resync_head_for(self, log_path: Path) -> None:
+        """Refresh the cached chain head from *log_path* when it may have moved.
+
+        Fast path preserved verbatim (issue #2690): when the day file is
+        byte-length-identical to what this instance's own last append left it
+        at, no other writer has touched it, so the full-file rescan is skipped.
+        """
+        if log_path != self._synced_path or _path_size(log_path) != self._synced_size:
+            self._prev_hmac = self._recover_chain_tail()
+
+    def resync_head(self) -> str:
+        """Refresh the cached chain head from disk and return it.
+
+        For callers that must read the head and then append based on what they
+        read - :meth:`AuditChainStore.log_with_prev_digest` embeds it in the
+        event payload. The cached head is only refreshed inside :meth:`log`, so
+        a caller reading it beforehand can publish a value that was already
+        superseded by another process. The resulting record asserts, under a
+        valid HMAC, that the chain head it observed was something it was not.
+
+        The caller must already hold :class:`chain_transaction` for this audit
+        directory, otherwise the value can go stale again before it is used.
+
+        Returns:
+            The current chain head HMAC.
+        """
+        day = datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        self._resync_head_for(self._audit_dir / f"{day}.jsonl")
+        return self._prev_hmac
+
+    def _seal_torn_tail(self, log_path: Path) -> None:
+        """Terminate a crash-truncated final line so the next record cannot fuse onto it.
+
+        Never repairs and never truncates: the log is append-only, so the torn
+        fragment stays exactly where it is as one isolated line that the
+        verifier flags forever. Sealing it costs one permanent error; not
+        sealing it costs a real record, silently.
+
+        The caller must hold :class:`chain_transaction`.
+        """
+        if self._sealing:
+            return
+        try:
+            size = log_path.stat().st_size
+        except OSError:
+            return
+        if size <= 0:
+            return
+        try:
+            with log_path.open("rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                last = fh.read(1)
+        except OSError:  # pragma: no cover - filesystem race
+            return
+        if last == b"\n":
+            return
+
+        with log_path.open("ab") as fh:
+            fh.write(b"\n")
+
+        # Recording the seal re-enters ``log``; the flag bounds that to one
+        # level, and by then the file already ends in a newline anyway.
+        self._sealing = True
+        try:
+            self.log(
+                event_type="chain.torn_record",
+                actor="audit-log",
+                resource_type="audit_segment",
+                resource_id=log_path.name,
+                details={"segment": log_path.name, "byte_offset": size},
+            )
+        finally:
+            self._sealing = False
 
     # -- verify -------------------------------------------------------------
 
@@ -1179,6 +1635,18 @@ class AuditLog:
         archive subdirectory.  The original ``.jsonl`` file is removed after
         a successful compress.
 
+        Runs inside :class:`chain_transaction` because compressing and then
+        unlinking is two steps against a directory readers walk in one pass
+        (archived segments first, live segments second). Both intermediate
+        states are wrong, and neither needs a concurrent writer to happen:
+
+        * Between the ``.gz`` landing and the ``.jsonl`` being unlinked, a
+          reader sees every event of that day twice.
+        * A reader that listed the archive before the ``.gz`` landed and
+          globbed the live files after the unlink misses that day entirely -
+          so an intact charter reads as "no charter exists", and the caller
+          that acted on it opens a second one over the top.
+
         Args:
             policy: Retention settings.  Uses defaults if ``None``.
 
@@ -1194,35 +1662,36 @@ class AuditLog:
         archived: list[str] = []
         skipped: list[str] = []
 
-        for log_path in sorted(self._audit_dir.glob(_JSONL_GLOB)):
-            stem = log_path.stem  # e.g. "2025-12-01"
-            try:
-                file_date = datetime.strptime(stem, "%Y-%m-%d").replace(tzinfo=UTC).date()
-            except ValueError:
-                skipped.append(log_path.name)
-                continue
+        with chain_transaction(self._audit_dir):
+            for log_path in sorted(self._audit_dir.glob(_JSONL_GLOB)):
+                stem = log_path.stem  # e.g. "2025-12-01"
+                try:
+                    file_date = datetime.strptime(stem, "%Y-%m-%d").replace(tzinfo=UTC).date()
+                except ValueError:
+                    skipped.append(log_path.name)
+                    continue
 
-            if file_date >= cutoff:
-                skipped.append(log_path.name)
-                continue
+                if file_date >= cutoff:
+                    skipped.append(log_path.name)
+                    continue
 
-            gz_path = archive_dir / f"{log_path.name}.gz"
-            if gz_path.exists():
-                skipped.append(log_path.name)
-                continue
+                gz_path = archive_dir / f"{log_path.name}.gz"
+                if gz_path.exists():
+                    skipped.append(log_path.name)
+                    continue
 
-            # Crash-safe compress: write to a sibling temp file and atomically
-            # rename into place, so a crash mid-archive never leaves a partial
-            # ``.gz`` that the verifier would later read (the original
-            # ``.jsonl`` is only unlinked once the full ``.gz`` is on disk).
-            tmp_path = gz_path.with_name(f"{gz_path.name}.tmp")
-            with log_path.open("rb") as f_in, gzip.open(tmp_path, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            tmp_path.replace(gz_path)
+                # Crash-safe compress: write to a sibling temp file and atomically
+                # rename into place, so a crash mid-archive never leaves a partial
+                # ``.gz`` that the verifier would later read (the original
+                # ``.jsonl`` is only unlinked once the full ``.gz`` is on disk).
+                tmp_path = gz_path.with_name(f"{gz_path.name}.tmp")
+                with log_path.open("rb") as f_in, gzip.open(tmp_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                tmp_path.replace(gz_path)
 
-            log_path.unlink()
-            archived.append(log_path.name)
-            logger.info("Archived audit log %s -> %s", log_path.name, gz_path.name)
+                log_path.unlink()
+                archived.append(log_path.name)
+                logger.info("Archived audit log %s -> %s", log_path.name, gz_path.name)
 
         return ArchiveResult(
             archived=archived,

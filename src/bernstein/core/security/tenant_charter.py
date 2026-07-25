@@ -640,6 +640,49 @@ def verify_charter(chain: AuditChainStore, tenant_id: str) -> CharterVerificatio
 # ---------------------------------------------------------------------------
 
 
+def _require_current_predecessor(chain: AuditChainStore, event: CharterEvent) -> None:
+    """Refuse *event* unless the recorded tail is exactly the predecessor it claims.
+
+    A lock only protects the callers that take it, and one demonstrably did not:
+    ``archive()`` rewrites the directory a charter read walks. So the invariant
+    is asserted by the record rather than left to lock discipline. A caller that
+    forgets :meth:`AuditChainStore.transaction` gets a loud, deterministic
+    refusal instead of a silently bricked charter.
+
+    The precondition and the lock compose: the lock provides liveness (a second
+    writer waits rather than spinning on refusals), the precondition provides
+    safety (a writer that skipped the lock cannot corrupt the fold).
+
+    The caller must already hold the transaction, otherwise the tail this reads
+    can move before the append lands.
+
+    Raises:
+        CharterChainError: with reason ``"stale_predecessor"`` when the recorded
+            tail is not the event's declared predecessor.
+    """
+    recorded = read_charter_events(chain, event.tenant_id)
+    if not recorded:
+        if event.seq != 0 or event.prev_event_hash != CHARTER_GENESIS:
+            raise CharterChainError(
+                "stale_predecessor",
+                f"refusing to append charter event seq {event.seq} for {event.tenant_id!r}: no charter "
+                f"is recorded, so the only appendable event is seq 0 pointing at the genesis sentinel",
+                seq=event.seq,
+            )
+        return
+
+    tail = recorded[-1]
+    tail_hash = tail.event_hash()
+    if event.prev_event_hash != tail_hash or event.seq != tail.seq + 1:
+        raise CharterChainError(
+            "stale_predecessor",
+            f"refusing to append charter event seq {event.seq} for {event.tenant_id!r}: it was minted "
+            f"against predecessor {event.prev_event_hash} (expecting seq {tail.seq + 1}), but the "
+            f"recorded tail is seq {tail.seq} with hash {tail_hash}. Re-read the charter and mint again.",
+            seq=event.seq,
+        )
+
+
 def record_charter_event(chain: AuditChainStore, event: CharterEvent) -> str:
     """Append *event* to the HMAC audit chain and return its content address.
 
@@ -647,17 +690,29 @@ def record_charter_event(chain: AuditChainStore, event: CharterEvent) -> str:
     the charter history inherits the audit chain's tamper evidence on top of
     its own hash linkage. ``details.tenant_id`` is set so the existing
     tenant-scoped export finds charter events without a special case.
+
+    The read of the recorded tail, the compare against the event's declared
+    predecessor, and the append all run inside one cross-process transaction.
+    Appending an event whose predecessor is no longer the tail is refused rather
+    than written: the log is append-only, so a duplicate ``seq`` can never be
+    removed and the fold would stay unreadable forever.
+
+    Raises:
+        CharterChainError: with reason ``"stale_predecessor"`` when the recorded
+            tail is not the predecessor *event* was minted against.
     """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
     details: dict[str, Any] = {"charter": event.to_body(), "tenant_id": event.tenant_id}
-    chain.log_with_prev_digest(
-        event_type=EVENT_TENANT_CHARTER,
-        actor=event.principal,
-        resource_type="tenant",
-        resource_id=event.tenant_id,
-        details=details,
-    )
+    with chain.transaction():
+        _require_current_predecessor(chain, event)
+        chain.log_with_prev_digest(
+            event_type=EVENT_TENANT_CHARTER,
+            actor=event.principal,
+            resource_type="tenant",
+            resource_id=event.tenant_id,
+            details=details,
+        )
     return event.event_hash()
 
 
@@ -672,13 +727,27 @@ def read_charter_events(chain: AuditChainStore, tenant_id: str) -> list[CharterE
     which would make an intact charter look like it never existed - and would
     let ``tenant create`` reopen a tenant that already has an owner.
 
+    The read runs inside the chain transaction, which is what keeps it from
+    observing the two-step archive window: between a segment's ``.gz`` landing
+    and its ``.jsonl`` being unlinked every event of that day is visible twice,
+    and a read straddling the unlink misses that day entirely. Neither window
+    needs a concurrent writer - retention alone opens both - and the second one
+    reads as "no charter exists", which is exactly the answer that lets a caller
+    open a second charter over a live one.
+
+    This read alone is not enough for a caller that then appends: the decision
+    and the append must be inside *one* transaction, so such callers wrap both
+    in :meth:`AuditChainStore.transaction` and this nests within it.
+
     Raises:
         CharterChainError: if a recorded event body cannot be rebuilt.
     """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
     out: list[CharterEvent] = []
-    for entry in chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True):
+    with chain.transaction():
+        entries = chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True)
+    for entry in entries:
         body = (entry.details or {}).get("charter")
         if not isinstance(body, dict):
             continue

@@ -58,6 +58,19 @@ LOCK_TTL_SECONDS = 7_200  # 2 hours - expire stale locks from crashed agents
 if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
     import msvcrt
 
+    def os_try_lock_fd(fd: int) -> bool:
+        """Attempt an exclusive OS-level lock on *fd* without blocking (Windows)."""
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    def os_unlock_fd(fd: int) -> None:
+        """Release the OS-level lock on *fd* (Windows)."""
+        with suppress(OSError):
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
     def _os_lock(fh: IO[bytes]) -> None:
         """Acquire an exclusive OS-level lock on *fh* (Windows)."""
         while True:
@@ -69,37 +82,47 @@ if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
                 # if it still raises we loop with a short sleep so the semantics
                 # match the blocking POSIX flock.
                 time.sleep(0.05)
+else:
+    import fcntl
 
-    def _os_try_lock(fh: IO[bytes]) -> bool:
-        """Attempt the lock without blocking; return whether it was taken."""
+    def os_try_lock_fd(fd: int) -> bool:
+        """Attempt an exclusive OS-level lock on *fd* without blocking (POSIX)."""
         try:
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return False
         return True
 
-    def _os_unlock(fh: IO[bytes]) -> None:
-        """Release the OS-level lock on *fh* (Windows)."""
-        with suppress(OSError):
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-else:
-    import fcntl
+    def os_unlock_fd(fd: int) -> None:
+        """Release the OS-level lock on *fd* (POSIX)."""
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
     def _os_lock(fh: IO[bytes]) -> None:
         """Acquire an exclusive OS-level lock on *fh* (POSIX)."""
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
 
-    def _os_try_lock(fh: IO[bytes]) -> bool:
-        """Attempt the lock without blocking; return whether it was taken."""
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return False
-        return True
 
-    def _os_unlock(fh: IO[bytes]) -> None:
-        """Release the OS-level lock on *fh* (POSIX)."""
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+# The descriptor-level primitives above are the real platform switch; the
+# handle-level wrappers below are a thin convenience for this module's own
+# context managers.
+#
+# They are public because the audit chain's cross-process transaction uses them
+# directly: it owns one long-lived descriptor per audit directory and layers its
+# own re-entrancy on top, so it cannot use :func:`cross_process_lock` (a fresh
+# handle per call would block on the process's own lock). Taking a descriptor
+# rather than a file object lets that caller hold a bare ``int`` instead of a
+# Python file object it would never close. Sharing the switch keeps both
+# platforms on identical semantics with one place to fix.
+
+
+def _os_try_lock(fh: IO[bytes]) -> bool:
+    """Attempt the lock without blocking; return whether it was taken."""
+    return os_try_lock_fd(fh.fileno())
+
+
+def _os_unlock(fh: IO[bytes]) -> None:
+    """Release the OS-level lock on *fh*."""
+    os_unlock_fd(fh.fileno())
 
 
 @contextmanager
