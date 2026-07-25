@@ -336,6 +336,64 @@ def setup_worktree_env(
             logger.warning("Failed to run worktree setup command: %s", exc)
 
 
+_WORKTREE_GITIGNORE_ENTRIES: tuple[str, ...] = (".sdd/", ".claude/", "CLAUDE.md")
+
+
+def _ensure_worktree_gitignore(worktree_path: Path) -> None:
+    """Ensure the worktree's root ``.gitignore`` excludes agent-control state.
+
+    Bernstein orchestrates agents against arbitrary target repositories,
+    most of which have no idea ``.sdd/``, ``.claude/``, or ``CLAUDE.md`` are
+    bernstein-internal runtime/agent-control files. Without this, an agent
+    that follows its own "finish with ``git add -A && git commit``"
+    instruction stages ``.sdd/runtime/*`` logs and heartbeats,
+    ``.sdd/skills/activations.jsonl``, ``.claude/*`` config, and
+    ``CLAUDE.md`` - and the reap-and-merge preflight's forbidden-path guard
+    then refuses the *entire* commit, diverting real work to the graveyard
+    instead of merging it (#3017).
+
+    Appends only the entries missing from any existing ``.gitignore``
+    (tracked or not), so the injection is idempotent: once a repo has these
+    lines - either from a prior agent run that committed them, or because
+    the target project already ignores them - later worktrees produce no
+    diff at all.
+
+    Best-effort: a failure is logged but never blocks worktree creation - a
+    worktree usable without this guard is still better than no worktree.
+
+    Args:
+        worktree_path: Root of the newly-created worktree.
+    """
+    gitignore_path = worktree_path / ".gitignore"
+    try:
+        existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+    except OSError as exc:
+        logger.warning("Could not read %s to inject agent-control ignores: %s", gitignore_path, exc)
+        return
+
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    missing = [entry for entry in _WORKTREE_GITIGNORE_ENTRIES if entry not in existing_lines]
+    if not missing:
+        return
+
+    block_lines = [
+        "# Bernstein agent-control/runtime state -- never a deliverable (see #3017).",
+        *missing,
+        "",
+    ]
+    block = "\n".join(block_lines)
+    # Separate the new block from any existing content with a blank line,
+    # but never emit a leading blank line into a brand-new file.
+    prefix = "" if not existing else ("" if existing.endswith("\n") else "\n") + "\n"
+
+    try:
+        with gitignore_path.open("a", encoding="utf-8") as fh:
+            fh.write(prefix + block)
+        logger.info("Injected agent-control ignores into %s: %s", gitignore_path, missing)
+    except OSError as exc:
+        logger.warning("Failed to write agent-control ignores to %s: %s", gitignore_path, exc)
+
+
 def _branch_exists(repo_root: Path, branch: str) -> bool:
     """Return True if *branch* resolves to a commit in *repo_root*."""
     try:
@@ -825,6 +883,11 @@ class WorktreeManager:
         # no ``asyncio.shield`` (shielding an unbounded cleanup would turn a
         # cancel into a hang).
         try:
+            # Ensure runtime/agent-control state is gitignored before the
+            # agent ever runs ``git add -A`` (#3017). Must happen before any
+            # setup step that might itself write into the worktree.
+            _ensure_worktree_gitignore(worktree_path)
+
             # Write lock file for stale detection (T487)
             worker_pid = os.getpid()
             write_worktree_lock(self.repo_root, session_id, pid=worker_pid)
