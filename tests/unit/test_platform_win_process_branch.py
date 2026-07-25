@@ -716,11 +716,19 @@ class TestReapReceiptWindowsProjection:
         already exited, so no stop could be delivered to it, and the receipt
         reported that as a failed reap. "Nothing left to stop" is the
         outcome the caller wanted, not a failure to produce it.
+
+        The exit is modelled at the *kernel* boundary rather than by stubbing
+        ``process_alive``. ``process_alive`` is where "no such pid", "live but
+        unopenable" and "will not answer" collapse into one False, so a test
+        that stubs it asserts the collapse instead of the exit and cannot fail
+        when the two are confused.
         """
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
         monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
-        monkeypatch.setattr(pc, "process_alive", lambda pid: False)
+        # A pid nothing holds: OpenProcess fails with ERROR_INVALID_PARAMETER.
+        fake = _PinKernel32(pid=999, exists=False)
+        _install_kernel32_everywhere(monkeypatch, fake)
 
         receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
 
@@ -787,13 +795,105 @@ class TestReapReceiptWindowsProjection:
         assert [c[0] for c in cmds] == ["taskkill"]
 
     def test_clean_exit_projects_confirmed_dead(self, monkeypatch: Any) -> None:
+        """A target that exits inside the grace window is confirmed by its pin.
+
+        The exit is driven through the kernel double so the confirmation has
+        to come from the pinned handle. Stubbing ``process_alive`` instead
+        would let a bare-pid probe answer for the target, which is the thing
+        the pin exists to stop.
+        """
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
-        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: True)
-        monkeypatch.setattr(pc, "process_alive", lambda pid: False)
+        fake = _PinKernel32(pid=999, running=True, start_time=time.time() - 30.0)
+        _install_kernel32_everywhere(monkeypatch, fake)
+
+        def _kpg(pgid: int, sig: int = signal.SIGTERM) -> bool:
+            fake.running = False  # the stop lands and the target exits
+            return True
+
+        monkeypatch.setattr(pc, "kill_process_group", _kpg)
 
         receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
 
         assert receipt.delivered is True
         assert receipt.confirmed_dead is True
         assert receipt.already_gone is False
+
+    def test_unopenable_live_target_is_not_confirmed_by_the_grace_poll(self, monkeypatch: Any) -> None:
+        """The grace-window poll may end a wait; it may not certify a death.
+
+        ``process_group_alive`` is a bare-pid probe on Windows, and
+        ``_win_process_alive`` reports "not running" for a live process this
+        user may not open. Letting that answer set ``confirmed_dead`` writes
+        "we watched it leave" into the signed chain about a process that is
+        still running. The confirmation therefore comes from the pin, which
+        names the target, and the pin here cannot see an exit.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        fake = _PinKernel32(pid=999, running=True, start_time=time.time() - 30.0)
+        _install_kernel32_everywhere(monkeypatch, fake)
+
+        def _kpg(pgid: int, sig: int = signal.SIGTERM) -> bool:
+            # The stop is accepted, and the target stays up but stops being
+            # openable: OpenProcess now answers ERROR_ACCESS_DENIED.
+            fake.openable = False
+            return True
+
+        monkeypatch.setattr(pc, "kill_process_group", _kpg)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert fake.running is True, "the target must still be running in this scenario"
+        assert receipt.delivered is True
+        assert receipt.confirmed_dead is False
+        assert receipt.already_gone is False
+
+    def test_reap_without_a_pin_claims_no_outcome(self, monkeypatch: Any) -> None:
+        """A reap whose pin could not be established confirms nothing.
+
+        ``_pin_reap_target`` degrades to the inert POSIX pin when the Windows
+        pin cannot be taken. That pin has no handle, so it has no way to
+        observe the target, and the only thing left to ask is the bare-pid
+        probe that cannot tell "gone" from "cannot look". Neither
+        ``already_gone`` nor ``confirmed_dead`` may be set from it.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        # Live process, refused by OpenProcess: ERROR_ACCESS_DENIED.
+        fake = _PinKernel32(pid=999, running=True, openable=False)
+        _install_kernel32_everywhere(monkeypatch, fake)
+
+        def _no_pin(pid: int) -> pc._WinReapPin | None:
+            raise OSError("kernel32 unavailable")
+
+        monkeypatch.setattr(pc, "_win_pin_process", _no_pin)
+        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert fake.running is True, "the target must still be running in this scenario"
+        assert receipt.delivered is False
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+
+    def test_escalation_without_a_pin_claims_no_death(self, monkeypatch: Any) -> None:
+        """The force tier without a pin reports the kill, never the outcome."""
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        fake = _PinKernel32(pid=999, running=True, openable=False)
+        _install_kernel32_everywhere(monkeypatch, fake)
+
+        def _no_pin(pid: int) -> pc._WinReapPin | None:
+            raise OSError("kernel32 unavailable")
+
+        monkeypatch.setattr(pc, "_win_pin_process", _no_pin)
+        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: True)
+        # Alive for the whole grace window, so the reap reaches the force tier.
+        monkeypatch.setattr(pc, "process_group_alive", lambda pgid: True)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.02, poll_interval=0.01)
+
+        assert receipt.delivered is True
+        assert receipt.escalated is True
+        assert receipt.confirmed_dead is False

@@ -397,6 +397,20 @@ class ProcessReapReceipt:
             set it.  False therefore means "not established", which is not
             the same as "still running" - the independent liveness helpers
             answer that question.
+
+            The observation's *scope* differs by platform, and the field is
+            only as strong as the scope it was taken at.  On POSIX the
+            observation covers the whole process group, because ``killpg``
+            addresses every member.  On Windows there is no group to probe:
+            the tree is stopped with ``taskkill /T`` but the confirmation is
+            taken from the pinned handle of the *lead* process, so
+            ``confirmed_dead`` there means the lead process left the system
+            and not that every descendant did.  A descendant that outlives
+            ``taskkill /T`` - one that refuses the console event, or one
+            already re-parented out of the tree - is outside what this field
+            can attest.  Read it as "the reaped lead is gone" on Windows;
+            widening it to the tree needs a tree-scoped observation the
+            platform layer does not have yet.
     """
 
     pgid: int
@@ -454,7 +468,17 @@ def _group_observed_gone(pgid: int) -> bool:
     """
     killpg = getattr(os, "killpg", None)
     if IS_WINDOWS or killpg is None:
-        return not process_group_alive(pgid)
+        # The bare-pid probe cannot establish an exit here, so it is not
+        # allowed to confirm one.  :func:`_win_process_alive` reports "not
+        # running" for a pid no process holds, for a live process this user
+        # may not open (``ERROR_ACCESS_DENIED``), and again when
+        # ``GetExitCodeProcess`` declines to answer.  Reading that False as
+        # an observed exit is the same "could not observe becomes observed
+        # gone" mistake the reap pin exists to prevent, one layer down.
+        # Confirmation on Windows comes from the pinned handle
+        # (:meth:`_WinReapPin.observed_gone`), which names the target; a reap
+        # with no pin has nothing that can confirm, and says so.
+        return False
     try:
         killpg(pgid, 0)
     except ProcessLookupError:
@@ -791,13 +815,26 @@ def reap_process_group(
         deadline = time.monotonic() + grace_seconds
         while time.monotonic() < deadline:
             if not process_group_alive(pgid):
-                return _receipt(delivered=True, escalated=False, confirmed_dead=True)
+                # process_group_alive decides when to stop waiting; it does
+                # not decide what may be claimed.  On Windows it is a bare-pid
+                # probe that reports an unopenable live process as not
+                # running, so the confirmation is taken from the pin, which
+                # names the target.  On POSIX the pin is the killpg probe.
+                return _receipt(
+                    delivered=True,
+                    escalated=False,
+                    confirmed_dead=pin.observed_gone(pgid),
+                )
             time.sleep(poll_interval)
 
         # Group still alive after grace period - escalate.
         if not process_group_alive(pgid):
             # Exited right on the grace boundary; no force tier needed.
-            return _receipt(delivered=True, escalated=False, confirmed_dead=True)
+            return _receipt(
+                delivered=True,
+                escalated=False,
+                confirmed_dead=pin.observed_gone(pgid),
+            )
         logger.warning(
             "Process group %d did not exit within %.1fs of SIGTERM; sending SIGKILL",
             pgid,
