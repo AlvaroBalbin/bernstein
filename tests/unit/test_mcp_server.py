@@ -299,23 +299,23 @@ async def test_bernstein_cost_returns_cost_summary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bernstein_stop_sends_stop_signal() -> None:
-    """bernstein_stop writes a SHUTDOWN signal file and confirms."""
+async def test_bernstein_stop_sends_stop_signal(tmp_path: Path) -> None:
+    """bernstein_stop writes a SHUTDOWN signal file and confirms.
+
+    A real project root on disk rather than a patched ``Path``: the handler
+    now proves the signal path is contained under the resolved workdir, and
+    a mocked path cannot exercise that.
+    """
     from bernstein.mcp.server import create_mcp_server
 
+    (tmp_path / ".sdd").mkdir()
     mcp = create_mcp_server(server_url="http://localhost:8052")
 
-    with patch("bernstein.mcp.server.Path") as mock_path_cls:
-        mock_path = MagicMock()
-        mock_path_cls.return_value = mock_path
-        mock_path.__truediv__ = MagicMock(return_value=mock_path)
-        mock_path.exists = MagicMock(return_value=True)
-        mock_path.write_text = MagicMock()
-
-        result = await mcp.call_tool("bernstein_stop", {})
+    result = await mcp.call_tool("bernstein_stop", {"workdir": str(tmp_path)})
 
     text = result[0][0].text  # type: ignore[index]
     assert "stop" in text.lower() or "shutdown" in text.lower()
+    assert (tmp_path / ".sdd" / "runtime" / "signals" / "SHUTDOWN").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -750,19 +750,21 @@ async def test_crash_protection_bernstein_approve() -> None:
 
 
 @pytest.mark.asyncio
-async def test_crash_protection_bernstein_stop() -> None:
-    """bernstein_stop returns error JSON on filesystem failure."""
+async def test_crash_protection_bernstein_stop(tmp_path: Path) -> None:
+    """bernstein_stop returns error JSON on filesystem failure.
+
+    The workdir is a real project root so the call clears the containment
+    barrier and fails where this test means it to: at the directory create.
+    """
+    import pathlib
+
     from bernstein.mcp.server import create_mcp_server
 
+    (tmp_path / ".sdd").mkdir()
     mcp = create_mcp_server(server_url="http://localhost:8052")
 
-    with patch("bernstein.mcp.server.Path") as mock_path_cls:
-        mock_path = MagicMock()
-        mock_path_cls.return_value = mock_path
-        mock_path.__truediv__ = MagicMock(return_value=mock_path)
-        mock_path.mkdir = MagicMock(side_effect=PermissionError("not allowed"))
-
-        result = await mcp.call_tool("bernstein_stop", {})
+    with patch.object(pathlib.Path, "mkdir", side_effect=PermissionError("not allowed")):
+        result = await mcp.call_tool("bernstein_stop", {"workdir": str(tmp_path)})
 
     text = result[0][0].text  # type: ignore[index]
     parsed = json.loads(text)

@@ -381,6 +381,33 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 
+
+def validation_scope_notice() -> str:
+    """Return the interim notice about this transport's weaker argument checks.
+
+    This transport does not route ``tools/call`` through
+    ``bernstein.mcp.input_validation.validate_tool_call``, so the
+    deny-by-default input firewall documented in ``docs/mcp/input-validation.md``
+    covers the stdio and SSE servers only. It also exposes a subset of the
+    server's tools, with schemas restated here rather than loaded from
+    ``src/bernstein/mcp/tool_schemas/``.
+
+    The tool list is derived from ``_TOOL_DEFS`` so the notice cannot drift
+    from what the transport actually serves.
+
+    This is a notice, not a fix. Delete this function, its call site, its
+    tests and the matching doc sections in the same change that closes issue
+    #3083.
+    """
+    names = ", ".join(str(defn["name"]) for defn in _TOOL_DEFS)
+    return (
+        f"Streamable HTTP transport: argument validation on this path is weaker than on stdio. "
+        f"It exposes {len(_TOOL_DEFS)} tools ({names}) with schemas restated in this module, "
+        f"and does not apply the deny-by-default input validation the stdio transport applies. "
+        f"Tracked in issue #3083."
+    )
+
+
 _SERVER_INFO: dict[str, Any] = {
     "name": "bernstein",
     "version": "1.0.0",
@@ -972,12 +999,14 @@ class StreamableHTTPTransport:
             return await self._proxy_post("/tasks", payload)
 
         if name == "bernstein_stop":
-            from pathlib import Path
+            from bernstein.mcp.signal_paths import shutdown_signal_path
 
-            workdir = arguments.get("workdir", ".")
-            signals_dir = Path(workdir) / ".sdd" / "runtime" / "signals"
-            signals_dir.mkdir(parents=True, exist_ok=True)
-            shutdown_file = signals_dir / "SHUTDOWN"
+            # Same barrier as the stdio surface: the workdir must name an
+            # existing project root and the signal path must stay inside it.
+            # A refusal raises and is rendered as the structured tool error,
+            # before any directory is created.
+            shutdown_file = shutdown_signal_path(arguments.get("workdir", "."))
+            shutdown_file.parent.mkdir(parents=True, exist_ok=True)
             shutdown_file.write_text("mcp-remote-stop\n", encoding="utf-8")
             return json.dumps({"status": "shutdown signal sent", "path": str(shutdown_file)})
 
@@ -1206,6 +1235,10 @@ def create_asgi_app(
         ASGI application callable.
     """
     cfg = config or RemoteMCPConfig()
+    # Interim notice (issue #3088). Emitted at WARNING so an operator sees it
+    # in ordinary startup output, not only with debug logging on. Remove with
+    # issue #3083.
+    logger.warning("%s", validation_scope_notice())
     transport = StreamableHTTPTransport(
         config=cfg,
         server_url=server_url,
