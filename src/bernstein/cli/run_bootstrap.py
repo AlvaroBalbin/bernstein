@@ -20,14 +20,17 @@ import httpx
 from bernstein.cli.first_run_guard import handle_first_run_exception
 from bernstein.cli.helpers import (
     SDD_DIRS,
+    SDD_PID_SPAWNER,
     SERVER_URL,
     adapter_cli_choice,
     auth_headers,
     console,
     find_seed_file,
+    is_alive,
     persist_server_port,
     print_banner,
     print_startup_banner,
+    read_pid,
     server_get,
 )
 from bernstein.cli.run_preflight import (
@@ -1042,6 +1045,24 @@ def _signal_orchestrator_shutdown(*, reason: str = "cli detected run completion"
         )
 
 
+def _orchestrator_liveness() -> tuple[bool, bool]:
+    """Return ``(pidfile_present, process_alive)`` for the orchestrator.
+
+    Reads the same ``.sdd/runtime/spawner.pid`` pidfile the bootstrap
+    supervisor and the demo reap path use, through the same canonical
+    ``is_alive`` check, rather than introducing a second notion of aliveness.
+
+    Both flags are needed because "no pidfile" is ambiguous on its own: it
+    means either "the orchestrator has not started yet" (startup window) or
+    "it exited and cleaned up". A pidfile that is present but points at a dead
+    pid is NOT ambiguous -- the orchestrator ran and is now gone.
+    """
+    pid = read_pid(SDD_PID_SPAWNER)
+    if pid is None or pid <= 0:
+        return False, False
+    return True, is_alive(pid)
+
+
 def _wait_for_run_completion(
     *,
     poll_interval_s: float = 2.0,
@@ -1054,26 +1075,38 @@ def _wait_for_run_completion(
         timeout_s: Maximum total time to wait.
 
     Returns:
-        The final ``/status`` payload IF AND ONLY IF quiescence was actually
-        detected, else ``None``.
+        The ``/status`` payload IF AND ONLY IF the run actually reached a
+        terminal state, else ``None``.
+
+        There are two terminal states, and both return a payload:
+
+        * **Quiescent** -- ``open == claimed == 0`` with no live agents: every
+          declared task reached a terminal outcome.
+        * **Orchestrator gone with unfinished tasks** -- the spawner process
+          has exited while declared tasks are still non-terminal. Nothing will
+          ever advance them, so the run is over and its goal was not met
+          (issue #3010).
 
         A ``None`` return means "no verdict": the deadline expired (or the
-        server stayed unreachable) while the run was still in flight. It must
-        NOT be read as a failed run -- callers deriving an exit code from the
-        outcome have to treat it as unknown and stay at 0, because the
-        orchestrator keeps running in the background and may still complete
-        every task successfully.
+        server stayed unreachable) while the run was still genuinely in
+        flight. It must NOT be read as a failed run -- callers deriving an
+        exit code have to treat it as unknown and stay at 0, because the
+        orchestrator is still working and may complete every task.
 
-        Returning the last observed (non-quiescent) payload here instead would
-        hand callers a mid-flight snapshot that by definition still has
-        ``open``/``claimed`` > 0 -- that is exactly why quiescence was never
+        Returning the last observed (non-quiescent) payload for that case
+        instead would hand callers a mid-flight snapshot that by definition
+        still has ``open``/``claimed`` > 0 -- exactly why quiescence was never
         detected -- so a run that merely outlived the wait deadline would be
         misreported as unhealthy. Multi-hour goals are designed for (see the
         scope timeouts in ``core/defaults.py``, up to 7200s against this 3600s
         default deadline), which makes that misread the common case rather
-        than an edge one.
+        than an edge one. Orchestrator liveness -- not the task counts -- is
+        what separates "still starting up" from "ended with work unfinished".
     """
+    from bernstein.core.quality.retrospective import count_incomplete_declared
+
     deadline = time.time() + timeout_s
+    orchestrator_seen_alive = False
     while time.time() < deadline:
         status_payload = server_get("/status")
         health_payload = server_get("/health")
@@ -1092,6 +1125,40 @@ def _wait_for_run_completion(
                     agent_count,
                 )
                 _signal_orchestrator_shutdown(reason="cli detected run completion (quiescent)")
+                return status_payload
+
+            # Second terminal state: the orchestrator is gone while declared
+            # tasks are still non-terminal. Nothing will ever advance them, so
+            # this IS a verdict -- and an unhealthy one (issue #3010: the agent
+            # produced no output, its task stayed `open`, the orchestrator
+            # stopped, and the run reported success).
+            #
+            # Quiescence cannot cover this: it requires open == claimed == 0,
+            # which a stuck task never satisfies. Orchestrator liveness is the
+            # discriminator that separates it from the STARTUP window, where
+            # tasks are also `open` but the orchestrator is alive (or not yet
+            # started) and about to drive them.
+            #
+            # "Gone" is only concluded when it is unambiguous: either a pidfile
+            # is present but its pid is dead (it ran and died), or we watched
+            # the orchestrator alive earlier in this wait and it has since
+            # disappeared. A pidfile that simply has not been written yet is
+            # never read as "gone" -- when in doubt this falls through to
+            # "no verdict" and keeps waiting.
+            pid_present, alive = _orchestrator_liveness()
+            orchestrator_seen_alive = orchestrator_seen_alive or alive
+            orchestrator_gone = not alive and (pid_present or orchestrator_seen_alive)
+            if orchestrator_gone and agent_count == 0 and count_incomplete_declared(status_payload) > 0:
+                logger.warning(
+                    "run_ended_with_unfinished_tasks: orchestrator process is gone but "
+                    "total=%d open=%d claimed=%d are still non-terminal (agent_count=%d) -- "
+                    "nothing will advance them. Treating this as a terminal, non-healthy "
+                    "verdict rather than waiting out the deadline (issue #3010).",
+                    total,
+                    open_count,
+                    claimed_count,
+                    agent_count,
+                )
                 return status_payload
         time.sleep(poll_interval_s)
     logger.info(

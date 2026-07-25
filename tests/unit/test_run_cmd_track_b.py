@@ -108,7 +108,7 @@ def test_wait_for_run_completion_timeout_does_not_signal_shutdown() -> None:
 
 
 def test_wait_for_run_completion_timeout_returns_no_verdict() -> None:
-    """A wait that times out with the run still in flight returns None.
+    """A wait that times out while the ORCHESTRATOR IS STILL ALIVE returns None.
 
     Returning the last observed payload instead would hand the caller a
     mid-flight snapshot (open/claimed > 0 -- precisely why quiescence was never
@@ -125,6 +125,7 @@ def test_wait_for_run_completion_timeout_returns_no_verdict() -> None:
         patch("bernstein.cli.run_bootstrap.server_get", return_value={"total": 2, "open": 1, "claimed": 1}),
         patch("bernstein.cli.run_bootstrap.time.sleep", return_value=None),
         patch("bernstein.cli.run_bootstrap.time.time", side_effect=_fake_time),
+        patch("bernstein.cli.run_bootstrap._orchestrator_liveness", return_value=(True, True)),
         patch("bernstein.cli.run_bootstrap._signal_orchestrator_shutdown"),
     ):
         result = _wait_for_run_completion(timeout_s=5.0)
@@ -144,10 +145,115 @@ def test_wait_for_run_completion_unreachable_server_returns_no_verdict() -> None
         patch("bernstein.cli.run_bootstrap.server_get", return_value=None),
         patch("bernstein.cli.run_bootstrap.time.sleep", return_value=None),
         patch("bernstein.cli.run_bootstrap.time.time", side_effect=_fake_time),
+        patch("bernstein.cli.run_bootstrap._orchestrator_liveness", return_value=(True, True)),
         patch("bernstein.cli.run_bootstrap._signal_orchestrator_shutdown"),
     ):
         result = _wait_for_run_completion(timeout_s=5.0)
 
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #3010: orchestrator liveness -- not the task counts -- separates
+# "still starting up" from "ended with work unfinished". Both show open > 0.
+# ---------------------------------------------------------------------------
+
+
+def _wait_with(status, *, liveness: list[tuple[bool, bool]], timeout_s: float = 5.0):  # type: ignore[no-untyped-def]
+    """Drive _wait_for_run_completion with a scripted (pidfile_present, alive) sequence."""
+    clock = {"now": 0.0}
+
+    def _fake_time() -> float:
+        clock["now"] += 1.0
+        return clock["now"]
+
+    it = iter(liveness)
+
+    def _fake_liveness() -> tuple[bool, bool]:
+        try:
+            return next(it)
+        except StopIteration:
+            return liveness[-1]
+
+    with (
+        patch("bernstein.cli.run_bootstrap.server_get", side_effect=lambda p: status),
+        patch("bernstein.cli.run_bootstrap.time.sleep", return_value=None),
+        patch("bernstein.cli.run_bootstrap.time.time", side_effect=_fake_time),
+        patch("bernstein.cli.run_bootstrap._orchestrator_liveness", side_effect=_fake_liveness),
+        patch("bernstein.cli.run_bootstrap._signal_orchestrator_shutdown"),
+    ):
+        return _wait_for_run_completion(timeout_s=timeout_s)
+
+
+def test_startup_window_open_tasks_with_live_orchestrator_is_not_a_verdict() -> None:
+    """State 1: tasks open + orchestrator ALIVE (startup) -> no verdict.
+
+    Open tasks before the first spawn must never be mistaken for a finished
+    run -- this is exactly why the counts alone cannot be the discriminator.
+    """
+    result = _wait_with(
+        {"total": 1, "open": 1, "claimed": 0, "agent_count": 0},
+        liveness=[(True, True)],
+    )
+    assert result is None
+
+
+def test_startup_window_before_pidfile_is_written_is_not_a_verdict() -> None:
+    """State 1b: tasks open and NO pidfile yet -> still the startup window.
+
+    "No pidfile" is ambiguous (not started yet vs exited and cleaned up), so on
+    its own it must never be read as "gone".
+    """
+    result = _wait_with(
+        {"total": 1, "open": 1, "claimed": 0, "agent_count": 0},
+        liveness=[(False, False)],
+    )
+    assert result is None
+
+
+def test_orchestrator_gone_with_unfinished_tasks_is_a_verdict() -> None:
+    """State 2: tasks non-terminal + orchestrator GONE (the #3010 shape).
+
+    The orchestrator ran, then exited leaving the task `open`. Nothing will
+    advance it, so this is terminal -- and it must be reported rather than
+    waiting out the deadline and exiting 0.
+    """
+    status = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0, "agent_count": 0}
+    result = _wait_with(status, liveness=[(True, True), (True, False)])
+    assert result == status
+
+
+def test_stale_pidfile_with_dead_pid_is_a_verdict_without_seeing_it_alive() -> None:
+    """State 2b: a crashed orchestrator that was never observed alive.
+
+    A pidfile that is PRESENT but points at a dead pid is unambiguous -- it ran
+    and died -- so the verdict must not require having watched it alive first.
+    """
+    status = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0, "agent_count": 0}
+    result = _wait_with(status, liveness=[(True, False)])
+    assert result == status
+
+
+def test_watched_alive_then_pidfile_removed_is_a_verdict() -> None:
+    """State 2c: observed alive, then the pidfile disappeared on clean exit."""
+    status = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0, "agent_count": 0}
+    result = _wait_with(status, liveness=[(True, True), (False, False)])
+    assert result == status
+
+
+def test_quiescent_run_is_a_verdict_regardless_of_orchestrator_state() -> None:
+    """State 3: quiescent + all done -> verdict (healthy), as before."""
+    status = {"total": 2, "open": 0, "claimed": 0, "done": 2, "failed": 0, "agent_count": 0}
+    result = _wait_with(status, liveness=[(False, False)])
+    assert result == status
+
+
+def test_live_agents_block_the_orchestrator_gone_verdict() -> None:
+    """Belt-and-braces: if agents are still reported live, work may yet land."""
+    result = _wait_with(
+        {"total": 1, "open": 1, "claimed": 0, "agent_count": 2},
+        liveness=[(True, False)],
+    )
     assert result is None
 
 

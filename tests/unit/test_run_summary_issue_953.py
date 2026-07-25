@@ -263,6 +263,85 @@ class TestCleanupOrdering:
             _finalize_run_output(quiet=True)
         drain.assert_called_once()
 
+    def test_issue_3010_end_to_end_stuck_task_orchestrator_gone_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #3010 end-to-end, through the REAL wait + REAL pidfile check.
+
+        The exact reported shape: one declared task that never completed, its
+        agent produced nothing, and the orchestrator has exited. Only the
+        server polls and the clock are faked -- ``_wait_for_run_completion``
+        and the orchestrator-liveness check are the real ones, reading a real
+        stale ``spawner.pid``. ``bernstein run --quiet && deploy`` must not
+        deploy on this run.
+        """
+        from bernstein.core.retrospective import EXIT_RUN_UNHEALTHY
+
+        import bernstein.cli.run_bootstrap as rb
+        from bernstein.cli.run_preflight import _finalize_run_output
+
+        runtime = tmp_path / ".sdd" / "runtime"
+        runtime.mkdir(parents=True)
+        # Orchestrator ran and exited: pidfile present, pid not alive.
+        (runtime / "spawner.pid").write_text("999999")
+        monkeypatch.chdir(tmp_path)
+
+        stuck = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0}
+        clock = {"t": 0.0}
+
+        def _fake_time() -> float:
+            clock["t"] += 1.0
+            return clock["t"]
+
+        with (
+            patch.object(rb, "server_get", side_effect=lambda p: stuck if p == "/status" else {"agent_count": 0}),
+            patch.object(rb.time, "sleep", return_value=None),
+            patch.object(rb.time, "time", side_effect=_fake_time),
+            patch.object(rb, "_signal_orchestrator_shutdown"),
+            patch("bernstein.cli.run_preflight._show_run_summary"),
+            patch("bernstein.cli.run_preflight._drain_completed_backlog_files"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _finalize_run_output(quiet=True)
+
+        assert exc_info.value.code == EXIT_RUN_UNHEALTHY
+        assert exc_info.value.code != 0
+
+    def test_startup_window_with_live_orchestrator_does_not_exit_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Counterpart guard: identical task counts, but the orchestrator is
+        ALIVE (startup window) -- must reach the deadline and exit 0, never be
+        mistaken for a finished run."""
+        import os
+
+        import bernstein.cli.run_bootstrap as rb
+        from bernstein.cli.run_preflight import _finalize_run_output
+
+        runtime = tmp_path / ".sdd" / "runtime"
+        runtime.mkdir(parents=True)
+        # A genuinely live pid: this test process.
+        (runtime / "spawner.pid").write_text(str(os.getpid()))
+        monkeypatch.chdir(tmp_path)
+
+        starting = {"total": 1, "open": 1, "claimed": 0, "done": 0, "failed": 0}
+        clock = {"t": 0.0}
+
+        def _fake_time() -> float:
+            clock["t"] += 1.0
+            return clock["t"]
+
+        with (
+            patch.object(rb, "server_get", side_effect=lambda p: starting if p == "/status" else {"agent_count": 0}),
+            patch.object(rb.time, "sleep", return_value=None),
+            patch.object(rb.time, "time", side_effect=_fake_time),
+            patch.object(rb, "_signal_orchestrator_shutdown"),
+            patch("bernstein.cli.run_preflight._show_run_summary"),
+            patch("bernstein.cli.run_preflight._drain_completed_backlog_files"),
+        ):
+            # Returns normally -> exit 0.
+            _finalize_run_output(quiet=True)
+
     def test_quiet_run_exits_zero_when_all_done(self) -> None:
         from bernstein.cli.run_preflight import _finalize_run_output
 

@@ -187,24 +187,18 @@ def _exit_nonzero_on_unhealthy_run(status_payload: object) -> None:
     ``bernstein run && deploy`` never deploys on a run that accomplished
     nothing (issue #3010).
 
-    The verdict is applied ONLY when quiescence was actually detected.
-    ``_wait_for_run_completion`` returns ``None`` for every "no verdict" case
-    (wait deadline expired with the run still in flight, or the server was
-    unreachable), and this function maps that to exit 0 rather than guessing:
-    a long-running-but-healthy run must never be reported as a failure just
-    for outliving the CLI's wait deadline.
+    The verdict is applied ONLY when the run actually reached a terminal state.
+    ``_wait_for_run_completion`` returns a payload for both terminal states --
+    quiescence, and "orchestrator gone while declared tasks are still
+    non-terminal" (the issue #3010 shape) -- and ``None`` for every "no
+    verdict" case (deadline expired with the run still in flight, or the
+    server unreachable). This function maps ``None`` to exit 0 rather than
+    guessing: a long-running-but-healthy run must never be reported as a
+    failure just for outliving the CLI's wait deadline.
 
-    Scope (deliberate, do not over-read): this covers runs whose end the CLI
-    can actually observe. Quiescence is defined as ``open == claimed == 0``
-    with no live agents, so a run that ends with a task still sitting in
-    ``open`` -- the shape in issue #3010, where the orchestrator stops but the
-    task was never re-driven -- is never reported quiescent and reaches the
-    deadline instead, exiting 0 here. Widening the quiescence definition to
-    cover it would risk declaring a run finished during the startup window
-    (``open`` > 0 with no agents spawned yet) and is a separate change. The
-    retrospective's own verdict is not subject to this: it is computed at
-    shutdown from the full task-status histogram and correctly reports such a
-    run UNHEALTHY (see ``compute_run_health``).
+    Note that the discriminator between "ended with work unfinished" and
+    "still starting up" is orchestrator liveness, not the task counts -- both
+    show ``open`` > 0. See ``_wait_for_run_completion``.
     """
     if not isinstance(status_payload, dict):
         return
