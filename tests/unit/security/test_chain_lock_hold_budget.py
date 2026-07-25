@@ -70,6 +70,15 @@ HOLD_BUDGET_READS = 3.0
 #: seeded chain in microseconds does not turn scheduler noise into a failure.
 HOLD_BUDGET_FLOOR_S = 0.30
 
+#: What fraction of an ``archive()`` call the exclusive lock may be held for.
+#: Measured at 0.3-1.0% with the compression outside; compressing under the
+#: lock puts it at 25% (once per segment) to 100% (once around the loop).
+ARCHIVE_HOLD_FRACTION = 0.12
+
+#: Floor for the archive budget, so probe granularity and scheduler noise on a
+#: fast machine cannot fail the test on their own.
+ARCHIVE_HOLD_FLOOR_S = 0.08
+
 
 @pytest.fixture(autouse=True)
 def _pin_audit_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -215,11 +224,11 @@ class TestArchiveHold:
             (audit_dir / f"{day}.jsonl").write_text(payload, encoding="utf-8")
 
         log = AuditLog(audit_dir=audit_dir, key=KEY)
-        one_read = _one_snapshot_read_s(audit_dir)
-        budget = max(HOLD_BUDGET_FLOOR_S, one_read * HOLD_BUDGET_READS)
 
         with _HoldProbe(audit_dir) as probe:
+            started = time.monotonic()
             result = log.archive()
+            total = time.monotonic() - started
         held = probe.longest_denial_s
 
         assert sorted(result.archived) == [
@@ -228,9 +237,19 @@ class TestArchiveHold:
             "2020-01-03.jsonl",
             "2020-01-04.jsonl",
         ]
+
+        # Calibrated against archive's own cost, not against a chain read: the
+        # honest locked work here is two renames per segment, which is
+        # microseconds, while the call as a whole is dominated by gzip. So the
+        # question is what *fraction* of the call the lock was held for.
+        # Compressing under the lock, whether once around the loop or once per
+        # segment, puts that fraction at 25-100%; keeping it outside measures
+        # under 1%.
+        budget = max(ARCHIVE_HOLD_FLOOR_S, total * ARCHIVE_HOLD_FRACTION)
         assert held <= budget, (
-            f"archive() held the exclusive chain lock for {held:.3f}s while compressing; "
-            f"the budget is {budget:.3f}s. Compression must run outside the transaction."
+            f"archive() held the exclusive chain lock for {held:.3f}s of a {total:.3f}s call "
+            f"({held / total:.1%}); the budget is {budget:.3f}s. Compression must run outside "
+            "the transaction."
         )
 
     def test_a_segment_that_changed_under_the_compress_is_not_published(self, tmp_path: Path) -> None:
