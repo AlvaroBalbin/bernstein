@@ -381,15 +381,18 @@ EVENT_TASK_MAILBOX_MESSAGE = "task.mailbox_message"
 EVENT_TASK_CLAIM_RECEIPT = "task.claim_receipt"
 
 #: Issue #3037 -- the counterpart of :data:`EVENT_TASK_CLAIM_RECEIPT`, emitted
-#: whenever a held claim ends: the task returns to the pool (force-claim,
-#: reopen, release, restart recovery, node departure) or dies terminally
-#: without delivering (fail, cancel, abandon). The event records the task id,
+#: whenever a held claim is surrendered: the task returns to the pool
+#: (force-claim, reopen, release, restart recovery, node departure) or dies
+#: terminally without delivering (fail, cancel, abandon, refuse, and the
+#: downstream leg of an abandon cascade). Delivery is not a surrender, so a
+#: task reaching ``DONE`` or ``CLOSED`` mints nothing; its claim ends only if
+#: it is later reopened, which does mint one. The event records the task id,
 #: its role lane, the holder that surrendered it, the post-transition task
 #: version, which path ended the claim, the status pair it moved across, and
 #: the reason. Without it the chain records every acquisition and no release,
 #: so a replay reports a node as still holding a task another node is already
 #: executing. With it, folding claim and release receipts in chain order
-#: reconstructs the current holder of every task offline -- see
+#: reconstructs the last claimant of every task offline -- see
 #: :func:`reconstruct_claim_holders`.
 EVENT_TASK_RELEASE_RECEIPT = "task.release_receipt"
 
@@ -3952,7 +3955,8 @@ def record_task_release_receipt(
     acquisition-only ledger reports node A as holding a task node B has
     already re-claimed. With both halves on one chain,
     :func:`reconstruct_claim_holders` folds them in chain order and answers
-    "who holds this task" offline, at any point in the chain.
+    "who last took this task, and has it gone back to the pool" offline, at
+    any point in the chain.
 
     Args:
         chain: The audit chain store accepting the entry.
@@ -3964,8 +3968,9 @@ def record_task_release_receipt(
         task_version: The task version after the releasing transition.
         release_path: Which path ended the claim (``force_claim`` /
             ``reopen`` / ``release`` / ``cancel`` / ``cancel_cascade`` /
-            ``fail`` / ``abandon`` / ``restart_recovery`` /
-            ``node_departure``).
+            ``fail`` / ``fail_contract_violation`` /
+            ``fail_empty_completion`` / ``refuse`` / ``abandon`` /
+            ``abandon_cascade`` / ``restart_recovery`` / ``node_departure``).
         reason: The transition's recorded reason.
         from_status: Task status the claim was held in.
         to_status: Task status the release moved it to.
@@ -3994,26 +3999,40 @@ def record_task_release_receipt(
 
 
 def reconstruct_claim_holders(events: Iterable[AuditEvent]) -> dict[str, str]:
-    """Fold claim and release receipts into the current holder per task (#3037).
+    """Fold claim and release receipts into the last claimant per task (#3037).
 
-    Offline reconstruction of task ownership from the chain alone: a
-    ``task.claim_receipt`` records a task as held by its claimer, the matching
-    ``task.release_receipt`` removes it. Pass a prefix of the chain to
-    reconstruct ownership as of that point.
+    Offline reconstruction from the chain alone: a ``task.claim_receipt``
+    records a task as taken by its claimer, the matching
+    ``task.release_receipt`` drops it. Pass a prefix of the chain to
+    reconstruct the same projection as of that point.
+
+    This is not "who is executing this task right now". Delivery mints no
+    release receipt, so a task that ran to completion stays mapped to the
+    worker that delivered it until something puts it back in the pool. What
+    the fold does guarantee is the property the acquisition-only ledger could
+    not support: every path that returns a task to the pool records a release
+    first, so a task is never mapped to one claimant while another holds it.
+    Cross-check the task's status when the caller needs liveness rather than
+    attribution.
 
     A release for a task with no recorded claim is tolerated (the claim may
     predate the range passed in, or have been granted through a store-level
-    path that mints no receipt) and simply leaves the task unheld.
+    path that mints no receipt) and simply leaves the task unclaimed.
+
+    Chains written before #3037 carry acquisitions only, so over that region
+    the fold reports every task ever claimed as still claimed; nothing in the
+    receipt marks where the release half starts, so a caller reading a chain
+    that spans the upgrade has to bound the range itself.
 
     Args:
         events: Audit events in chain order. Non-claim events are ignored, so
             the full chain can be passed unfiltered.
 
     Returns:
-        Mapping of task id to the identifier currently holding it. Tasks with
-        no live claim are absent. A held task whose claim carried no session
-        id maps to the empty string, which is still distinguishable from
-        "not held" by key membership.
+        Mapping of task id to the identifier that last claimed it without a
+        recorded release. Tasks whose claim was released are absent. A claim
+        that carried no session id maps to the empty string, which is still
+        distinguishable from "released" by key membership.
     """
     holders: dict[str, str] = {}
     for event in events:

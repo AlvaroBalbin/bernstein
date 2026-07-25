@@ -1324,7 +1324,7 @@ def create_app(
     application.state.audit_chain = _audit_chain  # type: ignore[attr-defined]
     # Both halves of the claim ledger land on this chain (#3037). The claim
     # routes mirror every granted claim as ``task.claim_receipt``; the store
-    # mirrors every transition that ends a held claim as the matching
+    # mirrors every transition that surrenders a held claim as the matching
     # ``task.release_receipt``. Attached here rather than behind
     # ``BERNSTEIN_AUDIT`` so a plain ``bernstein serve`` node records both --
     # an acquisition-only ledger replays as node A holding a task node B is

@@ -49,14 +49,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Statuses in which a claim granted by a claim endpoint is still held by its
-#: owner (#3037). A task leaving one of these has surrendered its claim -- it
-#: either returned to the pool or died terminally without delivering -- and the
-#: transition mints a ``task.release_receipt`` on the audit chain, the
-#: counterpart of the ``task.claim_receipt`` the claim minted. ``OPEN`` and
-#: ``PLANNED`` are excluded because nothing holds those; the terminal statuses
-#: are excluded because the claim has already ended by the time they are
-#: reached.
+#: Statuses a worker can be sitting in while it still owns the task (#3037).
+#: A task moving out of one of these is either going back to the pool or
+#: terminating without delivering, so the transition has to be paired with a
+#: ``task.release_receipt`` unless it is a delivery (``DONE`` / ``CLOSED``, see
+#: :data:`CLAIM_DELIVERED_STATUSES`). ``OPEN`` and ``PLANNED`` are excluded
+#: because nothing owns those. This set is not the test for "was a claim
+#: actually held" -- that is claim evidence on the task itself, see
+#: :meth:`TaskStore._claim_snapshot` -- it is the set the release guard in
+#: ``tests/unit/test_task_release_receipt.py`` reads to decide which
+#: transitions need a receipt.
 CLAIM_HELD_STATUSES: frozenset[TaskStatus] = frozenset(
     {
         TaskStatus.CLAIMED,
@@ -64,7 +66,20 @@ CLAIM_HELD_STATUSES: frozenset[TaskStatus] = frozenset(
         TaskStatus.WAITING_FOR_SUBTASKS,
         TaskStatus.BLOCKED,
         TaskStatus.ORPHANED,
-        TaskStatus.SUSPENDED,
+    }
+)
+
+#: Statuses a task reaches by delivering its result (#3037). Reaching one of
+#: these is not a surrender: the worker finished the job it claimed, and the
+#: claim only ends when the task later goes back to the pool (``reopen``, which
+#: does mint a receipt) or stays terminal. Release receipts are deliberately
+#: not minted here, so a fold of the chain reports a delivered task under the
+#: worker that delivered it rather than as unowned. See
+#: :func:`bernstein.core.security.audit_chain.reconstruct_claim_holders`.
+CLAIM_DELIVERED_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.CLOSED,
     }
 )
 
@@ -75,7 +90,11 @@ class ClaimSnapshot(NamedTuple):
     Attributes:
         status: Status the task was in.
         holder: Claim owner, matching the claim receipt's ``claimed_by``.
-        held: Whether a claim existed to surrender at all.
+        held: Whether the task carried evidence of an actual claim. Status
+            membership is deliberately not part of this: a task can reach
+            ``WAITING_FOR_SUBTASKS`` or ``BLOCKED`` without ever having been
+            claimed, and minting a surrender for a claim that never existed
+            writes a false record onto a signed chain.
     """
 
     status: TaskStatus
@@ -403,8 +422,8 @@ class TaskStore:
     def attach_audit_chain(self, chain: AuditChainStore | None) -> None:
         """Route this store's claim ledger to *chain* (#3037).
 
-        Claims mint a ``task.claim_receipt``; every transition that ends a
-        held claim mints the matching ``task.release_receipt`` here, so the
+        Claims mint a ``task.claim_receipt``; every transition that surrenders
+        a held claim mints the matching ``task.release_receipt`` here, so the
         chain records both halves and a replay reports the real holder of a
         task instead of the last node that acquired it.
 
@@ -422,18 +441,26 @@ class TaskStore:
         ``claimed_at`` / ``claimed_by_session`` and move the status, so after
         the fact there is nothing left to attribute the release to.
 
+        ``held`` is decided on claim evidence carried by the task, not on its
+        status. ``OPEN -> WAITING_FOR_SUBTASKS`` and ``... -> BLOCKED`` are
+        legal without any claim, so a status test mints a surrender for a
+        claim that never existed, and a fabricated surrender on a signed chain
+        is worse than a missing one: a verifier folding the chain cannot tell
+        it apart from a real one.
+
         Args:
             task: The task about to transition.
 
         Returns:
-            The status, claim owner, and whether a claim was held at all. The
-            owner matches the ``claimed_by`` field of the claim receipt, so
-            claim and release receipts name the same identity.
+            The status, claim owner, and whether the task carried evidence of
+            an actual claim. The owner matches the ``claimed_by`` field of the
+            claim receipt, so claim and release receipts name the same
+            identity.
         """
         return ClaimSnapshot(
             status=task.status,
             holder=task.claimed_by_session or task.assigned_agent or "",
-            held=task.claimed_at is not None or task.status in CLAIM_HELD_STATUSES,
+            held=task.claimed_at is not None or bool(task.claimed_by_session),
         )
 
     def _record_release_receipt(
@@ -447,11 +474,12 @@ class TaskStore:
         """Mirror a surrendered claim into the audit chain (#3037).
 
         The counterpart of the claim receipt the claim path mints. Called by
-        every transition that ends a held claim, after the transition has been
-        applied, so the receipt carries the post-transition task version.
+        every transition that surrenders a held claim, after the transition
+        has been applied, so the receipt carries the post-transition task
+        version.
 
-        No-ops when no chain is attached or when the task held no claim to
-        surrender (a never-claimed task being cancelled surrenders nothing).
+        No-ops when no chain is attached or when the task carried no claim
+        evidence (a never-claimed task being cancelled surrenders nothing).
         Best-effort: a chain append failure never rolls back the transition
         that already happened.
 
@@ -1879,6 +1907,7 @@ class TaskStore:
                     TaskStatus.REFUSED,
                 ):
                     raise EmptyCompletionError(task_id, task)
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 transition_task(
                     task,
@@ -1893,6 +1922,16 @@ class TaskStore:
                 completed_at = task.completed_at
                 await self._append_jsonl(self._task_to_record(task))
                 await self._append_archive(task, completed_at)
+                # The slot this frees is a surrender, not a delivery: the
+                # worker held the claim and produced nothing, so the ledger
+                # needs the release half or the chain keeps naming it as the
+                # holder of a task it never finished (#3037).
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="fail_empty_completion",
+                    reason=_EMPTY_COMPLETION_REASON,
+                )
             raise EmptyCompletionError(task_id, task)
 
         async with self._lock:
@@ -2302,7 +2341,10 @@ class TaskStore:
             )
 
             # Cascade: downstream tasks waiting on this one move to
-            # BLOCKED_BY_ABANDON so consumers stop waiting forever.
+            # BLOCKED_BY_ABANDON so consumers stop waiting forever. A
+            # downstream can be CLAIMED or IN_PROGRESS under a different node
+            # than the one that abandoned the upstream, so this loop ends
+            # claims it never granted and owes each one a receipt (#3037).
             for downstream in list(self._tasks.values()):
                 if task_id not in downstream.depends_on:
                     continue
@@ -2313,6 +2355,7 @@ class TaskStore:
                     TaskStatus.WAITING_FOR_SUBTASKS,
                 }:
                     continue
+                downstream_snapshot = self._claim_snapshot(downstream)
                 self._index_remove(downstream)
                 try:
                     transition_task(
@@ -2329,6 +2372,12 @@ class TaskStore:
                 downstream.version += 1
                 self._index_add(downstream)
                 await self._append_jsonl(self._task_to_record(downstream))
+                self._record_release_receipt(
+                    downstream,
+                    downstream_snapshot,
+                    release_path="abandon_cascade",
+                    reason=f"upstream {task_id} abandoned: {row.reason.value}",
+                )
 
             # Ledger write is last so the in-memory state is the source
             # of truth even when the ledger file is read-only / OOS.
