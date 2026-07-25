@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import shlex
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
@@ -183,7 +184,8 @@ def render_skill_template(
     Supported placeholders:
 
     - ``{{SESSION_ID}}``: agent session identifier
-    - ``{{COMPLETE_CMDS}}``: curl commands to mark all tasks complete
+    - ``{{COMPLETE_CMDS}}``: ``bernstein task complete`` commands to mark all
+      tasks complete
     - ``{{TASK_IDS}}``: space-separated task ID list
 
     Args:
@@ -196,16 +198,17 @@ def render_skill_template(
     """
     task_list = tasks or []
 
-    # Build per-task completion curl commands
+    # Build per-task completion commands using the first-class `bernstein
+    # task complete` CLI front door (issue #3035). It resolves the
+    # task-server URL and the session's auth token itself at runtime -
+    # `server_post` -> `auth_headers()` / `resolve_server_url()` - unlike a
+    # raw curl POST, which carried no Authorization header (a 401 under the
+    # default auth-enabled config) and hardcoded `http://127.0.0.1:8052`
+    # (wrong on any node that isn't the task server itself).
     complete_cmds_parts: list[str] = []
     for task in task_list:
-        cmd = (
-            "```bash\n"
-            f"curl -s --retry 3 -X POST http://127.0.0.1:8052/tasks/{task.id}/complete \\\n"
-            '  -H "Content-Type: application/json" \\\n'
-            f'  -d \'{{"result_summary": "Completed: {task.title}"}}\'\n'
-            "```"
-        )
+        summary = shlex.quote(f"Completed: {task.title}")
+        cmd = f"```bash\nbernstein task complete {shlex.quote(task.id)} --summary {summary}\n```"
         complete_cmds_parts.append(cmd)
     complete_cmds = (
         "\n\n".join(complete_cmds_parts)
