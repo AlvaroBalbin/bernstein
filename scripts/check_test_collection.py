@@ -79,9 +79,6 @@ ALLOWLIST: dict[str, str] = {
         "runners. Run on demand (ADR-009 section 12.5)."
     ),
     # --- Not collected today; relocation tracked separately ---------------
-    "tests/test_worktree.py": (
-        "Sits at the tests/ root, so no shard collects it. Relocation into tests/unit/ is tracked in #3026."
-    ),
     "tests/test_server.py": ("Sits at the tests/ root, so no shard collects it. Pending relocation into tests/unit/."),
     "tests/test_evolution_e2e.py": (
         "Sits at the tests/ root, so no shard collects it. Pending relocation into tests/integration/."
