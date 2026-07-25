@@ -78,6 +78,31 @@ def test_mcp_server_registers_all_tools() -> None:
     assert "bernstein_approve" in tool_names
 
 
+def test_every_registered_tool_has_an_explicit_tier(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Every tool a server registers must declare its tier in ``TOOL_TIERS``.
+
+    ``tool_in_tier`` falls back to the ``all`` tier for an unlisted name, so a
+    tool registered without a ``TOOL_TIERS`` entry silently disappears from
+    ``tools/list`` under the default ``standard`` tier. Comparing the tool
+    manager's registry against the declaration turns that silent drop into a
+    test failure at the moment the tool is added.
+    """
+    from bernstein.core.protocols.mcp.tool_tiers import TOOL_TIERS
+    from bernstein.mcp.server import create_mcp_server
+
+    # The ``all`` tier keeps every registered tool, and lineage registration
+    # is opt-in, so this build is the widest possible registration set.
+    mcp = create_mcp_server(
+        server_url="http://localhost:8052",
+        tier="all",
+        lineage_enabled=True,
+        lineage_root=tmp_path,
+    )
+    registered = {t.name for t in mcp._tool_manager.list_tools()}
+    undeclared = sorted(registered - set(TOOL_TIERS))
+    assert not undeclared, f"MCP tools registered without a TOOL_TIERS entry: {undeclared}"
+
+
 # ---------------------------------------------------------------------------
 # bernstein_run
 # ---------------------------------------------------------------------------
