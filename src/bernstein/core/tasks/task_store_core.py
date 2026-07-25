@@ -15,7 +15,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, Protocol, cast
 
 from fastapi import HTTPException
 from typing_extensions import TypedDict
@@ -44,9 +44,44 @@ from bernstein.core.tenanting import ensure_tenant_layout, normalize_tenant_id
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from bernstein.core.security.audit_chain import AuditChainStore
     from bernstein.core.tasks.contracts import ContractViolation, WorkerCompletion, WorkerRefusal
 
 logger = logging.getLogger(__name__)
+
+#: Statuses in which a claim granted by a claim endpoint is still held by its
+#: owner (#3037). A task leaving one of these has surrendered its claim -- it
+#: either returned to the pool or died terminally without delivering -- and the
+#: transition mints a ``task.release_receipt`` on the audit chain, the
+#: counterpart of the ``task.claim_receipt`` the claim minted. ``OPEN`` and
+#: ``PLANNED`` are excluded because nothing holds those; the terminal statuses
+#: are excluded because the claim has already ended by the time they are
+#: reached.
+CLAIM_HELD_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.WAITING_FOR_SUBTASKS,
+        TaskStatus.BLOCKED,
+        TaskStatus.ORPHANED,
+        TaskStatus.SUSPENDED,
+    }
+)
+
+
+class ClaimSnapshot(NamedTuple):
+    """Claim state read off a task before a transition that may end it (#3037).
+
+    Attributes:
+        status: Status the task was in.
+        holder: Claim owner, matching the claim receipt's ``claimed_by``.
+        held: Whether a claim existed to surrender at all.
+    """
+
+    status: TaskStatus
+    holder: str
+    held: bool
+
 
 # ---------------------------------------------------------------------------
 # TypedDicts for file-based state records
@@ -356,6 +391,96 @@ class TaskStore:
         # here so that progress history survives a server crash.  Rebuilt on
         # startup by ``replay_progress()``.
         self._progress_dir: Path = jsonl_path.parent / "progress"
+        # Audit chain the claim ledger is written to (#3037). Attached by
+        # ``create_app`` on every server, so a plain ``bernstein serve`` node
+        # mints release receipts without the orchestrator's ``BERNSTEIN_AUDIT``
+        # wiring. ``None`` in bare store usage (CLI, tests), where the receipt
+        # is skipped rather than the transition refused.
+        self._audit_chain: AuditChainStore | None = None
+
+    # -- claim ledger --------------------------------------------------------
+
+    def attach_audit_chain(self, chain: AuditChainStore | None) -> None:
+        """Route this store's claim ledger to *chain* (#3037).
+
+        Claims mint a ``task.claim_receipt``; every transition that ends a
+        held claim mints the matching ``task.release_receipt`` here, so the
+        chain records both halves and a replay reports the real holder of a
+        task instead of the last node that acquired it.
+
+        Args:
+            chain: Audit chain store to append release receipts to, or
+                ``None`` to detach.
+        """
+        self._audit_chain = chain
+
+    @staticmethod
+    def _claim_snapshot(task: Task) -> ClaimSnapshot:
+        """Capture *task*'s claim state before a transition that may end it (#3037).
+
+        Must be read before the transition: the releasing paths clear
+        ``claimed_at`` / ``claimed_by_session`` and move the status, so after
+        the fact there is nothing left to attribute the release to.
+
+        Args:
+            task: The task about to transition.
+
+        Returns:
+            The status, claim owner, and whether a claim was held at all. The
+            owner matches the ``claimed_by`` field of the claim receipt, so
+            claim and release receipts name the same identity.
+        """
+        return ClaimSnapshot(
+            status=task.status,
+            holder=task.claimed_by_session or task.assigned_agent or "",
+            held=task.claimed_at is not None or task.status in CLAIM_HELD_STATUSES,
+        )
+
+    def _record_release_receipt(
+        self,
+        task: Task,
+        snapshot: ClaimSnapshot,
+        *,
+        release_path: str,
+        reason: str,
+    ) -> None:
+        """Mirror a surrendered claim into the audit chain (#3037).
+
+        The counterpart of the claim receipt the claim path mints. Called by
+        every transition that ends a held claim, after the transition has been
+        applied, so the receipt carries the post-transition task version.
+
+        No-ops when no chain is attached or when the task held no claim to
+        surrender (a never-claimed task being cancelled surrenders nothing).
+        Best-effort: a chain append failure never rolls back the transition
+        that already happened.
+
+        Args:
+            task: The task whose claim ended, already transitioned.
+            snapshot: Claim state captured by :meth:`_claim_snapshot` before
+                the transition.
+            release_path: Which path ended the claim.
+            reason: The transition's recorded reason.
+        """
+        chain = self._audit_chain
+        if chain is None or not snapshot.held:
+            return
+        from bernstein.core.security.audit_chain import record_task_release_receipt
+
+        try:
+            record_task_release_receipt(
+                chain=chain,
+                task_id=task.id,
+                role=task.role,
+                released_by=snapshot.holder,
+                task_version=task.version,
+                release_path=release_path,
+                reason=reason,
+                from_status=snapshot.status.value,
+                to_status=task.status.value,
+            )
+        except Exception as exc:  # intentional-broad-except: receipt mirror is best-effort, never blocks the transition
+            logger.warning("task.release receipt append failed: %s", type(exc).__name__)
 
     # -- index helpers -------------------------------------------------------
 
@@ -487,6 +612,7 @@ class TaskStore:
         reset_tasks: list[Task] = []
         for stale_status in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
             for task in list(self._by_status.get(stale_status, {}).values()):
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 # Use the FSM for the transition so audit/telemetry fire and
                 # any illegal jump is caught.  CLAIMED→OPEN and
@@ -501,6 +627,12 @@ class TaskStore:
                 task.claimed_at = None
                 task.claimed_by_session = None
                 self._index_add(task)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="restart_recovery",
+                    reason="recover_stale_after_restart",
+                )
                 reset_tasks.append(task)
                 reset_count += 1
         if reset_count:
@@ -543,6 +675,7 @@ class TaskStore:
             for task in list(self._by_status.get(stale_status, {}).values()):
                 if task.claimed_by_session != node_id:
                     continue
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 transition_task(
                     task,
@@ -554,6 +687,12 @@ class TaskStore:
                 task.claimed_by_session = None
                 task.version += 1
                 self._index_add(task)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="node_departure",
+                    reason="recover_node_departed",
+                )
                 reset_tasks.append(task)
                 reset_count += 1
         if reset_count:
@@ -1845,6 +1984,7 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.FAILED, actor="task_store", reason=reason)
             task.result_summary = reason
@@ -1856,6 +1996,7 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="fail", reason=reason)
             return task
 
     async def fail_contract_violation(self, task_id: str, violation: ContractViolation) -> Task:
@@ -1885,6 +2026,7 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.FAILED, actor="task_store", reason=reason)
             task.result_summary = reason
@@ -1898,6 +2040,7 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="fail_contract_violation", reason=reason)
         self._audit_contract_outcome(task_id, outcome="violation", schema_error_path=violation.path)
         return task
 
@@ -1929,6 +2072,7 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.REFUSED, actor="task_store", reason=refusal.detail)
             task.result_summary = refusal.detail
@@ -1942,6 +2086,7 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="refuse", reason=outcome)
         self._audit_contract_outcome(task_id, outcome=outcome)
         return task
 
@@ -2053,6 +2198,7 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.OPEN, actor="task_store", reason=reason)
             reopen_count = int(task.metadata.get("janitor_reopen_count", 0) or 0) + 1
@@ -2066,6 +2212,7 @@ class TaskStore:
             task.version += 1
             self._index_add(task)
             await self._append_jsonl(self._task_to_record(task))
+            self._record_release_receipt(task, snapshot, release_path="reopen", reason=reason)
             logger.info(
                 "task.reopen: task_id=%s reopen_count=%d reason=%s",
                 sanitize_log(task_id),
@@ -2136,6 +2283,7 @@ class TaskStore:
                 attempts=task.retry_count,
             )
 
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.ABANDONED, actor="task_store", reason=detail or reason)
             task.result_summary = detail or reason
@@ -2146,6 +2294,12 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(
+                task,
+                snapshot,
+                release_path="abandon",
+                reason=row.reason.value,
+            )
 
             # Cascade: downstream tasks waiting on this one move to
             # BLOCKED_BY_ABANDON so consumers stop waiting forever.
@@ -2368,6 +2522,7 @@ class TaskStore:
             }
             if task.status not in _cancellable:
                 raise ValueError(f"Task '{task_id}' cannot be cancelled from status '{task.status.value}'")
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.CANCELLED, actor="task_store", reason=reason)
             task.result_summary = reason
@@ -2377,6 +2532,7 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="cancel", reason=reason)
             return task
 
     # -- TASK-002: WAITING_FOR_SUBTASKS timeout with escalation ---------------
@@ -2501,12 +2657,14 @@ class TaskStore:
                 task = self._tasks.get(tid)
                 if task is None or task.status not in cancellable:
                     continue
+                cascade_reason = reason if tid == task_id else f"parent {task_id} cancelled: {reason}"
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 transition_task(
                     task,
                     TaskStatus.CANCELLED,
                     actor="task_store",
-                    reason=reason if tid == task_id else f"parent {task_id} cancelled: {reason}",
+                    reason=cascade_reason,
                 )
                 task.result_summary = reason if tid == task_id else f"Cascade: parent {task_id} cancelled"
                 task.completed_at = time.time()
@@ -2515,6 +2673,12 @@ class TaskStore:
                 completed_at = task.completed_at
                 await self._append_jsonl(self._task_to_record(task))
                 await self._append_archive(task, completed_at)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="cancel_cascade",
+                    reason=cascade_reason,
+                )
                 cancelled.append(task)
 
         return cancelled
@@ -2621,6 +2785,7 @@ class TaskStore:
                 raise ValueError(
                     f"Task '{task_id}' is in terminal state '{task.status.value}' and cannot be force-claimed"
                 )
+            snapshot = self._claim_snapshot(task)
             # Set priority *before* re-indexing so the heap entry carries the
             # final priority - otherwise the pushed (old_priority, id) tuple
             # diverges from task.priority and claim_next will skip it as
@@ -2640,6 +2805,7 @@ class TaskStore:
             task.claimed_by_session = None  # Clear ownership on force-claim
             task.version += 1
             await self._append_jsonl(self._task_to_record(task))
+            self._record_release_receipt(task, snapshot, release_path="force_claim", reason="force_claim")
             return task
 
     # -- query / listing (delegated from task_store_index) ------------------

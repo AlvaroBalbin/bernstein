@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
     from pathlib import Path
 
 from bernstein.core.security.audit import (
@@ -379,6 +379,19 @@ EVENT_TASK_MAILBOX_MESSAGE = "task.mailbox_message"
 #: eligibility is reconstructable offline instead of remaining an in-memory
 #: scheduler decision.
 EVENT_TASK_CLAIM_RECEIPT = "task.claim_receipt"
+
+#: Issue #3037 -- the counterpart of :data:`EVENT_TASK_CLAIM_RECEIPT`, emitted
+#: whenever a held claim ends: the task returns to the pool (force-claim,
+#: reopen, release, restart recovery, node departure) or dies terminally
+#: without delivering (fail, cancel, abandon). The event records the task id,
+#: its role lane, the holder that surrendered it, the post-transition task
+#: version, which path ended the claim, the status pair it moved across, and
+#: the reason. Without it the chain records every acquisition and no release,
+#: so a replay reports a node as still holding a task another node is already
+#: executing. With it, folding claim and release receipts in chain order
+#: reconstructs the current holder of every task offline -- see
+#: :func:`reconstruct_claim_holders`.
+EVENT_TASK_RELEASE_RECEIPT = "task.release_receipt"
 
 #: Issue #2369 -- emitted once per packaged agent-skill / plugin install.
 #: When the bundled ``bernstein-run`` skill (or a plugin checkout a host
@@ -3914,6 +3927,104 @@ def record_task_claim_receipt(
             "claim_path": claim_path,
         },
     )
+
+
+def record_task_release_receipt(
+    *,
+    chain: AuditChainStore,
+    task_id: str,
+    role: str,
+    released_by: str,
+    task_version: int,
+    release_path: str,
+    reason: str,
+    from_status: str,
+    to_status: str,
+    actor: str = "task_store",
+) -> AuditEvent:
+    """Append a ``task.release_receipt`` event into *chain* (#3037).
+
+    The surrender half of the claim ledger. ``task.claim_receipt`` records
+    that a worker took a task; this records that the same worker no longer
+    holds it, because the task went back to the pool or died terminally
+    without delivering. Recording only acquisitions supports a strictly
+    weaker question than the claim receipt is for: a replay of an
+    acquisition-only ledger reports node A as holding a task node B has
+    already re-claimed. With both halves on one chain,
+    :func:`reconstruct_claim_holders` folds them in chain order and answers
+    "who holds this task" offline, at any point in the chain.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        task_id: The task whose claim ended.
+        role: The task's role lane.
+        released_by: The holder that surrendered the claim -- the session or
+            agent identifier recorded at claim time (may be empty when the
+            claim carried no session id).
+        task_version: The task version after the releasing transition.
+        release_path: Which path ended the claim (``force_claim`` /
+            ``reopen`` / ``release`` / ``cancel`` / ``cancel_cascade`` /
+            ``fail`` / ``abandon`` / ``restart_recovery`` /
+            ``node_departure``).
+        reason: The transition's recorded reason.
+        from_status: Task status the claim was held in.
+        to_status: Task status the release moved it to.
+        actor: Recorded actor; defaults to ``"task_store"``.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded
+        in its details payload.
+    """
+    return chain.log_with_prev_digest(
+        event_type=EVENT_TASK_RELEASE_RECEIPT,
+        actor=actor,
+        resource_type="task_claim",
+        resource_id=task_id,
+        details={
+            "task_id": task_id,
+            "role": role,
+            "released_by": released_by,
+            "task_version": task_version,
+            "release_path": release_path,
+            "reason": reason,
+            "from_status": from_status,
+            "to_status": to_status,
+        },
+    )
+
+
+def reconstruct_claim_holders(events: Iterable[AuditEvent]) -> dict[str, str]:
+    """Fold claim and release receipts into the current holder per task (#3037).
+
+    Offline reconstruction of task ownership from the chain alone: a
+    ``task.claim_receipt`` records a task as held by its claimer, the matching
+    ``task.release_receipt`` removes it. Pass a prefix of the chain to
+    reconstruct ownership as of that point.
+
+    A release for a task with no recorded claim is tolerated (the claim may
+    predate the range passed in, or have been granted through a store-level
+    path that mints no receipt) and simply leaves the task unheld.
+
+    Args:
+        events: Audit events in chain order. Non-claim events are ignored, so
+            the full chain can be passed unfiltered.
+
+    Returns:
+        Mapping of task id to the identifier currently holding it. Tasks with
+        no live claim are absent. A held task whose claim carried no session
+        id maps to the empty string, which is still distinguishable from
+        "not held" by key membership.
+    """
+    holders: dict[str, str] = {}
+    for event in events:
+        if event.event_type == EVENT_TASK_CLAIM_RECEIPT:
+            task_id = str(event.details.get("task_id", "") or event.resource_id)
+            if task_id:
+                holders[task_id] = str(event.details.get("claimed_by", "") or "")
+        elif event.event_type == EVENT_TASK_RELEASE_RECEIPT:
+            task_id = str(event.details.get("task_id", "") or event.resource_id)
+            holders.pop(task_id, None)
+    return holders
 
 
 def record_claim_journal_receipt(
@@ -7739,6 +7850,7 @@ __all__ = [
     "EVENT_SUBAGENT_DELEGATION",
     "EVENT_TASK_CLAIM_RECEIPT",
     "EVENT_TASK_MAILBOX_MESSAGE",
+    "EVENT_TASK_RELEASE_RECEIPT",
     "EVENT_TASK_RESOURCE_RELEASE",
     "EVENT_TASK_RESUMED",
     "EVENT_TASK_SUSPENDED",
@@ -7765,6 +7877,7 @@ __all__ = [
     "SkillInstallReceiptDetails",
     "SkillVerificationRefusalDetails",
     "ThreadApprovalDetails",
+    "reconstruct_claim_holders",
     "reconstruct_mcp_call_order",
     "record_a2a_message_receipt",
     "record_activity_result",
@@ -7869,6 +7982,7 @@ __all__ = [
     "record_taint_decision",
     "record_task_claim_receipt",
     "record_task_mailbox_message",
+    "record_task_release_receipt",
     "record_task_resource_release",
     "record_task_resume",
     "record_task_suspension",

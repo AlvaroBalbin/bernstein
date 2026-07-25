@@ -35,6 +35,31 @@ Claims are journal entries: claim eligibility is reconstructable offline
 from the task journal plus the chain, and rebuilding the store from the
 same JSONL journal reproduces the identical eligibility projection.
 
+## Release receipts
+
+Every transition that ends a held claim appends the matching
+`task.release_receipt` event to the same chain, carrying `task_id`, `role`,
+`released_by` (the holder that surrendered it), `task_version`,
+`release_path`, `reason`, and the `from_status` / `to_status` pair.
+
+| Path | `release_path` |
+| --- | --- |
+| `POST /tasks/{id}/force-claim` | `force_claim` |
+| `POST /tasks/{id}/reopen` | `reopen` |
+| `POST /tasks/{id}/cancel` | `cancel_cascade` (root and descendants) |
+| `POST /tasks/{id}/fail` | `fail` / `fail_contract_violation` |
+| Typed worker refusal | `refuse` |
+| `TaskStore.abandon` | `abandon` |
+| Stale-claim reset after a restart | `restart_recovery` |
+| Cluster node departure | `node_departure` |
+
+Both halves are written by the server itself, so a plain `bernstein serve`
+node records them without the orchestrator's audit wiring. A ledger that
+records acquisitions and no surrenders replays as node A holding a task node
+B is already executing; with both halves,
+`bernstein.core.security.audit_chain.reconstruct_claim_holders` folds any
+prefix of the chain into the holder of every task at that point, offline.
+
 ## Worker mailbox
 
 `POST /tasks/{task_id}/messages` hands a structured payload to another
