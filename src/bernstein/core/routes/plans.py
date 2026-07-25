@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from bernstein.core.lifecycle import transition_task
 from bernstein.core.models import PlanStatus, TaskStatus
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 
 if TYPE_CHECKING:
     from bernstein.core.plan_approval import PlanStore
@@ -100,6 +101,11 @@ def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | Non
 
     # Promote tasks from PLANNED to OPEN
     task_store = request.app.state.store  # type: ignore[attr-defined]
+    # The plan id resolves to a batch of existing tasks this route
+    # transitions, so the scope rule is applied to the resolved ids rather
+    # than to the plan: promoting task B here is the same mutation a
+    # path-scoped route would refuse for a token that does not hold B.
+    enforce_agent_task_scope_for_ids(request, [e.task_id for e in plan.task_estimates])
     promoted: list[str] = []
     for estimate in plan.task_estimates:
         task = task_store._tasks.get(estimate.task_id)  # pyright: ignore[reportPrivateUsage]
@@ -144,6 +150,9 @@ def reject_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None
 
     # Cancel PLANNED tasks
     task_store = request.app.state.store  # type: ignore[attr-defined]
+    # Same rule as approve: the tasks this cancels are named by the plan, not
+    # by the path, so bind the identity to the ids it is about to act on.
+    enforce_agent_task_scope_for_ids(request, [e.task_id for e in plan.task_estimates])
     cancelled: list[str] = []
     for estimate in plan.task_estimates:
         task = task_store._tasks.get(estimate.task_id)  # pyright: ignore[reportPrivateUsage]

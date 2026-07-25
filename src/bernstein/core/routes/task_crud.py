@@ -92,7 +92,7 @@ logger = logging.getLogger(__name__)
 _DRAINING_DETAIL = "Server is draining -- no new claims accepted"
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Sequence
     from pathlib import Path
 
     from bernstein.core.models import Task
@@ -221,6 +221,31 @@ def _require_task_access(task: Task, request: Request, requested_tenant: str | N
     effective_tenant = _resolve_request_tenant_scope(request, requested_tenant)
     if task.tenant_id != effective_tenant:
         raise HTTPException(status_code=404, detail=f"Task '{task.id}' not found")
+
+
+def _enforce_parent_task_scope(request: Request, parent_task_ids: Sequence[str | None]) -> None:
+    """Bind a create request's ``parent_task_id`` values to the agent's scope.
+
+    The created task is new and unconstrained, but the parent it names is an
+    EXISTING task, and grafting a child onto it writes into the subtree that
+    parent's completion logic reads: an ancestor sitting in
+    ``waiting_for_subtasks`` is promoted only once every direct child is
+    ``done``, so a new child changes whether and when it completes.  The id
+    arrives in the request body, where the middleware's path gate cannot see
+    it, so the same rule is applied here.
+
+    ``depends_on`` is deliberately NOT checked: a dependency edge is stored
+    on the new row and the referenced task is neither mutated nor made
+    unreachable by it.
+
+    Args:
+        request: The active request, carrying the resolved agent identity.
+        parent_task_ids: Parent ids from the body; ``None`` entries (no
+            parent) are dropped.
+    """
+    named = [task_id for task_id in parent_task_ids if task_id]
+    if named:
+        enforce_agent_task_scope_for_ids(request, named)
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +804,7 @@ async def create_task(body: TaskCreate, request: Request) -> TaskResponse:
     """Create a new task."""
     store = _get_store(request)
     sse_bus = _get_sse_bus(request)
+    _enforce_parent_task_scope(request, [body.parent_task_id])
     effective_body = body.model_copy(update={"tenant_id": request_tenant_id(request)})
     if effective_body.metadata is None:
         effective_body.metadata = {}
@@ -921,6 +947,8 @@ async def create_tasks_batch(body: BatchCreateRequest, request: Request) -> Batc
     store = _get_store(request)
     sse_bus = _get_sse_bus(request)
 
+    _enforce_parent_task_scope(request, [entry.parent_task_id for entry in body.tasks])
+
     prepared: list[TaskCreate] = []
     assessments: list[TaskRiskAssessment] = []
     for task_body in body.tasks:
@@ -994,6 +1022,14 @@ async def self_create_subtask(body: TaskSelfCreate, request: Request) -> TaskRes
     """
     store = _get_store(request)
     sse_bus = _get_sse_bus(request)
+
+    # The new subtask is unconstrained, but ``parent_task_id`` names an
+    # EXISTING task that this route transitions to ``waiting_for_subtasks``
+    # below - the same mutation ``POST /tasks/{parent}/wait-for-subtasks``
+    # performs, and that route is path-scoped. The id arrives in the body, so
+    # the middleware gate cannot see it: without this call a token scoped to
+    # task A could park task B in ``waiting_for_subtasks`` one path over.
+    enforce_agent_task_scope_for_ids(request, [body.parent_task_id])
 
     # Validate parent exists
     parent = store.get_task(body.parent_task_id)

@@ -21,20 +21,33 @@ once per process.
 
 Zero-trust enforcement
 ----------------------
-When an agent presents a task-scoped JWT, the middleware extracts the task ID
-from the URL path of every mutating request that addresses a single task and
-validates that the task ID appears in the token's ``task_ids`` claim.  The
-check is deny-by-default over the whole ``/tasks/{id}/...`` surface (and its
-``/api/v1`` mirror) rather than an enumeration of action names, so a task
-route added later is covered without touching this module; only the
-collection routes in ``TASK_COLLECTION_SEGMENTS`` are exempt.  The two
-collection routes that name existing tasks in their request body
-(``TASK_BODY_SCOPED_SEGMENTS``) apply the same rule at the handler through
-:func:`enforce_agent_task_scope_for_ids`, so an identity is bound to the same
-tasks whether the id arrives in the path or in the body.  A token without a
-task scope (``task_ids == []``) is treated as unrestricted (manager /
-orchestrator tokens), and non-agent credentials (SSO users, the legacy
-operator bearer, the cluster secret) never reach this check at all.
+When an agent presents a task-scoped JWT, the middleware resolves the task
+the request is about to act on and validates that its id appears in the
+token's ``task_ids`` claim.  The rule is applied to the task identity, not
+to a list of blessed URLs, so it holds wherever that identity arrives from:
+
+* **Path-addressed.**  Deny-by-default over the whole ``/tasks/{id}/...``
+  surface (and its ``/api/v<n>`` mirror), whatever the action segment below
+  it, plus every other registered route whose path template declares a
+  ``{task_id}`` parameter - ``/approvals/{task_id}/approve``, the review
+  board's per-task decision route, and any per-task route added later under
+  any prefix.  That second set is compiled from the app's own route table
+  (:func:`task_id_route_patterns`), so it cannot drift from the routes the
+  app registers.
+* **Body-addressed and batch-addressed.**  The collection routes under
+  ``/tasks/`` that name existing tasks in their request body
+  (``TASK_BODY_SCOPED_SEGMENTS``) have no id in the path for the gate above
+  to read, so their handlers apply the same rule through
+  :func:`enforce_agent_task_scope_for_ids`.
+* **Indirectly resolved.**  Handlers that reach a task through some other
+  key - an ACP run, a plan, a cluster steal decision - call the same
+  function with the ids they resolved, before mutating them.
+
+Only the collection routes in ``TASK_COLLECTION_SEGMENTS`` are exempt from
+the path gate, because they address the collection rather than one task.  A
+token without a task scope (``task_ids == []``) is treated as unrestricted
+(manager / orchestrator tokens), and non-agent credentials (SSO users, the
+legacy operator bearer, the cluster secret) never reach this check at all.
 
 RFC 8707 resource indicators
 ----------------------------
@@ -99,10 +112,18 @@ _TASK_ID_PATH_RE = re.compile(r"^(?:/api/v\d+)?/tasks/(?P<task_id>[^/]+)(?:/.*)?
 # the ids they are about to act on.  Without that call a token scoped to task
 # A could cancel task B through ``POST /tasks/batch-ops`` while
 # ``POST /tasks/B/cancel`` denied it - the same operation, one path over.
+#
+#   batch-ops    - ``ids``: the tasks the bulk action mutates
+#   claim-batch  - ``task_ids``: the tasks claimed for the caller
+#   self-create  - ``parent_task_id``: the NEW task is unconstrained, but the
+#                  named parent is an existing task this route transitions to
+#                  ``waiting_for_subtasks``, which is exactly what
+#                  ``POST /tasks/{parent}/wait-for-subtasks`` does
 TASK_BODY_SCOPED_SEGMENTS: Final[frozenset[str]] = frozenset(
     {
         "batch-ops",
         "claim-batch",
+        "self-create",
     }
 )
 
@@ -117,15 +138,12 @@ TASK_BODY_SCOPED_SEGMENTS: Final[frozenset[str]] = frozenset(
 #                                     cannot name one
 #   batch                           - creates NEW tasks, so no existing id
 #                                     can be in scope yet
-#   batch-ops, claim-batch          - name existing ids in the body; scoped
-#                                     at the handler, see
+#   batch-ops, claim-batch,         - name existing ids in the body; scoped
+#   self-create                       at the handler, see
 #                                     ``TASK_BODY_SCOPED_SEGMENTS`` above
 #   claim-receipt                   - claims the next eligible backlog row
 #                                     for the caller; like ``next``, the
 #                                     caller cannot name a task
-#   self-create                     - an agent decomposing its own work
-#                                     creates a NEW task, so no existing id
-#                                     can be in scope yet
 #
 # ``tests/unit/test_auth_middleware_task_scope_routes.py`` pins this set to
 # the literal segments actually registered under ``/tasks/``: a new
@@ -142,11 +160,24 @@ TASK_COLLECTION_SEGMENTS: Final[frozenset[str]] = (
             "graph",
             "next",
             "search",
-            "self-create",
         }
     )
     | TASK_BODY_SCOPED_SEGMENTS
 )
+
+# Path templates carry ``{task_id}`` for the task they address.  Per-task
+# routes exist outside ``/tasks/`` too (``/approvals/{task_id}/approve``,
+# ``/dashboard/review-board/runs/{run_id}/tasks/{task_id}/review``), and the
+# ``/tasks/``-anchored pattern above cannot see them.  Rather than name those
+# prefixes here - the enumeration that #3036 was filed about - the matchers
+# are compiled from the route table the app actually registers.
+_TASK_ID_TEMPLATE_PARAM: Final[str] = "task_id"
+
+# One ``{name}`` or ``{name:convertor}`` placeholder in a path template.
+_TEMPLATE_PARAM_RE = re.compile(r"\{(?P<name>[^{}:]+)(?::(?P<convertor>[^{}]+))?\}")
+
+# Where the compiled matchers are memoised on ``app.state``.
+_TASK_ROUTE_PATTERNS_ATTR: Final[str] = "_agent_task_scope_route_patterns"
 
 # ---------------------------------------------------------------------------
 # Public and HMAC-authenticated paths
@@ -766,7 +797,11 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         # Agents with a non-empty task_ids list may only act on their assigned
         # tasks.  Agents with task_ids=[] are unrestricted (manager role).
         if agent_identity.task_ids and request.method not in _READ_METHODS:
-            task_scope_error = _check_agent_task_scope(path, agent_identity.task_ids)
+            task_scope_error = _check_agent_task_scope(
+                path,
+                agent_identity.task_ids,
+                task_id_route_patterns(request.app),
+            )
             if task_scope_error is not None:
                 logger.warning(
                     "Agent %s denied task-scope access to %s: %s",
@@ -786,7 +821,103 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def _check_agent_task_scope(path: str, allowed_task_ids: list[str]) -> str | None:
+def _compile_task_id_route_pattern(template: str) -> re.Pattern[str] | None:
+    """Compile one path template into a matcher capturing its ``task_id``.
+
+    Returns ``None`` for templates that do not address a task by id.  Other
+    placeholders in the same template become non-capturing wildcards: a
+    ``path`` convertor may span ``/`` (``{file_path:path}``), every other
+    convertor matches one segment, and so does a task id.
+
+    Args:
+        template: Route path template, e.g. ``/approvals/{task_id}/approve``.
+
+    Returns:
+        A compiled anchored pattern with a ``task_id`` group, or None.
+    """
+    if f"{{{_TASK_ID_TEMPLATE_PARAM}}}" not in template:
+        return None
+    parts: list[str] = []
+    cursor = 0
+    for match in _TEMPLATE_PARAM_RE.finditer(template):
+        parts.append(re.escape(template[cursor : match.start()]))
+        if match.group("name") == _TASK_ID_TEMPLATE_PARAM:
+            parts.append(f"(?P<{_TASK_ID_TEMPLATE_PARAM}>[^/]+)")
+        elif match.group("convertor") == "path":
+            parts.append(".+")
+        else:
+            parts.append("[^/]+")
+        cursor = match.end()
+    parts.append(re.escape(template[cursor:]))
+    return re.compile("^" + "".join(parts) + "$")
+
+
+def task_id_route_patterns(app: Any) -> tuple[re.Pattern[str], ...]:
+    """Return a matcher per registered route that addresses a task by id.
+
+    Derived from the app's own route table, so a per-task route registered
+    under a prefix other than ``/tasks/`` is covered the moment it exists and
+    this module never carries a list of prefixes to keep in step.  The result
+    is memoised on ``app.state`` because the route table is fixed once the
+    app is built.
+
+    Args:
+        app: The FastAPI/Starlette application serving the request.
+
+    Returns:
+        Compiled patterns, each capturing a ``task_id`` group.  Empty when
+        the app exposes no route table (a bare ASGI callable in a test).
+    """
+    state = getattr(app, "state", None)
+    cached = getattr(state, _TASK_ROUTE_PATTERNS_ATTR, None) if state is not None else None
+    if cached is not None:
+        return cast("tuple[re.Pattern[str], ...]", cached)
+    templates: set[str] = set()
+    for route in getattr(getattr(app, "router", None), "routes", ()) or ():
+        template = getattr(route, "path", "")
+        if template:
+            templates.add(template)
+    compiled = tuple(
+        pattern for pattern in (_compile_task_id_route_pattern(t) for t in sorted(templates)) if pattern is not None
+    )
+    if state is not None:
+        setattr(state, _TASK_ROUTE_PATTERNS_ATTR, compiled)
+    return compiled
+
+
+def _addressed_task_id(path: str, route_patterns: Sequence[re.Pattern[str]] = ()) -> str | None:
+    """Return the single task id this path addresses, or None.
+
+    ``/tasks/``-anchored paths are resolved first and their answer is final:
+    a collection segment there (``batch-ops``, ``next``, ...) is not a task
+    id, and a path below ``/tasks/{id}/`` is one whether or not a route is
+    registered for it, so an unrouted probe cannot slip past the gate.
+    Everything else is matched against the route-table-derived patterns.
+
+    Args:
+        path: Request URL path.
+        route_patterns: Matchers from :func:`task_id_route_patterns`.
+
+    Returns:
+        The addressed task id, or None when the path addresses no single task.
+    """
+    anchored = _TASK_ID_PATH_RE.match(path)
+    if anchored is not None:
+        task_id = anchored.group(_TASK_ID_TEMPLATE_PARAM)
+        # A collection route under /tasks/, not a task id.
+        return None if task_id in TASK_COLLECTION_SEGMENTS else task_id
+    for pattern in route_patterns:
+        match = pattern.match(path)
+        if match is not None:
+            return match.group(_TASK_ID_TEMPLATE_PARAM)
+    return None
+
+
+def _check_agent_task_scope(
+    path: str,
+    allowed_task_ids: list[str],
+    route_patterns: Sequence[re.Pattern[str]] = (),
+) -> str | None:
     """Return an error message if the request path is out of the agent's task scope.
 
     Returns None when the request is permitted.
@@ -796,24 +927,22 @@ def _check_agent_task_scope(path: str, allowed_task_ids: list[str]) -> str | Non
     every non-agent credential are unaffected.  Within that population the
     rule is deny-by-default: any path addressing a single task by id is
     checked, whatever the action segment below it, on both the root mount and
-    the ``/api/v<n>`` mirrors.  Paths that are not task-addressed (bulletin,
-    status, ...) and the collection routes listed in
-    ``TASK_COLLECTION_SEGMENTS`` are allowed.
+    the ``/api/v<n>`` mirrors, and on every other registered per-task route.
+    Paths that are not task-addressed (bulletin, status, ...) and the
+    collection routes listed in ``TASK_COLLECTION_SEGMENTS`` are allowed.
 
     Args:
         path: Request URL path.
         allowed_task_ids: Task IDs the agent token is scoped to.
+        route_patterns: Per-task route matchers for prefixes other than
+            ``/tasks/``, from :func:`task_id_route_patterns`.  Defaults to
+            empty so the ``/tasks/`` surface can be checked without an app.
 
     Returns:
         Error message string if access should be denied, None otherwise.
     """
-    m = _TASK_ID_PATH_RE.match(path)
-    if m is None:
-        # Not a path addressing a single task - allow (bulletin, status, ...).
-        return None
-    task_id = m.group("task_id")
-    if task_id in TASK_COLLECTION_SEGMENTS:
-        # A collection route under /tasks/, not a task id.
+    task_id = _addressed_task_id(path, route_patterns)
+    if task_id is None:
         return None
     if task_id not in allowed_task_ids:
         return f"Task {task_id!r} is not in this agent's task scope (allowed: {allowed_task_ids})"
@@ -848,17 +977,25 @@ def check_agent_task_scope_ids(
 
 
 def enforce_agent_task_scope_for_ids(request: Request, requested_task_ids: Iterable[str]) -> None:
-    """Deny a task-scoped agent that names a task outside its scope in a body.
+    """Deny a task-scoped agent that reaches a task outside its scope.
 
-    Collection routes under ``/tasks/`` take the affected ids from the request
-    body, which the path-level middleware gate cannot inspect.  Handlers for
-    the segments in :data:`TASK_BODY_SCOPED_SEGMENTS` call this with the ids
-    they are about to act on, so the same identity is bound to the same tasks
-    whichever route names them.
+    The handler-side half of the task-scope rule, for every id the path-level
+    gate in this module cannot see:
 
-    Pass the ids the handler will actually use, after any normalisation it
-    applies - checking the raw input while acting on a rewritten value would
-    let a rewrite carry an id past the check.
+    * ids the caller names in a request body - the collection routes under
+      ``/tasks/`` listed in :data:`TASK_BODY_SCOPED_SEGMENTS`, and the
+      per-task id ``POST /a2a/message`` carries;
+    * ids the handler resolves from some other key - the Bernstein task
+      behind an ACP run, the tasks a plan decision promotes or cancels, the
+      tasks a cluster steal is about to reassign.
+
+    Calling it binds the identity to the same tasks whichever route reaches
+    them, so ``POST /tasks/B/cancel`` and every operation equivalent to it
+    answer the same way for the same token.
+
+    Pass the ids the handler will actually use, after any normalisation or
+    lookup it applies - checking the raw input while acting on a rewritten or
+    indirectly resolved value would let that step carry an id past the check.
 
     No-op for every credential that is not a task-scoped agent identity:
     operator bearer tokens, SSO users, the cluster secret, unscoped manager

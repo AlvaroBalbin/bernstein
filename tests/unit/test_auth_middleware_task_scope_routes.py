@@ -192,6 +192,12 @@ _OPERATOR_TOKEN = "operator-token-for-scope-tests"
 _BODY_SCOPED_PROBES: dict[str, dict[str, Any]] = {
     "batch-ops": {"action": "cancel", "ids": ["{task_id}"]},
     "claim-batch": {"task_ids": ["{task_id}"], "agent_id": "probe-agent"},
+    "self-create": {
+        "title": "probe subtask",
+        "description": "probe subtask",
+        "role": "backend",
+        "parent_task_id": "{task_id}",
+    },
 }
 
 # The response field each probe reports its successfully handled ids under, so
@@ -200,7 +206,12 @@ _BODY_SCOPED_PROBES: dict[str, dict[str, Any]] = {
 _BODY_SCOPED_SUCCESS_FIELD: dict[str, str] = {
     "batch-ops": "succeeded",
     "claim-batch": "claimed",
+    "self-create": "parent_task_id",
 }
+
+# Status code a permitted probe answers with. ``self-create`` is a creation
+# route and answers 201; the rest report per-id outcomes with 200.
+_BODY_SCOPED_OK_STATUS: dict[str, int] = {"self-create": 201}
 
 
 @pytest.fixture
@@ -231,18 +242,25 @@ def _create_task(application: FastAPI, index: int, title: str) -> str:
 
 
 def _probe_body(segment: str, task_id: str) -> dict[str, Any]:
-    """Fill a probe body template with a concrete task id."""
-    template = _BODY_SCOPED_PROBES[segment]
-    return {
-        key: [task_id if item == "{task_id}" else item for item in value] if isinstance(value, list) else value
-        for key, value in template.items()
-    }
+    """Fill a probe body template with a concrete task id.
+
+    The placeholder is substituted whether the template carries it as a bare
+    value (``parent_task_id``) or inside a list (``ids``, ``task_ids``).
+    """
+
+    def _fill(value: Any) -> Any:
+        if isinstance(value, list):
+            return [_fill(item) for item in value]  # pyright: ignore[reportUnknownVariableType]
+        return task_id if value == "{task_id}" else value
+
+    return {key: _fill(value) for key, value in _BODY_SCOPED_PROBES[segment].items()}
 
 
 def test_body_scoped_segments_all_have_a_probe() -> None:
     """Every body-scoped segment is exercised by the tests below."""
     assert set(_BODY_SCOPED_PROBES) == set(TASK_BODY_SCOPED_SEGMENTS)
     assert set(_BODY_SCOPED_SUCCESS_FIELD) == set(TASK_BODY_SCOPED_SEGMENTS)
+    assert set(_BODY_SCOPED_OK_STATUS) <= set(TASK_BODY_SCOPED_SEGMENTS)
 
 
 def test_body_scoped_segments_are_exempt_from_the_path_gate() -> None:
@@ -288,7 +306,8 @@ def test_body_scoped_routes_allow_the_agents_own_task(authed_app: FastAPI) -> No
             json=_probe_body(segment, own_id),
         )
 
-        assert response.status_code == 200, f"/tasks/{segment} -> {response.status_code} {response.text}"
+        expected = _BODY_SCOPED_OK_STATUS.get(segment, 200)
+        assert response.status_code == expected, f"/tasks/{segment} -> {response.status_code} {response.text}"
         assert own_id in response.json()[_BODY_SCOPED_SUCCESS_FIELD[segment]], f"/tasks/{segment} {response.text}"
 
 
@@ -307,7 +326,8 @@ def test_body_scoped_routes_allow_an_unscoped_manager_token(authed_app: FastAPI)
             json=_probe_body(segment, target_id),
         )
 
-        assert response.status_code == 200, f"/tasks/{segment} -> {response.status_code} {response.text}"
+        expected = _BODY_SCOPED_OK_STATUS.get(segment, 200)
+        assert response.status_code == expected, f"/tasks/{segment} -> {response.status_code} {response.text}"
         assert target_id in response.json()[_BODY_SCOPED_SUCCESS_FIELD[segment]], f"/tasks/{segment} {response.text}"
 
 
