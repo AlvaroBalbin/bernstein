@@ -1605,6 +1605,15 @@ class OrchestratorConfig:
     drain_timeout_s: float = field(
         default_factory=lambda: _defaults.ORCHESTRATOR.drain_timeout_s,
     )  # Seconds to wait for agents during drain before cleanup
+    # Terminal state for a quiescent run that produced zero terminal tasks
+    # (issue #3010). See ``core.orchestration.run_stall`` for the criterion
+    # and ``defaults.OrchestratorDefaults`` for why the grace is 1800s.
+    stalled_run_grace_s: float = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stalled_run_grace_s,
+    )  # Seconds of unchanged task state before a zero-terminal run is stopped
+    stalled_run_ticks: int = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stalled_run_ticks,
+    )  # Consecutive no-progress quiescent ticks required alongside the grace
     # Priority-aging janitor: boost long-waiting low-priority tasks
     # so they do not starve behind a steady stream of P1 work.  Default off
     # until run data confirms behaviour; interval is measured in orchestrator ticks.

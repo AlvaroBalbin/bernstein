@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 import textwrap
 from unittest.mock import AsyncMock, patch
 
@@ -481,6 +482,9 @@ class TestToolExecution:
         from pathlib import Path
 
         workdir = Path(str(tmp_path))
+        # The workdir must already be a Bernstein project root: the tool stops
+        # a project that exists, it does not create a tree where it is pointed.
+        (workdir / ".sdd").mkdir()
         body = _jsonrpc_request(
             "tools/call",
             {"name": "bernstein_stop", "arguments": {"workdir": str(workdir)}},
@@ -492,6 +496,60 @@ class TestToolExecution:
         assert text["status"] == "shutdown signal sent"
         signal_file = workdir / ".sdd" / "runtime" / "signals" / "SHUTDOWN"
         assert signal_file.exists()
+
+    @pytest.mark.anyio
+    async def test_stop_tool_refuses_a_workdir_that_is_not_a_project(
+        self, transport: StreamableHTTPTransport, tmp_path: object
+    ) -> None:
+        """The remote surface serves the same tool and needs the same barrier.
+
+        Before the barrier this transport ran ``mkdir(parents=True)`` on any
+        path the caller named, so a stop against an unrelated directory both
+        created a ``.sdd`` tree there and dropped a SHUTDOWN file in it.
+        """
+        from pathlib import Path
+
+        victim = Path(str(tmp_path)) / "victim"
+        victim.mkdir()
+        body = _jsonrpc_request(
+            "tools/call",
+            {"name": "bernstein_stop", "arguments": {"workdir": str(victim)}},
+        )
+        status, _, resp_body = await transport.handle_request("POST", "/mcp", {}, body)
+        assert status == 200
+        data = json.loads(resp_body)
+        text = _tool_result(data["result"]["content"][0]["text"])
+        assert "error" in text
+        assert "status" not in text
+        assert list(victim.iterdir()) == []
+
+    @pytest.mark.anyio
+    async def test_stop_tool_refuses_a_workdir_the_filesystem_cannot_address(
+        self, transport: StreamableHTTPTransport, tmp_path: object
+    ) -> None:
+        """This surface applies no tool schema, so the barrier owns the refusal.
+
+        The stdio server bounds ``workdir`` in its tool schema before the
+        handler runs. This transport serves the tool straight from the
+        JSON-RPC arguments, so a workdir that cannot name a directory reaches
+        the barrier unfiltered and must come back as the barrier's own
+        refusal rather than a raw filesystem message.
+        """
+        from pathlib import Path
+
+        unaddressable = f"{Path(str(tmp_path))}/pro\x00ject"
+        body = _jsonrpc_request(
+            "tools/call",
+            {"name": "bernstein_stop", "arguments": {"workdir": unaddressable}},
+        )
+        status, _, resp_body = await transport.handle_request("POST", "/mcp", {}, body)
+        assert status == 200
+        data = json.loads(resp_body)
+        text = _tool_result(data["result"]["content"][0]["text"])
+        assert "error" in text
+        assert "status" not in text
+        assert "workdir" in text["error"]
+        assert "lstat" not in text["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +773,62 @@ class TestProxyAuthHeader:
 
 
 # ---------------------------------------------------------------------------
+# Interim validation-scope notice (issue #3088)
+# ---------------------------------------------------------------------------
+
+
+class TestValidationScopeNotice:
+    """The transport must announce that it validates arguments more weakly than stdio.
+
+    Remove this class in the same change that closes issue #3083. Until then
+    it keeps the notice from being dropped while the limitation remains.
+    """
+
+    def test_starting_the_transport_warns_about_weaker_validation(
+        self,
+        _clear_token_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="bernstein.mcp.remote_transport")
+
+        create_asgi_app()
+
+        records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert records, "starting the streamable HTTP transport emitted no warning"
+        message = "\n".join(r.getMessage() for r in records)
+        assert "validation" in message.lower()
+        assert "stdio" in message.lower()
+        assert "#3083" in message
+
+    def test_notice_is_at_warning_level_not_debug(
+        self,
+        _clear_token_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A debug-only notice is invisible in ordinary startup output."""
+        caplog.set_level(logging.INFO, logger="bernstein.mcp.remote_transport")
+
+        create_asgi_app()
+
+        assert any(r.levelno >= logging.WARNING and "#3083" in r.getMessage() for r in caplog.records), (
+            "the notice must be emitted at WARNING or above"
+        )
+
+    def test_notice_names_every_tool_the_transport_exposes(
+        self,
+        _clear_token_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The list is derived from _TOOL_DEFS so it cannot drift from reality."""
+        caplog.set_level(logging.WARNING, logger="bernstein.mcp.remote_transport")
+
+        create_asgi_app()
+
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        exposed = [str(defn["name"]) for defn in remote_transport_module._TOOL_DEFS]
+        assert str(len(exposed)) in message
+        for name in exposed:
+            assert name in message, f"notice does not name exposed tool {name}"
 # WWW-Authenticate challenge on 401 (issue #3075)
 # ---------------------------------------------------------------------------
 
