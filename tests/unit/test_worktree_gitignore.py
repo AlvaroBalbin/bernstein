@@ -40,12 +40,14 @@ behaviour.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from bernstein.core.models import Scope, Task
 
 import bernstein.core.git.git_pr as git_pr
+import bernstein.core.git.worktree as worktree_mod
 from bernstein.core.git.worktree import WorktreeManager
 from bernstein.core.git.worktree_claude_md import write_claude_md
 
@@ -83,6 +85,17 @@ def _configured_excludes_file(worktree_path: Path) -> Path | None:
     if result.returncode != 0 or not result.stdout.strip():
         return None
     return Path(result.stdout.strip())
+
+
+def _config_value(repo: Path, *args: str) -> str:
+    """Read a config value, returning ``""`` when the key is not set."""
+    result = subprocess.run(
+        ["git", "config", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def _local_exclude_lines(worktree_path: Path) -> set[str]:
@@ -347,3 +360,284 @@ def test_operator_main_checkout_unaffected_after_worktree_lifecycle(tmp_path: Pa
         "the operator's main checkout -- their own bernstein.yaml must "
         "stage normally"
     )
+
+
+# ---------------------------------------------------------------------------
+# Best-effort contract: the exclusion is a degradation, never a blocker.
+#
+# ``git config --worktree`` needs ``extensions.worktreeConfig``. Per
+# git-config(1), ``extensions.*`` keys are an error unless
+# ``core.repositoryFormatVersion`` is 1 -- with an explicit carve-out for
+# ``worktreeConfig``, which is documented as "respected regardless of the
+# core.repositoryFormatVersion setting". The implementation therefore never
+# bumps the format version, and a git too old to know the extension simply
+# ignores an unknown extension at format version 0 (it is only fatal at
+# version 1). Either way the worktree must still be created; only the
+# exclusion goes missing.
+# ---------------------------------------------------------------------------
+
+
+def _fail_git_config_when(monkeypatch: pytest.MonkeyPatch, matches: Callable[[list[str]], bool]) -> None:
+    """Make ``git config`` calls whose args satisfy *matches* report failure.
+
+    Only the matching invocation is forced to fail; every other ``git
+    config`` call still runs for real against the real repository, so the
+    surrounding behaviour under test is genuine.
+    """
+    real = worktree_mod._run_git_config
+
+    def _patched(worktree_path: Path, args: list[str]) -> bool:
+        if matches(args):
+            return False
+        return real(worktree_path, args)
+
+    monkeypatch.setattr(worktree_mod, "_run_git_config", _patched)
+
+
+_EXCLUDE_SETUP_FAILURE_MODES: dict[str, Callable[[pytest.MonkeyPatch], None]] = {
+    # ``git rev-parse --git-dir`` unavailable or unparseable (no git binary
+    # on PATH, a git too old for ``--path-format=absolute``, a timeout).
+    "git_dir_unresolvable": lambda mp: mp.setattr(worktree_mod, "_resolve_git_dir", lambda _path: None),
+    # The one-time ``extensions.worktreeConfig`` write is refused: a
+    # read-only or unwritable repository config, a repository format the
+    # local git refuses to write extensions into, a locked config file.
+    "extension_write_refused": lambda mp: _fail_git_config_when(
+        mp, lambda args: any(arg.startswith("extensions.") for arg in args)
+    ),
+    # The worktree-scoped write itself is refused: a git predating
+    # ``git config --worktree`` (added in 2.20), or one that declines the
+    # extension for this repository format.
+    "worktree_scoped_write_refused": lambda mp: _fail_git_config_when(mp, lambda args: "--worktree" in args),
+    # The exclude file cannot be written into the per-worktree git dir.
+    # Redirecting the filename through a directory that does not exist
+    # produces a real ``OSError`` from a real filesystem call.
+    "exclude_file_unwritable": lambda mp: mp.setattr(
+        worktree_mod, "_LOCAL_EXCLUDES_FILENAME", "no-such-dir/bernstein-local-excludes"
+    ),
+}
+
+
+@pytest.mark.parametrize("failure_mode", sorted(_EXCLUDE_SETUP_FAILURE_MODES))
+def test_create_succeeds_when_local_exclude_setup_fails(
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """Every failure in the exclude setup degrades, it never blocks.
+
+    The original contract is best-effort: a missing exclusion costs the
+    agent a graveyard diversion on the paths the merge guard denies, which
+    is the behaviour that existed before this fix. Failing worktree
+    creation instead would take the agent offline entirely -- strictly
+    worse than the bug being fixed. So whatever goes wrong while
+    configuring the exclusion, ``create()`` must still return a usable
+    worktree.
+    """
+    _EXCLUDE_SETUP_FAILURE_MODES[failure_mode](monkeypatch)
+
+    mgr = WorktreeManager(repo_root=repo)
+    session_id = f"sess-degraded-{failure_mode.replace('_', '-')}"
+
+    worktree_path = mgr.create(session_id)
+
+    # The worktree exists, is a real checkout, and git works inside it.
+    assert worktree_path.is_dir()
+    assert (worktree_path / "README.md").read_text(encoding="utf-8") == "# repo\n"
+    assert _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD").strip() == f"agent/{session_id}"
+    assert _git(worktree_path, "status", "--porcelain") == ""
+
+    # The exclusion is genuinely absent -- this asserts the failure path was
+    # really taken, so the test cannot pass for the wrong reason.
+    assert _local_exclude_lines(worktree_path) == set()
+    (worktree_path / "bernstein.yaml").write_text("runtime: true\n", encoding="utf-8")
+    src_dir = worktree_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "feature.py").write_text("def feature():\n    return 42\n", encoding="utf-8")
+    _git(worktree_path, "add", "-A")
+    staged = _staged(worktree_path)
+    assert "bernstein.yaml" in staged, "degraded mode means the exclusion is missing, not silently still applied"
+    assert "src/feature.py" in staged, "the agent can still do its actual work"
+
+    # The worktree still tears down cleanly.
+    _git(worktree_path, "reset", "-q")
+    mgr.cleanup(session_id)
+
+    # A half-applied setup must not damage the repository for anyone else.
+    # ``_git`` runs with ``check=True``, so a repository the local git
+    # refuses to read (the way an unrecognised extension behaves at
+    # repository format version 1) would raise here rather than assert.
+    # The operator's own main checkout still stages their own files.
+    (repo / "operator-note.md").write_text("operator file\n", encoding="utf-8")
+    _git(repo, "add", "operator-note.md")
+    assert "operator-note.md" in _staged(repo)
+
+
+def test_create_never_raises_the_repository_format_version(tmp_path: Path, repo: Path) -> None:
+    """The extension is enabled without touching ``repositoryFormatVersion``.
+
+    This is what keeps the failure mode above benign. ``extensions.*`` keys
+    are only fatal to a git that does not recognise them when
+    ``core.repositoryFormatVersion`` is 1; at version 0 an unrecognised
+    extension is ignored outright. Because the fix leaves the version at
+    whatever the target repo already had, a git too old to know
+    ``worktreeConfig`` keeps reading and writing the repository normally --
+    it just never gets the exclusion. Bumping the version here would be the
+    regression: it would make the whole repository unreadable to that git.
+    """
+    assert _git(repo, "config", "--get", "core.repositoryformatversion").strip() == "0"
+
+    mgr = WorktreeManager(repo_root=repo)
+    worktree_path = mgr.create("sess-format-version")
+
+    assert _git(repo, "config", "--get", "core.repositoryformatversion").strip() == "0"
+    assert _git(worktree_path, "config", "--get", "core.repositoryformatversion").strip() == "0"
+
+    # ...and at format version 0 the extension is still honoured, so the
+    # exclusion really is active rather than quietly inert.
+    assert _git(repo, "config", "--get", "extensions.worktreeConfig").strip() == "true"
+    (worktree_path / "bernstein.yaml").write_text("runtime: true\n", encoding="utf-8")
+    assert _git(worktree_path, "status", "--porcelain") == ""
+
+
+def test_git_config_worktree_is_refused_without_the_extension(tmp_path: Path, repo: Path) -> None:
+    """Anchor the simulated refusal above to real git behaviour.
+
+    A worktree that never had ``extensions.worktreeConfig`` enabled makes
+    real git reject ``git config --worktree`` outright. That is the exact
+    condition the ``worktree_scoped_write_refused`` case stands in for, so
+    the degradation test is modelled on something git actually does.
+    """
+    plain_worktree = tmp_path / "plain-worktree"
+    _git(repo, "worktree", "add", "-q", str(plain_worktree), "-b", "plain")
+
+    result = subprocess.run(
+        ["git", "config", "--worktree", "core.excludesFile", str(tmp_path / "excludes")],
+        cwd=plain_worktree,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "worktreeconfig" in result.stderr.lower()
+    assert _configured_excludes_file(plain_worktree) is None
+
+
+# ---------------------------------------------------------------------------
+# ``extensions.worktreeConfig`` is repository-wide and permanent, and it
+# changes the scope of two other keys. Per git-worktree(1): "in this file,
+# the exception for core.bare and core.worktree is gone". With the extension
+# off, those two keys in the shared config apply to the main worktree only;
+# with it on, they apply to every linked worktree of the clone. Bernstein
+# must not flip that switch on a repository that keeps either key there --
+# doing so breaks worktrees it does not own, and outlives the session.
+# ---------------------------------------------------------------------------
+
+
+def _bare_clone_with_operator_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A bare repo (``core.bare = true``) that already has a linked worktree."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "config", "user.email", "test@example.com")
+    _git(seed, "config", "user.name", "Test")
+    (seed / "README.md").write_text("# repo\n", encoding="utf-8")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "initial")
+
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(seed), str(bare))
+    assert _git(bare, "config", "--get", "core.bare").strip() == "true"
+
+    operator_worktree = tmp_path / "operator-worktree"
+    _git(bare, "worktree", "add", "-q", str(operator_worktree), "-b", "operator")
+    return bare, operator_worktree
+
+
+def test_create_does_not_break_other_worktrees_of_a_bare_clone(tmp_path: Path) -> None:
+    """A bare repo with linked worktrees is an ordinary git setup, and
+    ``core.bare = true`` lives in its shared config. Enabling
+    ``extensions.worktreeConfig`` there makes ``core.bare`` apply to every
+    linked worktree, so all of them -- including the operator's own,
+    created long before bernstein ran -- start failing with "this operation
+    must be run in a work tree". Creating an agent worktree must not do
+    that to them."""
+    bare, operator_worktree = _bare_clone_with_operator_worktree(tmp_path)
+    mgr = WorktreeManager(repo_root=bare)
+
+    worktree_path = mgr.create("sess-bare-clone")
+
+    # The operator's pre-existing worktree still works.
+    assert _git(operator_worktree, "status", "--porcelain") == ""
+    (operator_worktree / "operator-note.md").write_text("operator file\n", encoding="utf-8")
+    _git(operator_worktree, "add", "operator-note.md")
+    assert "operator-note.md" in _staged(operator_worktree)
+
+    # So does the agent's own worktree.
+    assert _git(worktree_path, "status", "--porcelain") == ""
+
+    # The flag was never written, so nothing is left behind for the next
+    # git command anyone runs against this clone.
+    assert _config_value(bare, "--get", "extensions.worktreeConfig") == ""
+    assert _local_exclude_lines(worktree_path) == set()
+
+
+def test_create_does_not_redirect_a_submodule_checkouts_worktree(tmp_path: Path) -> None:
+    """A checkout that is itself a git submodule always carries
+    ``core.worktree`` in its shared config. Enabling
+    ``extensions.worktreeConfig`` re-scopes that key onto the agent's linked
+    worktree, which then resolves its working tree to the git dir itself:
+    ``git status`` reports the repository internals as untracked and the
+    real tracked files as deleted, and ``git add -A && git commit`` -- the
+    exact instruction agents are given -- commits git internals. The agent's
+    worktree must keep pointing at itself."""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _git(sub, "init", "-q", "-b", "main")
+    _git(sub, "config", "user.email", "test@example.com")
+    _git(sub, "config", "user.name", "Test")
+    (sub / "library.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-q", "-m", "initial")
+
+    super_repo = tmp_path / "super"
+    super_repo.mkdir()
+    _git(super_repo, "init", "-q", "-b", "main")
+    _git(super_repo, "config", "user.email", "test@example.com")
+    _git(super_repo, "config", "user.name", "Test")
+    (super_repo / "top.md").write_text("# top\n", encoding="utf-8")
+    _git(super_repo, "add", "-A")
+    _git(super_repo, "commit", "-q", "-m", "initial")
+    _git(super_repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor")
+    _git(super_repo, "commit", "-q", "-m", "add submodule")
+
+    vendor = super_repo / "vendor"
+    assert _git(vendor, "config", "--local", "--get", "core.worktree").strip() != ""
+
+    mgr = WorktreeManager(repo_root=vendor)
+    worktree_path = mgr.create("sess-submodule")
+
+    toplevel = Path(_git(worktree_path, "rev-parse", "--path-format=absolute", "--show-toplevel").strip())
+    assert toplevel.resolve() == worktree_path.resolve(), (
+        "the agent worktree must resolve its own working tree, not the submodule git dir"
+    )
+
+    (worktree_path / "agent_work.py").write_text("def work():\n    return 1\n", encoding="utf-8")
+    _git(worktree_path, "add", "-A")
+    assert _staged(worktree_path) == ["agent_work.py"], "only the agent's own file may be staged"
+
+    assert _config_value(vendor, "--local", "--get", "extensions.worktreeConfig") == ""
+    assert _local_exclude_lines(worktree_path) == set()
+
+
+def test_core_bare_false_is_not_treated_as_a_hazard(tmp_path: Path, repo: Path) -> None:
+    """``git init`` writes ``core.bare = false`` into every ordinary
+    repository's shared config. Re-scoping *that* onto linked worktrees
+    changes nothing, so the common case must still get its exclusion --
+    otherwise the guard above would disable the fix everywhere."""
+    assert _git(repo, "config", "--local", "--get", "core.bare").strip() == "false"
+
+    mgr = WorktreeManager(repo_root=repo)
+    worktree_path = mgr.create("sess-bare-false")
+
+    assert "/bernstein.yaml" in _local_exclude_lines(worktree_path)

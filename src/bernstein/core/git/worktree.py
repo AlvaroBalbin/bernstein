@@ -451,6 +451,88 @@ def _run_git_config(worktree_path: Path, args: list[str]) -> bool:
 
 _LOCAL_EXCLUDES_FILENAME = "bernstein-local-excludes"
 
+# Keys whose meaning changes the moment ``extensions.worktreeConfig`` is
+# enabled. See :func:`_worktree_config_would_rescope_core_settings`.
+_RESCOPED_BY_WORKTREE_CONFIG = ("core.worktree", "core.bare")
+
+# Sentinel distinguishing "config could not be read" from "key is not set",
+# so an unreadable config can fail closed instead of looking unset.
+_CONFIG_READ_FAILED = "\x00config-read-failed"
+
+
+def _read_shared_git_config(worktree_path: Path, key: str) -> str | None:
+    """Read *key* from the shared (``--local``) repository config.
+
+    ``--local`` is the config file shared by every worktree of the clone
+    (``$GIT_COMMON_DIR/config``), which is the file whose semantics the
+    ``extensions.worktreeConfig`` flag alters.
+
+    Returns the value, ``None`` when the key is not set (git's documented
+    exit code 1), or :data:`_CONFIG_READ_FAILED` on any other failure.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "config", "--local", "--get", key],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_LOCAL_EXCLUDE_GIT_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        logger.warning("Could not read %s for %s: %s", key, worktree_path, exc)
+        return _CONFIG_READ_FAILED
+    if result.returncode == 1:
+        # Documented exit code for "key not present".
+        return None
+    if result.returncode != 0:
+        logger.warning("git config --local --get %s exited %d for %s", key, result.returncode, worktree_path)
+        return _CONFIG_READ_FAILED
+    return result.stdout.strip()
+
+
+def _worktree_config_would_rescope_core_settings(worktree_path: Path) -> bool:
+    """Would enabling ``extensions.worktreeConfig`` re-scope this repo's config?
+
+    With the extension off, ``core.worktree`` and ``core.bare`` in the shared
+    repository config apply to the main worktree only. Enabling it removes
+    that exception (git-worktree(1), CONFIGURATION FILE: "the exception for
+    core.bare and core.worktree is gone"), so both immediately start applying
+    to every *linked* worktree of the clone as well.
+
+    Two ordinary setups keep those keys in the shared config:
+
+    * a checkout that is itself a git submodule - its git-dir config always
+      carries ``core.worktree`` pointing at the submodule's working dir
+    * a bare repository that linked worktrees are added to (``core.bare =
+      true``)
+
+    In the first, flipping the extension redirects the agent's worktree onto
+    the git dir itself, so ``git status`` reports the repository internals as
+    untracked and the real tracked files as deleted. In the second, every
+    linked worktree of the clone starts failing with "this operation must be
+    run in a work tree". Both break worktrees bernstein does not own, and the
+    flag is repository-wide and outlives the session.
+
+    So bernstein declines to flip it there and runs without the exclusion -
+    the same degradation as any other setup failure. Fails closed: an
+    unreadable config counts as "would re-scope".
+    """
+    for key in _RESCOPED_BY_WORKTREE_CONFIG:
+        value = _read_shared_git_config(worktree_path, key)
+        if value is None:
+            continue
+        if value == _CONFIG_READ_FAILED:
+            return True
+        if key == "core.bare" and value.strip().lower() != "true":
+            # ``core.bare = false`` is written by plain ``git init``/``clone``
+            # and is harmless to re-scope: a linked worktree is not bare
+            # either way.
+            continue
+        return True
+    return False
+
 
 def _ensure_worktree_local_excludes(worktree_path: Path) -> None:
     """Scope orchestrator runtime-state exclusion to this worktree only.
@@ -487,6 +569,15 @@ def _ensure_worktree_local_excludes(worktree_path: Path) -> None:
     """
     git_dir = _resolve_git_dir(worktree_path)
     if git_dir is None:
+        return
+
+    if _worktree_config_would_rescope_core_settings(worktree_path):
+        logger.warning(
+            "Shared git config carries core.worktree or core.bare=true for %s; "
+            "enabling extensions.worktreeConfig there would re-scope them onto every "
+            "linked worktree of the clone. Skipping local excludes.",
+            worktree_path,
+        )
         return
 
     if not _run_git_config(worktree_path, ["extensions.worktreeConfig", "true"]):
