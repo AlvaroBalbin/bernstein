@@ -470,9 +470,7 @@ class TestComputeRunHealth:
         assert counts.get(TERMINATOR_INCOMPLETE_DECLARED, 0) == 1
 
     def test_incomplete_declared_alongside_completed_still_unhealthy(self) -> None:
-        healthy, counts = compute_run_health(
-            [_make_task(id="T-ok", status="done")], n_incomplete_declared=1
-        )
+        healthy, counts = compute_run_health([_make_task(id="T-ok", status="done")], n_incomplete_declared=1)
         assert healthy is False
         assert counts[TERMINATOR_AGENT_COMPLETED] == 1
         assert counts[TERMINATOR_INCOMPLETE_DECLARED] == 1
