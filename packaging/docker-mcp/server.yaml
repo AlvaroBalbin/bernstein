@@ -23,7 +23,7 @@ about:
     worktrees, verifies output against a Merkle-chained lineage journal and
     HMAC audit chain, and merges results. The MCP server exposes
     bernstein_run, bernstein_status, bernstein_tasks, bernstein_cost,
-    bernstein_stop, and bernstein_approve.
+    bernstein_stop, bernstein_approve, and bernstein_complete.
 source:
   project: https://github.com/sipyourdrink-ltd/bernstein
 run:

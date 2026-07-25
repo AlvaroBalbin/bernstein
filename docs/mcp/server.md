@@ -407,6 +407,20 @@ worker is executing. Scope the credential per task (the agent identity JWT
 carries a `task_ids` claim that the server enforces on `POST /tasks/{id}/complete`)
 when that matters.
 
+### What the gates do not cover
+
+Both gates read the task and then write, and the two requests cannot be made
+atomic from the client: `POST /tasks/{id}/complete` takes no expected-state
+precondition. The gate therefore decides *which* endpoint is called, and the
+task server decides whether the call lands.
+
+Where the state machine has no edge to `done` the write is rejected, so a task
+that moves into `blocked` or `cancelled` after the read is not completed. Where
+it has one, the write lands on whatever the task became: a task that enters
+`waiting_for_subtasks` between the read and the write is completed even though
+a direct call in that state is refused. Closing that needs a precondition on
+the completion route rather than a second client-side check.
+
 ## Worked example: pointing a host at the server
 
 1. Start the server over the streamable HTTP transport on loopback:

@@ -221,8 +221,23 @@ async def test_complete_still_finishes_the_mcp_worker_loop_task(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# The window between the read and the write is closed by the server, not the gate
+# The window between the read and the write, and how far it is actually closed
 # ---------------------------------------------------------------------------
+
+
+def _racing_client_factory(app: object, store: Any, task_id: str, race_to: TaskStatus, moved: dict[str, bool]) -> Any:
+    """Client factory that moves the task to *race_to* right after the gate's read."""
+
+    async def _racing_app(scope: Any, receive: Any, send: Any) -> None:
+        await app(scope, receive, send)  # type: ignore[operator]
+        if scope.get("method") == "GET" and not moved["done"]:
+            store._tasks[task_id].status = race_to
+            moved["done"] = True
+
+    def _factory(**_kwargs: object) -> AsyncClient:
+        return AsyncClient(transport=ASGITransport(app=_racing_app), base_url=_SERVER_URL)
+
+    return _factory
 
 
 async def test_a_task_that_moves_between_the_read_and_the_write_is_not_completed(
@@ -243,22 +258,107 @@ async def test_a_task_that_moves_between_the_read_and_the_write_is_not_completed
     store._tasks[task_id].status = TaskStatus.PENDING_APPROVAL
 
     moved = {"done": False}
-
-    async def _racing_app(scope: Any, receive: Any, send: Any) -> None:
-        """Forward to the task server, then decide the task behind the gate's back."""
-        await app(scope, receive, send)
-        if scope.get("method") == "GET" and not moved["done"]:
-            store._tasks[task_id].status = TaskStatus.CANCELLED
-            moved["done"] = True
-
-    def _racing_factory(**_kwargs: object) -> AsyncClient:
-        return AsyncClient(transport=ASGITransport(app=_racing_app), base_url=_SERVER_URL)
+    factory = _racing_client_factory(app, store, task_id, TaskStatus.CANCELLED, moved)
 
     mcp = create_mcp_server(server_url=_SERVER_URL)
-    with patch("bernstein.mcp.server.httpx.AsyncClient", side_effect=_racing_factory):
+    with patch("bernstein.mcp.server.httpx.AsyncClient", side_effect=factory):
         result = await mcp.call_tool("bernstein_approve", {"task_id": task_id, "note": "sign-off"})
 
     parsed = _unwrap(result)
     assert moved["done"], "the race never happened, so the test proves nothing"
     assert "error" in parsed, parsed
     assert store._tasks[task_id].status is TaskStatus.CANCELLED
+
+
+async def test_the_read_write_window_is_only_closed_where_the_state_machine_refuses(
+    tmp_path: Path,
+) -> None:
+    """The window is not closed in general, and the limit is recorded here.
+
+    Two HTTP calls cannot be made atomic from the client, and
+    ``POST /tasks/{id}/complete`` takes no expected-state precondition. So the
+    gate's read decides which endpoint is called, and the task server decides
+    whether the call lands. Where the state machine has no edge to ``done``
+    the write is rejected; where it has one the write still lands on whatever
+    the task became.
+
+    ``waiting_for_subtasks`` is the case that matters: the gate refuses it on
+    a direct call, but a task that enters it after the read is completed
+    anyway. Closing that needs a precondition on the completion route, not a
+    second client-side check. Asserted rather than described so that adding
+    the precondition breaks this test instead of leaving a stale claim in the
+    docs.
+    """
+    from bernstein.mcp.server import create_mcp_server
+
+    mcp = create_mcp_server(server_url=_SERVER_URL)
+
+    # 1. Racing into a state with no edge to done: the server refuses.
+    app = create_app(jsonl_path=tmp_path / "refused" / "tasks.jsonl")
+    task_id = await _make_task(app, title="races into blocked")
+    store = app.state.store
+    store._tasks[task_id].status = TaskStatus.IN_PROGRESS
+    moved = {"done": False}
+    with patch(
+        "bernstein.mcp.server.httpx.AsyncClient",
+        side_effect=_racing_client_factory(app, store, task_id, TaskStatus.BLOCKED, moved),
+    ):
+        refused = _unwrap(await mcp.call_tool("bernstein_complete", {"task_id": task_id, "result_summary": "raced"}))
+    assert moved["done"], "the race never happened, so the test proves nothing"
+    assert "error" in refused, refused
+    assert store._tasks[task_id].status is TaskStatus.BLOCKED
+
+    # 2. Racing into a state that does have an edge to done: the write lands.
+    #    This is the residual the gate cannot close from the client side.
+    app2 = create_app(jsonl_path=tmp_path / "landed" / "tasks.jsonl")
+    task2_id = await _make_task(app2, title="races into waiting_for_subtasks")
+    store2 = app2.state.store
+    store2._tasks[task2_id].status = TaskStatus.IN_PROGRESS
+    moved2 = {"done": False}
+    with patch(
+        "bernstein.mcp.server.httpx.AsyncClient",
+        side_effect=_racing_client_factory(app2, store2, task2_id, TaskStatus.WAITING_FOR_SUBTASKS, moved2),
+    ):
+        landed = _unwrap(await mcp.call_tool("bernstein_complete", {"task_id": task2_id, "result_summary": "raced"}))
+    assert moved2["done"], "the race never happened, so the test proves nothing"
+    assert "error" not in landed, landed
+    assert store2._tasks[task2_id].status is TaskStatus.DONE
+
+
+# ---------------------------------------------------------------------------
+# The read itself is hostile input
+# ---------------------------------------------------------------------------
+
+
+async def test_neither_verb_writes_when_the_task_does_not_exist(tmp_path: Path) -> None:
+    """A task id that resolves to nothing must not reach a completion.
+
+    The read is the gate's only evidence. A 404 leaves it with none, so both
+    verbs have to stop there rather than fall through to the POST.
+    """
+    from bernstein.mcp.server import create_mcp_server
+
+    app = create_app(jsonl_path=tmp_path / "runtime" / "tasks.jsonl")
+    posts: list[str] = []
+
+    async def _recording_app(scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("method") == "POST":
+            posts.append(str(scope.get("path")))
+        await app(scope, receive, send)
+
+    def _factory(**_kwargs: object) -> AsyncClient:
+        return AsyncClient(transport=ASGITransport(app=_recording_app), base_url=_SERVER_URL)
+
+    mcp = create_mcp_server(server_url=_SERVER_URL)
+    with patch("bernstein.mcp.server.httpx.AsyncClient", side_effect=_factory):
+        approve = _unwrap(await mcp.call_tool("bernstein_approve", {"task_id": "no-such-task"}))
+        complete = _unwrap(
+            await mcp.call_tool(
+                "bernstein_complete",
+                {"task_id": "no-such-task", "result_summary": "done I guess"},
+            )
+        )
+
+    assert "error" in approve, approve
+    assert "error" in complete, complete
+    assert posts == [], f"a POST was issued for a task that does not exist: {posts}"
