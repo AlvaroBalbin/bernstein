@@ -351,6 +351,7 @@ Bernstein is named after Leonard Bernstein, the American conductor and composer.
 
 | File                  | Purpose |
 |-----------------------|---------|
+| `approval_gate.py`    | The approval gate shared by every MCP surface that exposes ``bernstein_approve`` |
 | `capability.py`       | Runtime capability cards for the Bernstein MCP server |
 | `cost_meter.py`       | Per-call cost-meter and observability envelope for MCP tool responses |
 | `input_validation.py` | Schema-validated MCP tool-call inputs with deny-by-default |

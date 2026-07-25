@@ -35,6 +35,7 @@ from bernstein.core.protocols.mcp.stateless_core import (
     legacy_session_header_value,
     months_since_deprecation,
 )
+from bernstein.mcp.approval_gate import is_approvable, refusal_payload, releases_for_execution
 from bernstein.mcp.streaming import InFlightRegistry, cancelled_envelope
 
 if TYPE_CHECKING:
@@ -299,7 +300,12 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
     {
         "name": "bernstein_approve",
-        "description": "Approve a pending/blocked task.",
+        "description": (
+            "Grant the approval a task is waiting on. Acts only on a task in "
+            "'planned' (releases it for execution) or 'pending_approval' "
+            "(signs off finished work); any other status is refused. Not a "
+            "way to finish work - use bernstein_complete for that."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -307,6 +313,18 @@ _TOOL_DEFS: list[dict[str, Any]] = [
                 "note": {"type": "string", "default": "Approved via MCP"},
             },
             "required": ["task_id"],
+        },
+    },
+    {
+        "name": "bernstein_complete",
+        "description": "Complete a task you are executing, with a summary of what the work produced.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "result_summary": {"type": "string"},
+            },
+            "required": ["task_id", "result_summary"],
         },
     },
     {
@@ -935,9 +953,26 @@ class StreamableHTTPTransport:
         if name == "bernstein_approve":
             task_id = arguments["task_id"]
             note = arguments.get("note", "Approved via MCP")
+            # The gate is the same one the in-process server enforces: read
+            # the task first and refuse anything that is not waiting on an
+            # approval decision, so the remote transport is not a way around
+            # it. A planned task is released for execution rather than
+            # completed - it has not run yet.
+            raw_task = await self._proxy_get(f"/tasks/{task_id}")
+            current_status = str(json.loads(raw_task).get("status") or "")
+            if not is_approvable(current_status):
+                return json.dumps(refusal_payload(task_id, current_status), indent=2)
+            if releases_for_execution(current_status):
+                return await self._proxy_post(f"/tasks/{task_id}/force-claim", {})
             return await self._proxy_post(
                 f"/tasks/{task_id}/complete",
                 {"result_summary": note},
+            )
+
+        if name == "bernstein_complete":
+            return await self._proxy_post(
+                f"/tasks/{arguments['task_id']}/complete",
+                {"result_summary": arguments["result_summary"]},
             )
 
         if name == "bernstein_create_subtask":

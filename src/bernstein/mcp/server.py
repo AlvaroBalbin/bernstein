@@ -56,8 +56,7 @@ from bernstein.core.protocols.mcp.tool_tiers import (
     resolve_active_tier,
     tool_in_tier,
 )
-from bernstein.core.tasks.lifecycle import APPROVABLE_TASK_STATUSES
-from bernstein.core.tasks.models import TaskStatus
+from bernstein.mcp.approval_gate import is_approvable, refusal_payload, releases_for_execution
 from bernstein.mcp.cost_meter import measure_call, wrap_envelope
 from bernstein.mcp.input_validation import (
     ValidatedPayload,
@@ -99,11 +98,6 @@ _HTTP_TIMEOUT = 5.0
 # header so the default unauth task-server mode keeps working.
 _AUTH_TOKEN_ENV = "BERNSTEIN_AUTH_TOKEN"
 
-# Status values ``bernstein_approve`` may act on, projected from the task
-# state machine (``bernstein.core.tasks.lifecycle.APPROVABLE_TASK_STATUSES``)
-# so this module cannot drift from the states an approval actually decides.
-_APPROVABLE_STATUS_VALUES: tuple[str, ...] = tuple(sorted(s.value for s in APPROVABLE_TASK_STATUSES))
-
 logger = logging.getLogger(__name__)
 
 
@@ -136,41 +130,8 @@ def _error_response(exc: Exception, *, hint: str = "Task server may be restartin
 
 
 def _approval_refusal_response(task_id: str, current_status: str) -> str:
-    """Render the structured refusal returned when a task has no approval to grant.
-
-    The payload names the current status so the caller can pick a different
-    action instead of retrying the approval, and lists the states an approval
-    is defined for.
-
-    Args:
-        task_id: The task the approval was attempted on.
-        current_status: The status the task server reported, or an empty
-            string when the task payload carried none.
-
-    Returns:
-        A JSON string carrying the refusal.
-    """
-    approvable = ", ".join(_APPROVABLE_STATUS_VALUES)
-    reported = current_status or "unknown"
-    return json.dumps(
-        {
-            "error": "task_not_awaiting_approval",
-            "task_id": task_id,
-            "current_status": reported,
-            "approvable_statuses": list(_APPROVABLE_STATUS_VALUES),
-            "message": (
-                f"Task {task_id} is in status '{reported}'. bernstein_approve only acts on a task "
-                f"waiting on an approval decision ({approvable}), and never forces another state "
-                f"to complete."
-            ),
-            "hint": (
-                "To finish work you are executing, use bernstein_complete. "
-                "To report that the task is stuck, post to the task mailbox with bernstein_update. "
-                "To abandon the work, cancel the task (bernstein task cancel <task_id>)."
-            ),
-        },
-        indent=2,
-    )
+    """Render the shared approval refusal as the JSON string MCP tools return."""
+    return json.dumps(refusal_payload(task_id, current_status), indent=2)
 
 
 def _validation_error_response(err: ValidationError) -> str:
@@ -921,9 +882,9 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
                 read = await client.get(f"{server_url}/tasks/{task_id}", headers=_auth_headers())
                 read.raise_for_status()
                 current_status = str(read.json().get("status") or "")
-                if current_status not in _APPROVABLE_STATUS_VALUES:
+                if not is_approvable(current_status):
                     return _approval_refusal_response(task_id, current_status)
-                if current_status == TaskStatus.PLANNED.value:
+                if releases_for_execution(current_status):
                     # Pre-execution approval: release the plan for execution.
                     # The task must not be completed - it has not run.
                     approval = "released_for_execution"

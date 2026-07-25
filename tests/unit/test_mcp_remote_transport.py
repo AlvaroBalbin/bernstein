@@ -712,3 +712,80 @@ class TestProxyAuthHeader:
 
         headers = mock_client.post.call_args.kwargs.get("headers") or {}
         assert headers.get("Authorization") == "Bearer post-tok"
+
+
+# ---------------------------------------------------------------------------
+# Approval gate over the remote transport (#3081)
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteApprovalGate:
+    """The remote transport enforces the same approval gate as the local server.
+
+    The gate would be worthless if a caller could reach the unconditional
+    completion path simply by connecting over HTTP instead of stdio.
+    """
+
+    @pytest.mark.anyio
+    async def test_approve_refuses_a_task_that_is_not_awaiting_approval(
+        self,
+        transport: StreamableHTTPTransport,
+    ) -> None:
+        proxy_get = AsyncMock(return_value=json.dumps({"id": "t-1", "status": "in_progress"}))
+        proxy_post = AsyncMock(return_value="{}")
+
+        with (
+            patch.object(StreamableHTTPTransport, "_proxy_get", proxy_get),
+            patch.object(StreamableHTTPTransport, "_proxy_post", proxy_post),
+        ):
+            raw = await transport._execute_tool("bernstein_approve", {"task_id": "t-1"})
+
+        payload = json.loads(raw)
+        assert payload["error"] == "task_not_awaiting_approval"
+        assert payload["current_status"] == "in_progress"
+        proxy_post.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_approve_signs_off_a_pending_approval_task(
+        self,
+        transport: StreamableHTTPTransport,
+    ) -> None:
+        proxy_get = AsyncMock(return_value=json.dumps({"id": "t-2", "status": "pending_approval"}))
+        proxy_post = AsyncMock(return_value="{}")
+
+        with (
+            patch.object(StreamableHTTPTransport, "_proxy_get", proxy_get),
+            patch.object(StreamableHTTPTransport, "_proxy_post", proxy_post),
+        ):
+            await transport._execute_tool("bernstein_approve", {"task_id": "t-2", "note": "LGTM"})
+
+        path, body = proxy_post.call_args[0]
+        assert path == "/tasks/t-2/complete"
+        assert body["result_summary"] == "LGTM"
+
+    @pytest.mark.anyio
+    async def test_approve_releases_a_planned_task(self, transport: StreamableHTTPTransport) -> None:
+        proxy_get = AsyncMock(return_value=json.dumps({"id": "t-3", "status": "planned"}))
+        proxy_post = AsyncMock(return_value="{}")
+
+        with (
+            patch.object(StreamableHTTPTransport, "_proxy_get", proxy_get),
+            patch.object(StreamableHTTPTransport, "_proxy_post", proxy_post),
+        ):
+            await transport._execute_tool("bernstein_approve", {"task_id": "t-3"})
+
+        assert proxy_post.call_args[0][0] == "/tasks/t-3/force-claim"
+
+    @pytest.mark.anyio
+    async def test_complete_posts_the_worker_summary(self, transport: StreamableHTTPTransport) -> None:
+        proxy_post = AsyncMock(return_value="{}")
+
+        with patch.object(StreamableHTTPTransport, "_proxy_post", proxy_post):
+            await transport._execute_tool(
+                "bernstein_complete",
+                {"task_id": "t-4", "result_summary": "shipped"},
+            )
+
+        path, body = proxy_post.call_args[0]
+        assert path == "/tasks/t-4/complete"
+        assert body["result_summary"] == "shipped"
