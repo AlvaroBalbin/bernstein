@@ -169,6 +169,31 @@ error:
 `isError` is not set: a cancel is a client-initiated stop, not a tool failure.
 Cancelling an unknown or already-settled id is a no-op.
 
+## Connect-time instructions
+
+The server sends an `instructions` string on connect. It is the only
+Bernstein text guaranteed to stay in a connected model's context for the
+whole session, so it carries the control loop rather than a description of
+the system:
+
+1. One clause of identity.
+2. The start-then-poll loop: `bernstein_run` returns a `task_id` which is the
+   run id, `bernstein_task_handle` is polled with that value as `run_id`,
+   runs take minutes to hours, poll tens of seconds apart, and stop at a
+   terminal status (`completed`, `failed`, `cancelled`).
+3. One pointer to `load_skill` for anything deeper.
+
+Two rules keep the text honest, both enforced in
+`tests/unit/test_mcp_server.py`:
+
+- The string stays at or under 900 characters.
+- Every tool name it mentions is registered on the server, so instruction
+  text cannot outlive a tool rename.
+
+The `src/bernstein/mcp/server.py` module docstring lists every tool the
+module registers, and the same test asserts that list against the live
+registration set.
+
 ## Driving long-running runs from an MCP host (Tasks extension)
 
 A run started over MCP can outlive a single call. Rather than hold a session
