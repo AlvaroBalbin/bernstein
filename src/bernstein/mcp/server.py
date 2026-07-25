@@ -8,16 +8,35 @@ Transport:
     stdio  - for local IDE integration (default ``bernstein mcp``)
     sse    - for remote/web integration (``bernstein mcp --transport sse``)
 
-Tools:
-    bernstein_run     - start an orchestration run with a goal
-    bernstein_status  - get task counts summary
-    bernstein_tasks   - list tasks with optional status filter
-    bernstein_task_handle - verifiable Tasks-extension run handle (poll a run)
-    bernstein_cost    - get cost summary across all roles
-    bernstein_stop    - graceful shutdown (writes SHUTDOWN signal)
-    bernstein_approve - approve a pending/blocked task
-    bernstein_health  - liveness check (always succeeds)
-    load_skill        - load a skill pack body / reference / script (oai-004)
+Tools registered by ``create_mcp_server`` below. The list is exhaustive and
+is asserted against the live registration set by
+``tests/unit/test_mcp_server.py``, so a tool added here without a docstring
+line fails that test. Tiers are declared in
+:data:`bernstein.core.protocols.mcp.tool_tiers.TOOL_TIERS`; the widest tier
+plus lineage exposes all of them.
+
+    bernstein_health        - liveness check (always succeeds)
+    bernstein_run           - start an orchestration run with a goal
+    bernstein_status        - get task counts summary
+    bernstein_tasks         - list tasks with optional status filter
+    bernstein_task_handle   - verifiable run handle, polled by run id
+    bernstein_cost          - get cost summary across all roles
+    bernstein_context       - signed spawn capsule for a worker (#2545)
+    bernstein_claim         - claim the next dependency-gated task
+    bernstein_update        - post progress on a claimed task
+    bernstein_post_artifact - attach an artefact to a task
+    bernstein_stop          - graceful shutdown (writes SHUTDOWN signal)
+    bernstein_approve       - approve a pending/blocked task
+    bernstein_create_subtask - split a claimed task into a child task
+    load_skill              - load a skill pack body / reference / script
+
+Registered from sibling modules by the same ``create_mcp_server`` call:
+
+    bernstein_scenarios       - list scenario definitions (routine_tools)
+    bernstein_scenario        - start a scenario run (routine_tools)
+    bernstein_scenario_status - poll a scenario run (routine_tools)
+    verify_chain              - verify an artefact against the audit chain
+                                (resources.lineage, lineage builds only)
 """
 
 from __future__ import annotations
@@ -81,20 +100,36 @@ FuncMetadata.convert_result = _patched_convert_result
 
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8052"
 
-# Self-description advertised to MCP clients on connect.
+# Advertised to MCP clients on connect and therefore the only Bernstein text
+# guaranteed to sit in the connected model's context for the whole session.
+# It spends that budget on the control loop, not on a system description:
+# a client that starts a run and then polls wrongly pays for a second run.
+# Budget and tool-name accuracy are asserted in tests/unit/test_mcp_server.py.
 _SERVER_INSTRUCTIONS = (
-    "Bernstein: deterministic, verifiable orchestration for CLI coding agents - "
-    "reproducible parallel runs, signed audit trail, air-gap friendly. "
-    "Dispatches goals across 40+ CLI agent adapters (Claude Code, Codex, "
-    "Gemini CLI, and more), each task in its own git worktree behind "
-    "lint/type/test gates. Scheduling is plain Python with no LLM in the "
-    "coordination loop, so runs replay byte-identically. An always-on lineage "
-    "spine and replay journal record every run; an opt-in HMAC-chained audit "
-    "log adds receipts that verify offline."
+    "Bernstein runs CLI coding agents deterministically, one git worktree per "
+    "task, against an offline-verifiable audit chain.\n"
+    "Driving a run:\n"
+    "1. bernstein_run starts a run and returns immediately with a task_id, "
+    "which is the run id. It does not wait for the run to finish.\n"
+    "2. Poll bernstein_task_handle with run_id set to that value. The handle "
+    "is reprojected from the run journal, so it is safe to poll from anywhere.\n"
+    "3. Runs take minutes to hours. Poll on a slow cadence, tens of seconds "
+    "apart. A handle still reading working is normal progress, not a stall, "
+    "so do not start the goal again.\n"
+    "4. Stop polling once status is terminal: completed, failed or cancelled. "
+    "input_required means the run is waiting on you.\n"
+    "For anything deeper, call load_skill with a name from the skill index and "
+    "load only the pack the task needs."
 )
 
 # Timeout for all httpx calls to the task server (seconds).
 _HTTP_TIMEOUT = 5.0
+
+# Advisory delay a caller should wait before its first poll of a run handle,
+# reported as ``poll_after_ms`` on the ``bernstein_run`` response. Matches the
+# ``pollInterval`` carried on the projected Tasks-extension task, so a client
+# that reads either field paces itself the same way.
+_POLL_AFTER_MS = 5000
 
 # Env var holding the bearer token the task server expects when auth is
 # enabled. When unset, MCP tools fall back to sending no Authorization
@@ -207,6 +242,57 @@ def _get_journal_head(task_id: str) -> str:
 _TASK_TTL_MS = 86_400_000
 
 
+def _resolve_run_journal(sdd_dir: Path, run_id: str) -> tuple[str, Path]:
+    """Return the ``(run id, journal path)`` a poll identifier resolves to.
+
+    A caller of ``bernstein_task_handle`` holds whichever identifier
+    ``bernstein_run`` handed it: the task id, or the journal run id that
+    :func:`bernstein.core.tasks.checkpoint_retry.task_run_id` derives from
+    the task id. Both must reach the same journal, and the order is fixed so
+    an identifier can never resolve two ways:
+
+    1. ``run_id`` read as a journal run id, when that journal exists on disk.
+    2. ``task_run_id(run_id)``, when that journal exists on disk.
+    3. ``run_id`` as given, so an identifier with no journal at all keeps
+       projecting the empty working handle it projects today.
+
+    Rule 1 before rule 2 is what makes a task id already shaped like
+    ``task-*`` unambiguous: it names its own journal if one exists, and only
+    otherwise is it slugified a second time.
+
+    Every candidate goes through ``run_journal_path``, so the containment
+    barrier stays the single check on both forms and neither can address a
+    journal outside the runs root.
+
+    Args:
+        sdd_dir: The project ``.sdd`` directory.
+        run_id: The identifier the caller polled with.
+
+    Returns:
+        The resolved run id and its containment-checked journal path.
+
+    Raises:
+        JournalPathError: ``run_id`` cannot safely name a journal directory.
+    """
+    from bernstein.core.replay.journal import JournalPathError, run_journal_path
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+
+    direct = run_journal_path(sdd_dir, run_id)
+    if direct.is_file():
+        return run_id, direct
+
+    derived_id = task_run_id(run_id)
+    if derived_id != run_id:
+        try:
+            derived = run_journal_path(sdd_dir, derived_id)
+        except JournalPathError:
+            derived = None
+        if derived is not None and derived.is_file():
+            return derived_id, derived
+
+    return run_id, direct
+
+
 def _project_task_helper(data: dict[str, Any]) -> Any:
     from datetime import datetime
 
@@ -303,6 +389,14 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
     ) -> str:
         """Start an orchestration run by posting a task to the Bernstein server.
 
+        A run executes real work and takes minutes to hours. This call
+        returns as soon as the run is queued, not when it finishes. Do not
+        re-issue it while waiting: that starts a second run. To follow the
+        run, wait ``poll_after_ms`` and then call ``bernstein_task_handle``,
+        passing either the returned ``task_id`` or the returned ``run_id``.
+        Poll it until ``status`` is terminal (``completed``, ``failed`` or
+        ``cancelled``).
+
         Args:
             goal: Description of what you want Bernstein to accomplish.
             role: Specialist role to assign (backend, frontend, qa, security, …).
@@ -312,7 +406,9 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
             estimated_minutes: Rough time estimate in minutes.
 
         Returns:
-            JSON with the created task ID, title, and status. When the call
+            JSON with the created task ID, title and status, plus the
+            ``run_id`` naming the run journal and the advisory
+            ``poll_after_ms`` delay before the first poll. When the call
             itself is task-augmented (the client sent ``task`` in the request
             params), a Tasks-extension ``CreateTaskResult`` is returned
             instead so the client can poll the run.
@@ -381,8 +477,16 @@ def _register_query_tools(mcp: FastMCP[None], server_url: str) -> None:
                 task_obj = _project_task_helper(data)
                 return CreateTaskResult(task=task_obj)
 
+            from bernstein.core.tasks.checkpoint_retry import task_run_id
+
             return json.dumps(
-                {"task_id": data["id"], "title": data["title"], "status": data["status"]},
+                {
+                    "task_id": data["id"],
+                    "title": data["title"],
+                    "status": data["status"],
+                    "run_id": task_run_id(data["id"]),
+                    "poll_after_ms": _POLL_AFTER_MS,
+                },
                 indent=2,
             )
         except Exception as exc:
@@ -501,7 +605,11 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
         instance reprojects the same handle from the on-disk journal.
 
         Args:
-            run_id: The run identifier whose journal to project. Must be a
+            run_id: The run to project. Either identifier ``bernstein_run``
+                returned is accepted: the ``task_id``, or the ``run_id``
+                naming the journal. Resolution is journal run id first, then
+                the task id slugified into a journal run id, so the two forms
+                reach one journal and project an identical handle. Must be a
                 plain identifier - path separators and traversal are refused.
             workdir: Project root directory (default: current directory).
 
@@ -518,14 +626,14 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
             from bernstein.core.replay.journal import (
                 JournalPathError,
                 load_events,
-                run_journal_path,
             )
 
             base = Path(workdir).resolve()
             # Shared barrier rather than a local containment check, so this
             # surface cannot drift from the rest of the run-journal readers.
+            # _resolve_run_journal applies it to every candidate id.
             try:
-                journal_path = run_journal_path(base / ".sdd", run_id)
+                resolved_id, journal_path = _resolve_run_journal(base / ".sdd", run_id)
             except JournalPathError as exc:
                 return _error_response(
                     exc,
@@ -533,9 +641,11 @@ def _register_task_handle_tool(mcp: FastMCP[None]) -> None:
                 )
             events = load_events(journal_path)
             chain_head = _read_audit_chain_head(base / ".sdd" / "audit")
+            # Both id forms project the identical handle: the handle is a
+            # projection of the journal, not of how the caller addressed it.
             handle = RunHandle.from_journal(
-                task_id=run_id,
-                run_id=run_id,
+                task_id=resolved_id,
+                run_id=resolved_id,
                 events=events,
                 chain_head=chain_head,
             )

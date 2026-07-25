@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
+import pytest
 from bernstein.core.models import Task
 
+from bernstein import _BUNDLED_TEMPLATES_DIR
 from bernstein.adapters.skills_injector import (
     ROLE_SKILL_MAP,
     inject_skills,
     render_skill_template,
 )
+
+# A curl POST to a /tasks/<id>/complete endpoint on a single line - the
+# fragile, unauthenticated, loopback-hardcoded shape issue #3035 calls out.
+_RAW_CURL_COMPLETE = re.compile(r"curl[^\n]*/tasks/\S*?/complete", re.IGNORECASE)
 
 
 def _make_task(id: str = "T-001", title: str = "Test task") -> Task:
@@ -25,12 +32,16 @@ class TestRenderSkillTemplate:
         assert "backend-abc123" in result
         assert "{{SESSION_ID}}" not in result
 
-    def test_replaces_complete_cmds_with_task_curl(self) -> None:
+    def test_replaces_complete_cmds_with_task_complete_cli(self) -> None:
+        """Issue #3035 - completion commands use the `task complete` CLI front
+        door, not a raw curl (which carries no auth header and hardcodes
+        127.0.0.1:8052 - see TestNoRawCurlInRealInjectedSkills below).
+        """
         tasks = [_make_task(id="T-001", title="Fix bug")]
         result = render_skill_template("{{COMPLETE_CMDS}}", tasks=tasks)
         assert "T-001" in result
-        assert "curl" in result
-        assert "/complete" in result
+        assert "bernstein task complete" in result
+        assert _RAW_CURL_COMPLETE.search(result) is None
 
     def test_replaces_complete_cmds_for_multiple_tasks(self) -> None:
         tasks = [
@@ -472,3 +483,79 @@ class TestRevokedSkillGuard:
         log = AuditLog(workdir / ".sdd" / "audit")
         events = log.query(event_type="skill.verification_refusal")
         assert any(e.details["stage"] == "spawn" for e in events)
+
+
+def _all_shipped_roles() -> list[str]:
+    """Every role template shipped under ``templates/roles/`` today.
+
+    Includes, but is not limited to, the manager/backend/qa/security/
+    reviewer/docs roles issue #3035 verified by name - discovering the list
+    dynamically means a newly added role is covered automatically instead of
+    silently falling outside this regression guard.
+    """
+    roles_dir = _BUNDLED_TEMPLATES_DIR / "roles"
+    return sorted(p.name for p in roles_dir.iterdir() if p.is_dir() and not p.name.startswith("_"))
+
+
+class TestNoRawCurlInRealInjectedSkills:
+    """Issue #3035 regression guard.
+
+    Runs the REAL ``inject_skills`` path against the shipped
+    ``templates/skills/`` directory (not a fixture double built by this test
+    file) so a regression in the bundled completion skill fails a test
+    instead of shipping into every spawned agent's ``.claude/skills/``
+    unnoticed - which is exactly what happened before this fix: the
+    coherence guard added for #3021/#3015 only inspected the rendered
+    *prompt* (``_render_prompt`` + ``_render_auth_section``), never the
+    files ``inject_skills`` writes to disk.
+    """
+
+    def test_role_discovery_did_not_collapse(self) -> None:
+        """Guard the guard, part 1: ``@pytest.mark.parametrize("role", _all_shipped_roles())``
+        silently generates ZERO cases - and the parametrized test below then
+        silently "passes" by not existing - if ``_all_shipped_roles()`` ever
+        returns an empty (or near-empty) list, e.g. because
+        ``_BUNDLED_TEMPLATES_DIR`` resolves to the wrong path. This regression
+        guard is exactly the kind that must fail loudly if its input set
+        collapses, so assert a floor well below the 19 roles shipped today
+        rather than relying on the subset-check below to catch it indirectly.
+        """
+        discovered = _all_shipped_roles()
+        assert len(discovered) >= 10, (
+            f"role discovery found only {len(discovered)} role(s) {discovered} - "
+            "the parametrized no-raw-curl sweep below would silently cover almost "
+            "nothing; check _BUNDLED_TEMPLATES_DIR / 'roles' resolves correctly"
+        )
+
+    def test_at_least_the_verified_roles_are_covered(self) -> None:
+        """Guard the guard, part 2: issue #3035 was verified for these roles by
+        name; they must still exist and be swept by the parametrized test
+        below."""
+        verified = {"manager", "backend", "qa", "security", "reviewer", "docs"}
+        missing = verified - set(_all_shipped_roles())
+        assert not missing, f"roles #3035 verified but no longer shipped: {sorted(missing)}"
+
+    @pytest.mark.parametrize("role", _all_shipped_roles())
+    def test_injected_completion_skill_has_no_raw_curl(self, role: str, tmp_path: Path) -> None:
+        templates_dir = _BUNDLED_TEMPLATES_DIR / "roles"
+        workdir = tmp_path / role
+        workdir.mkdir()
+        tasks = [_make_task(id="T-3035", title="Fix the completion skill")]
+
+        inject_skills(
+            workdir=workdir,
+            role=role,
+            tasks=tasks,
+            session_id=f"{role}-session",
+            templates_dir=templates_dir,
+        )
+
+        skill_path = workdir / ".claude" / "skills" / "bernstein-completion-protocol.md"
+        assert skill_path.exists(), f"{role}: completion protocol skill was not injected"
+        content = skill_path.read_text(encoding="utf-8")
+
+        match = _RAW_CURL_COMPLETE.search(content)
+        assert match is None, (
+            f"{role}: raw-curl completion still present in injected skill -> {match and match.group(0)!r}"
+        )
+        assert "bernstein task complete" in content, f"{role}: CLI completion instruction missing"

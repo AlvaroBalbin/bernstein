@@ -127,6 +127,23 @@ def test_test_macos_name_is_literal(ci_doc: dict[str, object]) -> None:
     )
 
 
+def _emits_required_context(name: object) -> bool:
+    """True when a job's ``name:`` can post a ``CI gate`` check run.
+
+    The stub resolves its name from a guard verdict, so ``CI gate``
+    appearing as a quoted branch of a ``${{ ... }}`` expression counts as
+    an emitter. Matching only the bare literal would let a third emitter
+    hide behind a template.
+    """
+    if not isinstance(name, str):
+        return False
+    if name == REQUIRED_CONTEXT:
+        return True
+    if "${{" not in name:
+        return False
+    return REQUIRED_CONTEXT in re.findall(r"'([^']*)'", name)
+
+
 def test_ci_gate_check_run_name_emitters_are_allow_listed() -> None:
     """Only the allow-listed workflow files may emit a `CI gate` check.
 
@@ -138,6 +155,9 @@ def test_ci_gate_check_run_name_emitters_are_allow_listed() -> None:
         ci.yml never fires). Without this stub such PRs sit ``BLOCKED``
         on ``main`` indefinitely (Renovate lockfile bumps for
         ``sdk/typescript/**`` were the originally reported regression).
+        It publishes the context only when its guard proves every changed
+        path is ignored -- see
+        ``tests/unit/test_ci_gate_stub_workflow_yaml.py``.
 
     Any additional emitter is rejected so a future refactor cannot
     weaken branch protection by silently introducing a third source
@@ -154,7 +174,7 @@ def test_ci_gate_check_run_name_emitters_are_allow_listed() -> None:
         for key, body in jobs.items():
             if not isinstance(body, dict):
                 continue
-            if body.get("name") != REQUIRED_CONTEXT:
+            if not _emits_required_context(body.get("name")):
                 continue
             seen.append(f"{wf_path}:{key}")
 
@@ -254,15 +274,24 @@ def test_stub_workflow_exists() -> None:
     )
 
 
-def test_stub_emits_ci_gate_check(stub_doc: dict[str, object]) -> None:
+def test_stub_can_emit_ci_gate_check(stub_doc: dict[str, object]) -> None:
+    """The stub must keep a job able to publish the required context.
+
+    It resolves the name from its guard verdict rather than hard-coding
+    it, so the assertion is "``CI gate`` is a reachable branch of the
+    name expression". That the *other* branch is not ``CI gate``, and
+    that the verdict is derived honestly, is asserted in
+    ``tests/unit/test_ci_gate_stub_workflow_yaml.py``.
+    """
     jobs = stub_doc.get("jobs")
     assert isinstance(jobs, dict)
     job = jobs.get(REQUIRED_JOB_KEY)
     assert isinstance(job, dict), f"ci-gate-stub.yml must define a `{REQUIRED_JOB_KEY}` job."
-    assert job.get("name") == REQUIRED_CONTEXT, (
-        f"ci-gate-stub.yml::{REQUIRED_JOB_KEY}.name must equal "
+    name = job.get("name")
+    assert _emits_required_context(name), (
+        f"ci-gate-stub.yml::{REQUIRED_JOB_KEY}.name must be able to resolve to "
         f"{REQUIRED_CONTEXT!r} so branch protection's required context "
-        "is satisfied on paths-ignored-only PRs."
+        f"is satisfied on paths-ignored-only PRs; found {name!r}."
     )
 
 

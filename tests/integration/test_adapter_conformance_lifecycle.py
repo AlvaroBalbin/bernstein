@@ -29,7 +29,11 @@ from bernstein.core.models import ModelConfig
 from bernstein.adapters.claude import ClaudeCodeAdapter
 from bernstein.adapters.codex import CodexAdapter
 from bernstein.adapters.gemini import GeminiAdapter
-from bernstein.core.config.platform_compat import process_alive, reap_process_group
+from bernstein.core.config.platform_compat import (
+    IS_WINDOWS,
+    process_alive,
+    reap_process_group,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -99,7 +103,30 @@ def test_adapter_stop_terminates_a_hung_spawn(
     tmp_path: Path,
     fake_cli_fixture: FakeCLIHandle,
 ) -> None:
-    """A hung spawn is stopped through the platform process-tree reap."""
+    """A hung spawn is stopped through the platform process-tree reap.
+
+    The guarantee under test is "the hung spawn is no longer running after
+    stop", not "a stop signal was accepted", so it is checked against the
+    process itself rather than against the receipt that would otherwise be
+    marking its own homework.
+
+    The Windows lane used to fail here on ``assert receipt.delivered``.  The
+    cause was not an already-exited spawn: the old Windows stop returned
+    True for a pid nothing held, because its fallback ended in a liveness
+    re-probe that a missing pid satisfied.  It returned False only when the
+    target was still *observed running* after the force kill, which is what
+    an immediate liveness probe does when raced against an asynchronous
+    ``TerminateProcess``.  The reap now terminates through a handle it
+    already holds and waits on that handle, so the outcome is decided by
+    evidence rather than by timing.
+
+    The receipt assertions below are deliberately limited to what each
+    platform can establish.  Windows can observe the exit directly, so the
+    receipt must say so.  POSIX cannot: an unreaped group answers EPERM on
+    macOS and answers successfully on Linux (both measured), and neither
+    reply separates "exited but unreaped" from "running", so the reap
+    records the stop it delivered and confirms nothing.
+    """
     adapter_cls, model = _ADAPTERS[adapter_name]
     workdir = _git_workdir(tmp_path)
     fake_cli_fixture.configure(mode="hang")
@@ -112,15 +139,25 @@ def test_adapter_stop_terminates_a_hung_spawn(
     pid = int(getattr(result, "pid", 0))
     assert pid > 0
     receipt = reap_process_group(pid, grace_seconds=3.0)
-    assert receipt.delivered
-    # The worker must actually be gone after the reap.
+
+    # The guarantee, established against the process rather than the receipt.
     proc = getattr(result, "proc", None)
     if proc is not None and hasattr(proc, "wait"):
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=8.0)
-        assert proc.poll() is not None, "worker still alive after platform reap"
+        stopped = proc.poll() is not None
     else:
-        assert not process_alive(pid), "worker still alive after platform reap"
+        stopped = not process_alive(pid)
+    assert stopped, f"worker still alive after platform reap: {receipt}"
+
+    # Either a stop was delivered, or the tree was observed already gone.
+    # A receipt claiming neither means the reap declined to act and said so,
+    # which is honest but is not a reap.
+    assert receipt.delivered or receipt.already_gone, f"reap reported neither a stop nor an observed exit: {receipt}"
+    if IS_WINDOWS:
+        # The pinned handle leaves the system when the process does, so on
+        # this platform the guarantee is observable and must be reported.
+        assert receipt.confirmed_dead, f"reap left the spawn unconfirmed: {receipt}"
     with contextlib.suppress(Exception):
         adapter_cls.cancel_timeout(result)
 
