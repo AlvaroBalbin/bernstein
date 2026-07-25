@@ -231,7 +231,11 @@ def _confirm_run(*, goal: str | None, seed_file: str | None) -> bool:
                 team = list(_seed.team) if _seed.team != "auto" else None
                 from bernstein.core.plan_approval import configure_plan_models
 
-                configure_plan_models(_seed.role_model_policy)
+                configure_plan_models(
+                    _seed.role_model_policy,
+                    default_model=_seed.model,
+                    default_cli=(_seed.cli if _seed.cli and _seed.cli != "auto" else None),
+                )
 
     if effective_goal:
         plan_obj, plan_tasks = _build_synthetic_plan(effective_goal, team)

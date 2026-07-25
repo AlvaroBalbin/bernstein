@@ -22,6 +22,7 @@ from bernstein.cli.helpers import (
 from bernstein.cli.run import render_run_summary_from_dict
 from bernstein.cli.ui import make_console
 from bernstein.core.cost import estimate_run_cost
+from bernstein.core.cost.model_prices import is_free_route
 from bernstein.core.cost.preflight import CostBand, compute_band, format_band
 from bernstein.core.plan_loader import load_plan_from_yaml
 from bernstein.core.runtime_state import directory_size_bytes
@@ -221,6 +222,10 @@ class RunCostEstimate:
         high_usd: Legacy single-point high estimate (kept for back-compat).
         band: Optional calibrated p50/p90 band. Populated for new callers;
             legacy callers can leave it unset.
+        free_route: True when the resolved model is a zero-cost route (a
+            ``:free`` id or a model the run's own metering prices at $0). The
+            estimate is then a hard $0 rather than a phantom fixed rate
+            (issue #3013).
     """
 
     task_count: int | None
@@ -228,6 +233,7 @@ class RunCostEstimate:
     low_usd: float
     high_usd: float
     band: CostBand | None = None
+    free_route: bool = False
 
 
 def _estimate_task_count(workdir: Path, plan_file: Path | None, goal: str | None) -> int | None:
@@ -372,7 +378,15 @@ def _estimate_run_preview(
     billable_count = est_task_count if est_task_count is not None else 1
     est_model, est_cli, est_role = _resolve_model_and_cli(seed_file, model_override, seed=seed)
 
-    if est_cli in _FREE_ADAPTERS:
+    # A run is free either because the adapter runs models locally at $0
+    # (ollama/qwen/gemini) or because the *resolved model* is a zero-cost
+    # route -- a ``:free`` id or a model the run's own metering
+    # (``price_model_usage``) prices at $0.  Keying the estimate on the
+    # resolved model, not a fixed Anthropic rate, keeps the pre-run banner
+    # and the final ``total_cost`` drawn from the same pricing source, so a
+    # free route is never quoted a phantom estimate (issue #3013).
+    free_route = est_cli in _FREE_ADAPTERS or is_free_route(est_model)
+    if free_route:
         low_usd, high_usd = 0.0, 0.0
         band = CostBand(
             p50=0.0,
@@ -399,6 +413,7 @@ def _estimate_run_preview(
         low_usd=low_usd,
         high_usd=high_usd,
         band=band,
+        free_route=free_route,
     )
 
 
@@ -440,12 +455,24 @@ def _emit_preflight_runtime_warnings(
             basis = f"based on {estimate.task_count} task(s) at {estimate.model} pricing"
         else:
             basis = f"per task at {estimate.model} pricing, task count not yet planned"
+        if estimate.free_route:
+            # A zero-cost route (:free / unpriced) must not be quoted a
+            # phantom rate: the real run meters it at $0 (issue #3013).
+            if estimate.task_count is not None:
+                basis = f"free route - no cost ({estimate.model}), based on {estimate.task_count} task(s)"
+            else:
+                basis = f"free route - no cost ({estimate.model}), task count not yet planned"
         if band is not None:
             console.print(f"[bold yellow]{format_band(band)}[/bold yellow]")
-            samples_note = (
-                f"{band.samples} historical sample(s)" if not band.cold_start else "no history yet - using heuristic"
-            )
-            console.print(f"[dim]{basis}, {samples_note}[/dim]")
+            if estimate.free_route:
+                console.print(f"[dim]{basis}[/dim]")
+            else:
+                samples_note = (
+                    f"{band.samples} historical sample(s)"
+                    if not band.cold_start
+                    else "no history yet - using heuristic"
+                )
+                console.print(f"[dim]{basis}, {samples_note}[/dim]")
         else:
             console.print(
                 f"[bold yellow]Estimated cost:[/bold yellow] ${estimate.low_usd:.2f}-${estimate.high_usd:.2f} {basis}"
