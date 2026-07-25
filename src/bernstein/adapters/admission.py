@@ -1237,13 +1237,23 @@ def preflight_admission(
 
     Returns:
         The gate's :class:`AdmissionDecision`, or ``None`` when the adapter is
-        exempt or the gate is disabled.
+        exempt, the gate is disabled, or ``adapter`` is not an adapter key.
 
     Raises:
         AdapterAdmissionRefusal: Under :data:`POLICY_ENFORCE`, when admission
             cannot be proved.
     """
     if policy == POLICY_OFF or adapter in ADMISSION_EXEMPT:
+        return None
+
+    # Every field of the receipt is serialised into the audit chain, so a
+    # non-string adapter key would poison the anchor with an unserialisable
+    # value rather than producing a decision. Only a test double reaches here
+    # with one (a spawner constructed around a stubbed adapter), and there is
+    # no contract, transcript, or receipt filename such a key could address -
+    # so there is nothing to gate and nothing to record.
+    if not isinstance(adapter, str) or not adapter:
+        logger.debug("admission: skipping gate for non-string adapter key %r", type(adapter).__name__)
         return None
 
     clock = now if now is not None else datetime.now(UTC)
