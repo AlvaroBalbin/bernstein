@@ -9,11 +9,30 @@ Windows runner.
 
 The reap-receipt cases assert the *verifiable artifact* itself: the
 :class:`ProcessReapReceipt` is a deterministic projection of the platform
-onto ``(os_name, method, delivered, escalated)``. On Windows the force
-tier must fall back to the numeric ``9`` code because ``SIGKILL`` does not
-exist, and the receipt must record ``windows_process_tree`` as the
-mechanism. Stripping that projection is what a Windows regression looks
-like, so we pin it here rather than only on a Windows host.
+onto ``(os_name, method, delivered, already_gone, escalated,
+confirmed_dead)``. On Windows the force tier must fall back to the numeric
+``9`` code because ``SIGKILL`` does not exist, and the receipt must record
+``windows_process_tree`` as the mechanism. Stripping that projection is
+what a Windows regression looks like, so we pin it here rather than only on
+a Windows host.
+
+Three properties get dedicated coverage because Windows recycles pids fast
+enough for all of them to matter in practice:
+
+* a target that was *observed* to have already exited is a satisfied reap,
+  not a failed one - nothing is left running, which is the whole point of
+  the call;
+* no stop tier may ever act on a pid that might have been recycled into an
+  unrelated process, so the reap pins the target with an open handle and
+  refuses a process that started after the reap was requested; and
+* "could not observe" is a third answer, never folded into either of the
+  first two.  ``OpenProcess`` refuses a pid nothing holds and a pid held by
+  a process this user may not touch with different error codes, a handle
+  can be open and still decline to report an exit code, and a mismatched
+  creation time says the number is not the target rather than that the
+  target is gone.  Each of those leaves both ``already_gone`` and
+  ``confirmed_dead`` False: the receipt is signed into the audit chain, so
+  an absence of evidence must not serialise as evidence of absence.
 """
 
 from __future__ import annotations
@@ -21,6 +40,7 @@ from __future__ import annotations
 import ctypes
 import signal
 import subprocess
+import time
 from typing import Any
 
 import bernstein.core.config.platform_compat as pc
@@ -126,7 +146,7 @@ class TestKillProcessGroupWindowsBranch:
 
 
 # ---------------------------------------------------------------------------
-# _win_taskkill - taskkill primary path + PowerShell fallback
+# _win_taskkill - taskkill tree stop + pinned-handle terminate fallback
 # ---------------------------------------------------------------------------
 
 
@@ -137,10 +157,215 @@ class _Result:
         self.stderr = ""
 
 
+class _PinKernel32:
+    """kernel32 stand-in with a one-process world model.
+
+    Models the handle semantics the reap pin depends on: ``OpenProcess``
+    only resolves a pid the world knows about, the handle keeps answering
+    after the process exits, ``TerminateProcess`` flips it to exited, and
+    ``WaitForSingleObject`` reports exited/timed-out rather than a raw
+    liveness poll.
+
+    ``exists`` and ``openable`` are separate knobs because the two failures
+    they model are separate findings.  A pid nothing holds fails
+    ``OpenProcess`` with ``ERROR_INVALID_PARAMETER`` and is evidence of an
+    exit.  A pid held by a process this user may not touch fails with
+    ``ERROR_ACCESS_DENIED`` and is evidence of a *live* process we cannot
+    follow.  A world model that returns a bare 0 for both cannot tell them
+    apart, and neither can code written against it.
+    """
+
+    def __init__(
+        self,
+        *,
+        pid: int = 123,
+        exists: bool = True,
+        running: bool = True,
+        start_time: float = 0.0,
+        openable: bool = True,
+        terminable: bool = True,
+    ) -> None:
+        self.pid = pid
+        self.exists = exists
+        self.running = running
+        self.start_time = start_time
+        self.openable = openable
+        self.terminable = terminable
+        self.opened: list[tuple[int, int]] = []
+        self.terminated: list[int] = []
+        self.closed: list[int] = []
+        self.waits: list[tuple[int, int]] = []
+        self.last_error = 0
+
+    _HANDLE = 4242
+
+    def OpenProcess(self, access: int, _inherit: bool, pid: int) -> int:
+        self.opened.append((access, pid))
+        if pid != self.pid or not self.exists:
+            self.last_error = 87  # ERROR_INVALID_PARAMETER: no such pid
+            return 0
+        if not self.openable:
+            self.last_error = 5  # ERROR_ACCESS_DENIED: live, but not ours
+            return 0
+        self.last_error = 0
+        return self._HANDLE
+
+    def GetLastError(self) -> int:
+        return self.last_error
+
+    def GetExitCodeProcess(self, _handle: int, ptr: Any) -> int:
+        ptr._obj.value = 259 if self.running else 0
+        return 1
+
+    def GetProcessTimes(self, _handle: int, creation: Any, *_rest: Any) -> int:
+        ticks = int((self.start_time + 11644473600.0) * 10_000_000)
+        creation._obj.dwLowDateTime = ticks & 0xFFFFFFFF
+        creation._obj.dwHighDateTime = ticks >> 32
+        return 1
+
+    def TerminateProcess(self, handle: int, _code: int) -> int:
+        self.terminated.append(handle)
+        if not self.terminable:
+            return 0
+        self.running = False
+        return 1
+
+    def WaitForSingleObject(self, handle: int, timeout_ms: int) -> int:
+        self.waits.append((handle, timeout_ms))
+        return 0 if not self.running else 258  # WAIT_OBJECT_0 / WAIT_TIMEOUT
+
+    def CloseHandle(self, handle: int) -> None:
+        self.closed.append(handle)
+
+
+def _install_kernel32(monkeypatch: Any, fake: _PinKernel32) -> None:
+    monkeypatch.setattr(pc, "_win_kernel32", lambda: fake)
+
+
+def _install_kernel32_everywhere(monkeypatch: Any, fake: _PinKernel32) -> None:
+    """Route both kernel32 entry points at *fake*.
+
+    ``_win_process_alive`` reaches ``ctypes.windll`` directly while the reap
+    pin goes through ``_win_kernel32``; a whole-reap test has to serve both.
+    """
+    _install_kernel32(monkeypatch, fake)
+
+    class _Windll:
+        kernel32 = fake
+
+    monkeypatch.setattr(ctypes, "windll", _Windll(), raising=False)
+
+
 class TestWinTaskkill:
-    """The taskkill primary path and the PowerShell verify-fallback."""
+    """The taskkill tree stop plus the pinned-handle terminate fallback.
+
+    The fallback deliberately does *not* re-resolve the pid. Windows
+    recycles pids fast, and the old PowerShell fallback fired
+    ``Stop-Process -Id <pid> -Force`` precisely in the situation where the
+    pid was most likely to have been recycled (taskkill had just reported it
+    missing), so it could force-kill an unrelated process. Everything below
+    goes through the handle opened before any stop tier ran.
+    """
 
     def test_taskkill_success_skips_fallback(self, monkeypatch: Any) -> None:
+        fake = _PinKernel32()
+        _install_kernel32(monkeypatch, fake)
+        cmds: list[list[str]] = []
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            cmds.append(cmd)
+            fake.running = False  # taskkill did stop it
+            return _Result(0)
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(123, force=True, tree=True) is True
+        # Exactly one external invocation: taskkill, no interpreter fallback.
+        assert len(cmds) == 1
+        assert cmds[0][0] == "taskkill"
+        assert "/F" in cmds[0] and "/T" in cmds[0]
+        assert cmds[0][-2:] == ["/PID", "123"]
+        assert fake.terminated == []
+        assert fake.closed == [_PinKernel32._HANDLE]
+
+    def test_taskkill_failure_terminates_through_the_pinned_handle(self, monkeypatch: Any) -> None:
+        fake = _PinKernel32()
+        _install_kernel32(monkeypatch, fake)
+        cmds: list[list[str]] = []
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            cmds.append(cmd)
+            return _Result(1)  # taskkill refuses (console process, no /F)
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(123) is True
+        # Only taskkill is ever spawned; the fallback is an in-process
+        # kernel call on the handle, not a second command line naming the pid.
+        assert [c[0] for c in cmds] == ["taskkill"]
+        assert fake.terminated == [_PinKernel32._HANDLE]
+
+    def test_unterminable_target_returns_false(self, monkeypatch: Any) -> None:
+        fake = _PinKernel32(terminable=False)
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(pc.subprocess, "run", lambda cmd, **_kw: _Result(1))
+        assert pc._win_taskkill(123) is False
+
+    def test_taskkill_timeout_falls_through_to_the_handle(self, monkeypatch: Any) -> None:
+        fake = _PinKernel32()
+        _install_kernel32(monkeypatch, fake)
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            raise subprocess.TimeoutExpired(cmd, 5)
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(123) is True
+        assert fake.terminated == [_PinKernel32._HANDLE]
+
+    def test_already_exited_target_is_never_signalled(self, monkeypatch: Any) -> None:
+        """An exited pid gets no taskkill and no terminate - only a report."""
+        fake = _PinKernel32(running=False)
+        _install_kernel32(monkeypatch, fake)
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            raise AssertionError("stopped an already-exited process")
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(123) is False
+        assert fake.terminated == []
+
+    def test_unknown_pid_is_never_signalled(self, monkeypatch: Any) -> None:
+        """A pid that resolves to nothing must not be handed to taskkill."""
+        fake = _PinKernel32(exists=False)
+        _install_kernel32(monkeypatch, fake)
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            raise AssertionError("stopped a pid that resolves to no process")
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(123) is False
+
+    def test_nonpositive_pid_is_never_signalled(self, monkeypatch: Any) -> None:
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            raise AssertionError("stopped a non-positive pid")
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+        assert pc._win_taskkill(0) is False
+        assert pc._win_taskkill(-1) is False
+
+    def test_taskkill_not_found_falls_back_to_the_handle(self, monkeypatch: Any) -> None:
+        """taskkill 128 means the lead is gone; the handle settles it."""
+        fake = _PinKernel32()
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(pc.subprocess, "run", lambda cmd, **_kw: _Result(128))
+        assert pc._win_taskkill(123, tree=True) is True
+        assert fake.terminated == [_PinKernel32._HANDLE]
+
+    def test_without_a_kernel_boundary_only_taskkill_runs(self, monkeypatch: Any) -> None:
+        """No pin means no bare-pid force kill, just the tree stop."""
+
+        def _boom() -> Any:
+            raise AttributeError("no windll on this host")
+
+        monkeypatch.setattr(pc, "_win_kernel32", _boom)
         cmds: list[list[str]] = []
 
         def _run(cmd: list[str], **_kw: Any) -> _Result:
@@ -149,52 +374,197 @@ class TestWinTaskkill:
 
         monkeypatch.setattr(pc.subprocess, "run", _run)
         assert pc._win_taskkill(123, force=True, tree=True) is True
-        # Exactly one invocation: taskkill, no PowerShell fallback.
-        assert len(cmds) == 1
-        assert cmds[0][0] == "taskkill"
-        assert "/F" in cmds[0] and "/T" in cmds[0]
-        assert cmds[0][-2:] == ["/PID", "123"]
+        assert [c[0] for c in cmds] == ["taskkill"]
 
-    def test_taskkill_failure_triggers_powershell_verify(self, monkeypatch: Any) -> None:
-        cmds: list[list[str]] = []
+    def test_unreadable_handle_state_is_not_an_exit(self, monkeypatch: Any) -> None:
+        """A handle that will not answer is neither running nor gone.
+
+        Refusing to signal an unreadable target is right.  Recording it as
+        an observed exit is not: nothing looked at the process, so the
+        receipt has nothing to certify.  ``_win_handle_alive`` collapses the
+        unreadable case into "not alive" for callers that only need to stop
+        waiting, so the pin must read the tri-state directly.
+        """
+
+        class _Mute(_PinKernel32):
+            def GetExitCodeProcess(self, _handle: int, _ptr: Any) -> int:
+                return 0
+
+            def GetProcessTimes(self, _handle: int, *_rest: Any) -> int:
+                return 0
+
+        fake = _Mute()
+        _install_kernel32(monkeypatch, fake)
+        assert pc._win_handle_liveness(_PinKernel32._HANDLE) is None
+        assert pc._win_handle_alive(_PinKernel32._HANDLE) is False
+        assert pc._win_handle_start_time(_PinKernel32._HANDLE) is None
+
+        pin = pc._win_pin_process(123)
+        assert pin is not None
+        assert pin.target_state == pc._PIN_TARGET_UNOBSERVABLE
+        assert pin.already_gone is False
+        assert pin.signalable is False
+        assert pin.observed_exited() is False
+
+    def test_unreadable_handle_state_claims_nothing_in_the_receipt(self, monkeypatch: Any) -> None:
+        """F2 regression: an unreadable handle must not certify a death.
+
+        Fails if ``already_gone`` is ever derived from "the handle would not
+        answer", which is what made an unobserved process serialise into the
+        audit chain as confirmed dead.
+        """
+
+        class _Mute(_PinKernel32):
+            def GetExitCodeProcess(self, _handle: int, _ptr: Any) -> int:
+                return 0
+
+        fake = _Mute(pid=999, running=True)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(
+                AssertionError("signalled a target nobody could observe")
+            ),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+        assert receipt.delivered is False
+        assert fake.terminated == []
+        assert fake.running is True
+
+    def test_access_denied_live_process_is_not_reported_gone(self, monkeypatch: Any) -> None:
+        """F1 regression: ERROR_ACCESS_DENIED is a live process, not an exit.
+
+        ``OpenProcess`` refuses both for a pid nothing holds and for a pid
+        held by a process this user may not touch.  Only the first is an
+        exit.  Fails if the two refusals are collapsed back into one
+        "already gone" answer.
+        """
+        fake = _PinKernel32(pid=999, running=True, openable=False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(
+                AssertionError("signalled a pid we were refused access to")
+            ),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        # Refused access: not signalled, and nothing claimed about it.
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+        assert receipt.delivered is False
+        assert fake.running is True
+
+    def test_absent_pid_is_still_reported_gone(self, monkeypatch: Any) -> None:
+        """The other half of F1: a pid nothing holds *is* an observed exit.
+
+        Guards the fix against over-correction - if every refusal became
+        "unobservable", the already-exited case this PR exists to report
+        would stop being reported.
+        """
+        fake = _PinKernel32(pid=999, exists=False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        _install_kernel32(monkeypatch, fake)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is True
+        assert receipt.confirmed_dead is True
+        assert receipt.delivered is False
+
+
+class TestWinPidReuseGuard:
+    """The pin refuses to act on a pid that was recycled under it."""
+
+    def test_process_started_after_the_request_is_not_the_target(self, monkeypatch: Any) -> None:
+        # Creation time in the future relative to the reap request: this
+        # process cannot be the one the caller asked us to stop.
+        fake = _PinKernel32(start_time=time.time() + 60.0)
+        _install_kernel32(monkeypatch, fake)
+
+        pin = pc._win_pin_process(123)
+
+        assert pin is not None
+        assert pin.signalable is False
+        # "That is not the process you asked about" is not "the process you
+        # asked about has exited".  The target's state was never observed.
+        assert pin.already_gone is False
+        assert pin.target_state == pc._PIN_TARGET_UNOBSERVABLE
+        # The impostor's handle was released and never terminated.
+        assert fake.terminated == []
+        assert fake.closed == [_PinKernel32._HANDLE]
+
+    def test_recycled_pid_claims_nothing_in_the_receipt(self, monkeypatch: Any) -> None:
+        """F3 regression: a mismatched identity must not certify a death.
+
+        The same path fires when the wall clock steps backwards between the
+        target's creation and the reap request, so a live process would be
+        certified dead by a clock adjustment alone.  Fails if the recycle
+        guard reports its refusal as an observed exit.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        fake = _PinKernel32(pid=999, running=True, start_time=time.time() + 2.0)
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(
+                AssertionError("signalled a pid whose identity did not match")
+            ),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is False
+        assert receipt.confirmed_dead is False
+        assert receipt.delivered is False
+        assert fake.terminated == []
+        assert fake.running is True
+
+    def test_recycled_pid_is_not_handed_to_taskkill(self, monkeypatch: Any) -> None:
+        fake = _PinKernel32(start_time=time.time() + 60.0)
+        _install_kernel32(monkeypatch, fake)
 
         def _run(cmd: list[str], **_kw: Any) -> _Result:
-            cmds.append(cmd)
-            return _Result(1)  # taskkill and powershell both "ran"
+            raise AssertionError("signalled a recycled pid")
 
         monkeypatch.setattr(pc.subprocess, "run", _run)
-        # After the fallback, liveness says the process is gone -> success.
-        monkeypatch.setattr(pc, "_win_process_alive", lambda pid: False)
-        assert pc._win_taskkill(123) is True
-        assert [c[0] for c in cmds] == ["taskkill", "powershell"]
+        assert pc._win_taskkill(123, force=True, tree=True) is False
 
-    def test_powershell_fallback_still_alive_returns_false(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(pc.subprocess, "run", lambda cmd, **_kw: _Result(1))
-        monkeypatch.setattr(pc, "_win_process_alive", lambda pid: True)
-        assert pc._win_taskkill(123) is False
+    def test_established_pin_keeps_the_handle_open_for_the_whole_reap(self, monkeypatch: Any) -> None:
+        """The open handle is what stops Windows recycling the pid mid-reap."""
+        fake = _PinKernel32(start_time=time.time() - 60.0)
+        _install_kernel32(monkeypatch, fake)
 
-    def test_taskkill_timeout_falls_through_to_powershell(self, monkeypatch: Any) -> None:
-        cmds: list[list[str]] = []
+        pin = pc._win_pin_process(123)
 
-        def _run(cmd: list[str], **_kw: Any) -> _Result:
-            cmds.append(cmd)
-            if cmd[0] == "taskkill":
-                raise subprocess.TimeoutExpired(cmd, 5)
-            return _Result(0)
+        assert pin is not None
+        assert pin.already_gone is False
+        assert fake.closed == []  # still pinned
+        pin.close()
+        assert fake.closed == [_PinKernel32._HANDLE]
 
-        monkeypatch.setattr(pc.subprocess, "run", _run)
-        monkeypatch.setattr(pc, "_win_process_alive", lambda pid: False)
-        assert pc._win_taskkill(123) is True
-        assert [c[0] for c in cmds] == ["taskkill", "powershell"]
+    def test_unavailable_kernel_boundary_claims_nothing(self, monkeypatch: Any) -> None:
+        """No kernel32 means "guard unavailable", never "target gone"."""
 
-    def test_powershell_oserror_returns_false(self, monkeypatch: Any) -> None:
-        def _run(cmd: list[str], **_kw: Any) -> _Result:
-            if cmd[0] == "taskkill":
-                return _Result(1)
-            raise OSError("powershell missing")
+        def _boom() -> Any:
+            raise AttributeError("no windll on this host")
 
-        monkeypatch.setattr(pc.subprocess, "run", _run)
-        assert pc._win_taskkill(123) is False
+        monkeypatch.setattr(pc, "_win_kernel32", _boom)
+        assert pc._win_pin_process(123) is None
 
 
 # ---------------------------------------------------------------------------
@@ -323,14 +693,11 @@ class TestReapReceiptWindowsProjection:
         assert sigs[-1] == 9
 
     def test_undeliverable_term_projects_not_delivered(self, monkeypatch: Any) -> None:
+        """An undeliverable stop against a *running* target is a failure."""
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
         monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
-        monkeypatch.setattr(
-            pc,
-            "process_alive",
-            lambda pid: (_ for _ in ()).throw(AssertionError("polled")),
-        )
+        monkeypatch.setattr(pc, "process_alive", lambda pid: True)
 
         receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
 
@@ -338,3 +705,95 @@ class TestReapReceiptWindowsProjection:
         assert receipt.method == "windows_process_tree"
         assert receipt.delivered is False
         assert receipt.escalated is False
+        # Still running and we could not stop it: no guarantee to report.
+        assert receipt.confirmed_dead is False
+        assert receipt.already_gone is False
+
+    def test_undeliverable_term_against_an_exited_target_is_success(self, monkeypatch: Any) -> None:
+        """An already-exited tree satisfies the guarantee the reap exists for.
+
+        This is the case that turned a green Windows lane red: the spawn had
+        already exited, so no stop could be delivered to it, and the receipt
+        reported that as a failed reap. "Nothing left to stop" is the
+        outcome the caller wanted, not a failure to produce it.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: False)
+        monkeypatch.setattr(pc, "process_alive", lambda pid: False)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.delivered is False
+        assert receipt.escalated is False
+        assert receipt.already_gone is True
+        assert receipt.confirmed_dead is True
+
+    def test_pinned_exited_target_skips_every_stop_tier(self, monkeypatch: Any) -> None:
+        """A pin that reports the target gone stops the reap before it signals."""
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        fake = _PinKernel32(pid=999, running=False)
+        _install_kernel32(monkeypatch, fake)
+        monkeypatch.setattr(
+            pc,
+            "kill_process_group",
+            lambda pgid, sig=signal.SIGTERM: (_ for _ in ()).throw(AssertionError("signalled")),
+        )
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.already_gone is True
+        assert receipt.confirmed_dead is True
+        assert receipt.delivered is False
+        assert fake.terminated == []
+        # The pin is always released, even on the early-return path.
+        assert fake.closed == [_PinKernel32._HANDLE]
+
+    def test_hung_console_spawn_is_reaped_and_confirmed(self, monkeypatch: Any) -> None:
+        """Whole-reap replay of the Windows conformance case.
+
+        A hung console process is what the adapter conformance suite spawns.
+        ``taskkill`` without ``/F`` refuses to stop a console process, which
+        used to drop the reap into a fallback that shelled out to
+        ``Stop-Process -Id <pid> -Force`` and then raced an immediate
+        liveness probe against an asynchronous termination. The reap now
+        terminates through the handle it already holds and waits on that
+        handle, so the outcome is decided by evidence rather than timing.
+        """
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        fake = _PinKernel32(pid=6300, start_time=time.time() - 30.0)
+        _install_kernel32_everywhere(monkeypatch, fake)
+        cmds: list[list[str]] = []
+
+        def _run(cmd: list[str], **_kw: Any) -> _Result:
+            cmds.append(cmd)
+            # "This process can only be terminated forcefully (with /F)".
+            return _Result(1)
+
+        monkeypatch.setattr(pc.subprocess, "run", _run)
+
+        receipt = pc.reap_process_group(6300, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.os_name == "windows"
+        assert receipt.method == "windows_process_tree"
+        assert receipt.delivered is True
+        assert receipt.escalated is False
+        assert receipt.confirmed_dead is True
+        assert fake.running is False
+        # Only taskkill was ever spawned - no interpreter was asked to
+        # force-kill the bare pid.
+        assert [c[0] for c in cmds] == ["taskkill"]
+
+    def test_clean_exit_projects_confirmed_dead(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_detect_os_name", lambda: "windows")
+        monkeypatch.setattr(pc, "kill_process_group", lambda pgid, sig=signal.SIGTERM: True)
+        monkeypatch.setattr(pc, "process_alive", lambda pid: False)
+
+        receipt = pc.reap_process_group(999, grace_seconds=0.05, poll_interval=0.01)
+
+        assert receipt.delivered is True
+        assert receipt.confirmed_dead is True
+        assert receipt.already_gone is False

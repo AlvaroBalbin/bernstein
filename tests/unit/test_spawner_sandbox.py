@@ -87,9 +87,14 @@ def test_spawn_in_sandbox_uses_sandbox_path(tmp_path: Path) -> None:
     assert sandbox_spawn.call_args.kwargs["adapter_name"] == "claude"
 
 
-def test_spawn_in_sandbox_falls_back_to_adapter_on_runtime_failure(tmp_path: Path) -> None:
+def test_spawn_in_sandbox_falls_back_to_adapter_on_runtime_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Runtime setup errors should fall back to the normal worktree adapter path."""
 
+    # The fallback is for a container request the operator did not pin with
+    # ``--sandbox``; a pinned container runtime refuses instead (issue #3039).
+    monkeypatch.delenv("BERNSTEIN_SANDBOX_RUNTIME", raising=False)
     adapter = FakeAdapter("codex")
     sandbox = DockerSandbox(enabled=True)
     session = AgentSession(id="S-2", role="backend")

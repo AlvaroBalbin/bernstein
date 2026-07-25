@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -76,6 +78,31 @@ def test_mcp_server_registers_all_tools() -> None:
     assert "bernstein_cost" in tool_names
     assert "bernstein_stop" in tool_names
     assert "bernstein_approve" in tool_names
+
+
+def test_every_registered_tool_has_an_explicit_tier(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Every tool a server registers must declare its tier in ``TOOL_TIERS``.
+
+    ``tool_in_tier`` falls back to the ``all`` tier for an unlisted name, so a
+    tool registered without a ``TOOL_TIERS`` entry silently disappears from
+    ``tools/list`` under the default ``standard`` tier. Comparing the tool
+    manager's registry against the declaration turns that silent drop into a
+    test failure at the moment the tool is added.
+    """
+    from bernstein.core.protocols.mcp.tool_tiers import TOOL_TIERS
+    from bernstein.mcp.server import create_mcp_server
+
+    # The ``all`` tier keeps every registered tool, and lineage registration
+    # is opt-in, so this build is the widest possible registration set.
+    mcp = create_mcp_server(
+        server_url="http://localhost:8052",
+        tier="all",
+        lineage_enabled=True,
+        lineage_root=tmp_path,
+    )
+    registered = {t.name for t in mcp._tool_manager.list_tools()}
+    undeclared = sorted(registered - set(TOOL_TIERS))
+    assert not undeclared, f"MCP tools registered without a TOOL_TIERS entry: {undeclared}"
 
 
 # ---------------------------------------------------------------------------
@@ -622,3 +649,232 @@ async def test_bernstein_run_sends_auth_header_when_set(
 
     headers = mock_client.post.call_args.kwargs.get("headers") or {}
     assert headers.get("Authorization") == "Bearer run-tok"
+
+
+# ---------------------------------------------------------------------------
+# bernstein_run -> bernstein_task_handle round trip
+#
+# The polling loop is the load-bearing interaction of this surface: a run
+# takes minutes to hours, so the caller starts it, gets a response body, and
+# comes back later with an identifier out of that body. These tests pin that
+# the identifiers the start call hands out are the identifiers the poll tool
+# accepts, without the caller deriving anything from our source.
+# ---------------------------------------------------------------------------
+
+
+def _run_tool_fn(mcp, name):
+    return mcp._tool_manager._tools[name].fn
+
+
+async def _call_unwrapped(mcp, name, **kwargs):
+    raw = await _run_tool_fn(mcp, name)(**kwargs)
+    data = json.loads(raw)
+    # Tools are wrapped in the cost-meter envelope by default; unwrap it.
+    if isinstance(data, dict) and "_meter" in data and "result" in data:
+        return data["result"]
+    return data
+
+
+def _mock_post_client(created: dict):
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=created)
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_response)
+    return mock_client
+
+
+async def _start_run(mcp, created: dict) -> dict:
+    with patch("bernstein.mcp.server.httpx.AsyncClient", return_value=_mock_post_client(created)):
+        return await _call_unwrapped(mcp, "bernstein_run", goal="watch me")
+
+
+@pytest.mark.asyncio
+async def test_bernstein_run_response_carries_poll_identifiers() -> None:
+    """The start response names the journal run id and an advisory poll delay."""
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+    from bernstein.mcp.server import create_mcp_server
+
+    created = _make_task_payload(task_id="abc123", status="open", title="Add auth")
+    mcp = create_mcp_server(server_url="http://localhost:8052", tier="all")
+
+    body = await _start_run(mcp, created)
+
+    # The three fields that shipped before must keep their values and order.
+    assert list(body)[:3] == ["task_id", "title", "status"]
+    assert body["task_id"] == "abc123"
+    assert body["title"] == "Add auth"
+    assert body["status"] == "open"
+    # The added fields make the poll loop reachable from the response alone.
+    assert body["run_id"] == task_run_id("abc123")
+    assert isinstance(body["poll_after_ms"], int)
+    assert body["poll_after_ms"] > 0
+
+
+@pytest.mark.asyncio
+async def test_run_then_poll_with_task_id_from_response(tmp_path, monkeypatch) -> None:
+    """Polling with the task id the start call returned finds the run journal."""
+    from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+    from bernstein.mcp.server import create_mcp_server
+
+    monkeypatch.chdir(tmp_path)
+    journal = EventJournal(task_run_id("abc123"), tmp_path / ".sdd")
+    journal.record("run_started", goal="g")
+    journal.record("run_completed", result="done")
+
+    mcp = create_mcp_server(server_url="http://localhost:8052", tier="all")
+    body = await _start_run(mcp, _make_task_payload(task_id="abc123"))
+
+    handle = await _call_unwrapped(mcp, "bernstein_task_handle", run_id=body["task_id"])
+    assert handle["status"] == "completed"
+    assert handle["journalHead"] == journal.head()
+
+
+@pytest.mark.asyncio
+async def test_task_handle_both_id_forms_project_the_same_handle(tmp_path, monkeypatch) -> None:
+    """The task id and the journal run id project a byte-identical handle."""
+    from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+    from bernstein.mcp.server import create_mcp_server
+
+    monkeypatch.chdir(tmp_path)
+    journal = EventJournal(task_run_id("abc123"), tmp_path / ".sdd")
+    journal.record("run_started", goal="g")
+
+    mcp = create_mcp_server(server_url="http://localhost:8052", tier="all")
+    body = await _start_run(mcp, _make_task_payload(task_id="abc123"))
+
+    by_task_id = await _call_unwrapped(mcp, "bernstein_task_handle", run_id=body["task_id"])
+    by_run_id = await _call_unwrapped(mcp, "bernstein_task_handle", run_id=body["run_id"])
+    assert by_task_id == by_run_id
+    assert by_task_id["journalHead"] == journal.head()
+    assert by_task_id["receiptHash"] == by_run_id["receiptHash"]
+
+
+@pytest.mark.asyncio
+async def test_task_handle_prefixed_id_resolves_to_exactly_one_journal(tmp_path, monkeypatch) -> None:
+    """A task id already in ``task-*`` form cannot address two journals."""
+    from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+    from bernstein.mcp.server import create_mcp_server
+
+    monkeypatch.chdir(tmp_path)
+    assert task_run_id("task-abc") == "task-task-abc"
+
+    direct = EventJournal("task-abc", tmp_path / ".sdd")
+    direct.record("run_started", goal="direct")
+    direct.record("run_completed", result="done")
+
+    derived = EventJournal("task-task-abc", tmp_path / ".sdd")
+    derived.record("run_started", goal="derived")
+
+    assert direct.head() != derived.head()
+
+    mcp = create_mcp_server(server_url="http://localhost:8052", tier="all")
+    handle = await _call_unwrapped(mcp, "bernstein_task_handle", run_id="task-abc")
+
+    # Journal run id first: the collision resolves to the direct journal only.
+    assert handle["journalHead"] == direct.head()
+    assert handle["journalHead"] != derived.head()
+    assert handle["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_task_handle_unresolvable_ids_keep_existing_shapes(tmp_path, monkeypatch) -> None:
+    """An id matching neither form answers exactly as it does today."""
+    from bernstein.mcp.server import create_mcp_server
+
+    monkeypatch.chdir(tmp_path)
+    mcp = create_mcp_server(server_url="http://localhost:8052", tier="all")
+
+    rejected = await _call_unwrapped(mcp, "bernstein_task_handle", run_id="../../etc")
+    assert "error" in rejected
+
+    unknown = await _call_unwrapped(mcp, "bernstein_task_handle", run_id="nope")
+    assert unknown["runId"] == "nope"
+    assert unknown["status"] == "working"
+# Connect-time server instructions and module docstring (issue #3076)
+# ---------------------------------------------------------------------------
+
+#: Every tool name Bernstein advertises matches one of these shapes, so a
+#: rename that leaves prose behind is caught rather than silently shipped.
+_TOOL_NAME_RE = re.compile(r"\b(?:bernstein_[a-z0-9_]+|load_skill|verify_chain)\b")
+
+#: Character budget for the text pinned in a connected model's context for
+#: the whole session.
+_INSTRUCTIONS_BUDGET = 900
+
+
+def _registered_tool_names(tmp_path: Path) -> set[str]:
+    """Return every tool name registered by ``bernstein.mcp.server``.
+
+    Built at the widest tier with lineage on, so the set covers every tool
+    the module can register rather than just the default tier.
+    """
+    from bernstein.mcp.server import create_mcp_server
+
+    mcp = create_mcp_server(
+        server_url="http://localhost:8052",
+        tier="all",
+        lineage_enabled=True,
+        lineage_root=tmp_path / "lineage",
+    )
+    return set(mcp._tool_manager._tools)
+
+
+def _tool_names_in(text: str) -> set[str]:
+    """Return the tool-shaped identifiers mentioned in ``text``."""
+    return set(_TOOL_NAME_RE.findall(text))
+
+
+def test_server_instructions_fit_the_context_budget() -> None:
+    """The connect-time instructions stay inside their character budget."""
+    from bernstein.mcp.server import _SERVER_INSTRUCTIONS
+
+    assert len(_SERVER_INSTRUCTIONS) <= _INSTRUCTIONS_BUDGET
+
+
+def test_server_instructions_state_the_control_loop_in_order() -> None:
+    """Identity, then the start-then-poll loop, then the pointer to skills."""
+    from bernstein.mcp.server import _SERVER_INSTRUCTIONS
+
+    text = _SERVER_INSTRUCTIONS
+    lowered = text.lower()
+
+    run_at = text.index("bernstein_run")
+    handle_at = text.index("bernstein_task_handle")
+    skill_at = text.index("load_skill")
+
+    # Identity comes first, before any tool is named.
+    assert lowered.index("bernstein") < run_at
+    # Start, then poll, then the deeper-material pointer.
+    assert run_at < handle_at < skill_at
+
+    # The poll loop must say what the identifier is, how long a run lasts,
+    # how often to poll, and when to stop.
+    assert "run_id" in text
+    assert "minutes to hours" in lowered
+    assert "poll" in lowered
+    for terminal in ("completed", "failed", "cancelled"):
+        assert terminal in lowered
+
+
+def test_server_instruction_tool_names_are_registered(tmp_path: Path) -> None:
+    """Instruction text must not outlive a tool rename."""
+    from bernstein.mcp.server import _SERVER_INSTRUCTIONS
+
+    mentioned = _tool_names_in(_SERVER_INSTRUCTIONS)
+    assert mentioned, "instructions should name the tools that drive a run"
+    assert mentioned <= _registered_tool_names(tmp_path)
+
+
+def test_module_docstring_lists_every_registered_tool(tmp_path: Path) -> None:
+    """The first thing a contributor reads must match what the module ships."""
+    import bernstein.mcp.server as server_module
+
+    docstring = server_module.__doc__ or ""
+    assert _tool_names_in(docstring) == _registered_tool_names(tmp_path)

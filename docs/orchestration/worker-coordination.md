@@ -35,12 +35,54 @@ Claims are journal entries: claim eligibility is reconstructable offline
 from the task journal plus the chain, and rebuilding the store from the
 same JSONL journal reproduces the identical eligibility projection.
 
+## Release receipts
+
+Every transition that surrenders a held claim appends the matching
+`task.release_receipt` event to the same chain, carrying `task_id`, `role`,
+`released_by` (the holder that surrendered it), `task_version`,
+`release_path`, `reason`, and the `from_status` / `to_status` pair.
+
+| Path | `release_path` |
+| --- | --- |
+| `POST /tasks/{id}/force-claim` | `force_claim` |
+| `POST /tasks/{id}/reopen` | `reopen` |
+| `POST /tasks/{id}/cancel` | `cancel_cascade` (root and descendants) |
+| `TaskStore.cancel` | `cancel` |
+| `POST /tasks/{id}/fail` | `fail` / `fail_contract_violation` |
+| `POST /tasks/{id}/complete` with an empty summary | `fail_empty_completion` |
+| Typed worker refusal | `refuse` |
+| `TaskStore.abandon` (the abandoned task) | `abandon` |
+| `TaskStore.abandon` (downstream tasks it blocks) | `abandon_cascade` |
+| Stale-claim reset after a restart | `restart_recovery` |
+| Cluster node departure | `node_departure` |
+
+A surrender is minted only when the task carried evidence of an actual claim
+(`claimed_at` or `claimed_by_session`). Status alone is not enough: a task can
+reach `WAITING_FOR_SUBTASKS` or `BLOCKED` without ever having been claimed,
+and a fabricated surrender on a signed chain cannot be told apart from a real
+one by a verifier.
+
+Delivery is not a surrender. A task reaching `DONE` or `CLOSED` mints no
+receipt, because the worker finished the job it claimed. Its claim ends only
+if the task later goes back to the pool, which happens through `reopen` and
+does mint one.
+
+Both halves are written by the server itself, so a plain `bernstein serve`
+node records them without the orchestrator's audit wiring. A ledger that
+records acquisitions and no surrenders replays as node A holding a task node
+B is already executing; with both halves,
+`bernstein.core.security.audit_chain.reconstruct_claim_holders` folds any
+prefix of the chain into the last claimant of every task at that point,
+offline. That projection is attribution, not liveness: a delivered task stays
+mapped to the worker that delivered it, and the guarantee it does carry is
+that no task is ever mapped to one claimant while another node holds it,
+because every path back to the pool records a release first.
+
 ## Worker mailbox
 
-`POST /tasks/{task_id}/messages` hands a structured payload to another
-worker's task mid-run. This is not chat: payloads are typed, size-capped,
-and addressed to exactly one task - no freeform threads, no undeclared
-fan-out.
+`POST /tasks/{task_id}/messages` hands a structured payload to a worker's
+task mid-run. This is not chat: payloads are typed, size-capped, and
+addressed to exactly one task - no freeform threads, no undeclared fan-out.
 
 | Field | Constraint |
 | --- | --- |
@@ -52,8 +94,28 @@ fan-out.
 Per task, at most 128 messages are held (`429` beyond that). Unknown kinds
 and oversize bodies are rejected with `422`.
 
+### Who may post to which mailbox
+
+Posting is a write against the addressed task, so it carries the same task
+scope as every other per-task write. The credential decides the reach:
+
+| Credential | May post to |
+| --- | --- |
+| Operator bearer token, SSO user, cluster shared secret or cluster JWT | any task's mailbox |
+| Agent JWT with an empty `task_ids` claim (manager / orchestrator) | any task's mailbox |
+| Agent JWT scoped to specific tasks | only the mailboxes of the tasks in its own `task_ids` |
+
+A task-scoped agent posting to a task outside its scope receives `403` and
+the mailbox is not written. Fan-out between tasks is therefore an
+orchestrator-level operation: a worker cannot address a sibling task's
+mailbox with the session token it was spawned with. Route the handoff
+through the orchestrator, or mint a token scoped to both tasks. The MCP
+`bernstein_update` tool authenticates with `BERNSTEIN_AUTH_TOKEN`, so it is
+unaffected.
+
 ```bash
 curl -s -X POST http://127.0.0.1:8052/tasks/<task-id>/messages \
+  -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"sender": "reviewer-1", "kind": "finding",
        "body": "Error mapping duplicated; use the shared helper in core/errors."}'

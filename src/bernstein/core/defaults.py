@@ -127,6 +127,25 @@ class OrchestratorDefaults:
     stale_claim_timeout_s: float = 900.0  # 15 min
     deadline_warning_window_s: float = 300.0  # 5 min warning before deadline
 
+    # Terminal state for a run that reaches quiescence having produced zero
+    # terminal tasks (issue #3010). The tick loop's only self-stop is gated
+    # on at least one done/failed task, so a run where nothing ever finished
+    # idles indefinitely. See core.orchestration.run_stall for the full
+    # criterion. Tunable via ``tuning.orchestrator.stalled_run_*``, or the
+    # ``BERNSTEIN_STALLED_RUN_GRACE_S`` / ``BERNSTEIN_STALLED_RUN_TICKS``
+    # env vars (checked first).
+    #
+    # 1800s is chosen against two fixed points rather than picked round:
+    #   * strictly ABOVE stale_claim_timeout_s (900s), so the stale-claim
+    #     release always gets its chance first - its outcome is strictly
+    #     more informative, since it produces a real failed task carrying a
+    #     reason instead of a task frozen mid-flight, and
+    #   * strictly BELOW the CLI's default wait for run completion (3600s),
+    #     so a synchronous ``bernstein run`` observes a genuine terminal
+    #     state rather than timing out against a still-idling orchestrator.
+    stalled_run_grace_s: float = 1800.0  # 30 min of zero forward progress
+    stalled_run_ticks: int = 10  # consecutive no-progress quiescent ticks
+
     max_dead_agents_kept: int = 20  # bounded dead-agent history for debugging
     max_processed_done: int = 500  # bounded done-task cache to limit memory
 
@@ -168,6 +187,20 @@ class AgentDefaults:
     """Heartbeat, idle detection, escalation tiers."""
 
     heartbeat_stale_s: float = 120.0  # 2 min
+    # Time-to-first-turn cap for the `starting` phase. Adapters that emit no
+    # heartbeats (e.g. `consumes_heartbeat_dir=False`) rely on log/git mtime
+    # for liveness, so a slow/free-tier model that needs longer than
+    # `heartbeat_stale_s` to produce its first turn used to be flagged stale
+    # and reaped while still working (issue #3012). The starting phase gets a
+    # larger, separately-configurable window sized above a realistic slow
+    # first turn. Override via `tuning.agent.heartbeat_starting_timeout_s`.
+    heartbeat_starting_timeout_s: float = 300.0  # 5 min
+    # A log/git-tree mtime fresher than this window is a POSITIVE liveness
+    # signal: the agent is demonstrably alive regardless of heartbeat age, so
+    # the heartbeat-staleness incident is suppressed and no SIGTERM is sent
+    # (issue #3012). Mirrors agent_lifecycle._ORPHAN_LIVENESS_GRACE_S, which
+    # already defers the reap-cycle death judgment on the same signal.
+    liveness_grace_s: float = 90.0  # 1.5 min
     idle_log_age_threshold_s: float = 180.0  # 3 min
 
     # Escalation tiers (seconds of heartbeat silence)
