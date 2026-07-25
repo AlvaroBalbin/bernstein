@@ -302,3 +302,154 @@ class TestDamageStaysReportable:
         monkeypatch.setattr(audit_cmd, "AUDIT_DIR", audit_dir)
         AuditLog(audit_dir=audit_dir, key=KEY).log("seed", "test", "resource", "r-0", {})
         assert audit_cmd._verify_chain_tears() is True
+
+
+# ---------------------------------------------------------------------------
+# The repair and its evidence are one write
+# ---------------------------------------------------------------------------
+
+
+class _WriteInterceptor:
+    """A segment handle that records every write, and can fail or truncate one.
+
+    Selects by payload rather than by call order, so the same test exercises the
+    same *event* whether the seal emits it in one write or in two.
+    """
+
+    def __init__(
+        self,
+        inner: object,
+        *,
+        marker: bytes | None = None,
+        fail: bool = False,
+        partial: int | None = None,
+    ) -> None:
+        self._inner = inner
+        self._marker = marker
+        self._fail = fail
+        self._partial = partial
+        self.writes: list[bytes] = []
+
+    def __enter__(self) -> _WriteInterceptor:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._inner.__exit__(*exc)  # type: ignore[attr-defined]
+
+    def write(self, data: bytes | str) -> int:
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        self.writes.append(raw)
+        if self._marker is not None and self._marker not in raw:
+            return self._inner.write(data)  # type: ignore[attr-defined]
+        if self._fail:
+            raise OSError(28, "No space left on device")
+        if self._partial is None:
+            return self._inner.write(data)  # type: ignore[attr-defined]
+        return self._inner.write(data[: self._partial])  # type: ignore[attr-defined]
+
+
+def _intercept_appends(monkeypatch: pytest.MonkeyPatch, **kwargs: object) -> list[_WriteInterceptor]:
+    """Route every append to a live segment through an interceptor."""
+    taken: list[_WriteInterceptor] = []
+    real_open = Path.open
+
+    def _patched(self: Path, mode: str = "r", *args: object, **kw: object) -> object:
+        handle = real_open(self, mode, *args, **kw)  # type: ignore[arg-type]
+        if not mode.startswith("a") or self.suffix != ".jsonl":
+            return handle
+        interceptor = _WriteInterceptor(handle.__enter__(), **kwargs)  # type: ignore[arg-type]
+        taken.append(interceptor)
+        return interceptor
+
+    monkeypatch.setattr(Path, "open", _patched)
+    return taken
+
+
+class TestTheSealAndItsEvidenceAreOneWrite:
+    """A crash during the seal must not leave the damage unreported.
+
+    Writing the terminator first and the ``chain.torn_record`` second leaves a
+    state in which the segment is healed and nothing on the chain says it was
+    ever damaged: ``bernstein audit verify`` goes exit 1 -> exit 0 with no
+    operator action, and a monitoring job watching the exit code stops alerting
+    by itself. The state is reachable by a crash, a ``SIGKILL``, or a full
+    volume - and a full volume is one of the two classic causes of the tear.
+    """
+
+    def _torn(self, tmp_path: Path) -> tuple[Path, Path]:
+        audit_dir = tmp_path / "audit"
+        log = AuditLog(audit_dir=audit_dir, key=KEY)
+        for index in range(3):
+            log.log("probe.seed", "test", "resource", f"r{index}", {})
+        segment = _segment(audit_dir)
+        _tear_terminator_only(segment)
+        assert AuditLog(audit_dir=audit_dir, key=KEY).verify()[0] is False
+        return audit_dir, segment
+
+    def test_the_seal_emits_the_terminator_and_the_record_in_one_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        audit_dir, _ = self._torn(tmp_path)
+
+        taken = _intercept_appends(monkeypatch)
+        AuditLog(audit_dir=audit_dir, key=KEY).log("probe.after", "test", "resource", "r9", {})
+        monkeypatch.undo()
+
+        sealing = [w for handle in taken for w in handle.writes if EVENT_CHAIN_TORN_RECORD.encode() in w]
+        assert len(sealing) == 1, f"the evidence was written {len(sealing)} times"
+        assert sealing[0].startswith(b"\n"), "the terminator was not in the same write as the evidence"
+        assert sealing[0].endswith(b"\n")
+        # Nothing else was written to the segment before it: the repair does not
+        # exist as a separate, earlier write.
+        assert taken[0].writes[0] is sealing[0], "the repair was written before its evidence"
+
+    def test_a_seal_write_that_fails_leaves_the_damage_reportable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ENOSPC on the seal: the volume that caused the tear is still full."""
+        audit_dir, segment = self._torn(tmp_path)
+        before = segment.read_bytes()
+
+        _intercept_appends(monkeypatch, marker=EVENT_CHAIN_TORN_RECORD.encode(), fail=True)
+        with pytest.raises(OSError, match="No space left"):
+            AuditLog(audit_dir=audit_dir, key=KEY).log("probe.after", "test", "resource", "r9", {})
+        monkeypatch.undo()
+
+        assert segment.read_bytes() == before, "the segment changed despite the failed write"
+        ok, errors = AuditLog(audit_dir=audit_dir, key=KEY).verify()
+        assert ok is False, "a failed seal healed the segment"
+        assert any("newline" in err for err in errors)
+
+    def test_a_partial_seal_write_leaves_the_damage_reportable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A torn write of the combined buffer must not read as a healed segment.
+
+        The caller is refused rather than allowed to append onto the fragment
+        the short write left: fusing its record onto that fragment would produce
+        one unparseable line and swallow a real record.
+        """
+        audit_dir, segment = self._torn(tmp_path)
+
+        _intercept_appends(monkeypatch, marker=EVENT_CHAIN_TORN_RECORD.encode(), partial=12)
+        with pytest.raises(OSError, match="could not seal the torn tail"):
+            AuditLog(audit_dir=audit_dir, key=KEY).log("probe.after", "test", "resource", "r9", {})
+        monkeypatch.undo()
+
+        assert not segment.read_bytes().endswith(b"\n"), "a partial seal left a terminated segment"
+        assert AuditLog(audit_dir=audit_dir, key=KEY).verify()[0] is False
+
+        # And the next ordinary append seals and reports the fresh fragment,
+        # so the damage stays on the chain rather than being written away.
+        AuditLog(audit_dir=audit_dir, key=KEY).log("probe.later", "test", "resource", "r10", {})
+        tears = AuditChainStore(audit_dir, key=KEY).query(event_type=EVENT_CHAIN_TORN_RECORD)
+        assert tears, "no tear was recorded for the fragment the partial write left"
+
+    def test_the_evidence_lands_in_the_segment_it_describes(self, tmp_path: Path) -> None:
+        """The tear and its record are in the same file, whatever day it is now."""
+        audit_dir, segment = self._torn(tmp_path)
+        AuditLog(audit_dir=audit_dir, key=KEY).log("probe.after", "test", "resource", "r9", {})
+
+        recorded = [row for row in _records(segment) if row.get("event_type") == EVENT_CHAIN_TORN_RECORD]
+        assert len(recorded) == 1
+        assert recorded[0]["details"]["segment"] == segment.name

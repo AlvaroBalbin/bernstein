@@ -81,6 +81,11 @@ class TestTenantCli:
     def test_verify_fails_and_exits_non_zero_after_tampering(self, workdir: Path) -> None:
         assert _run(["create", "acme", "--principal", "alice"], workdir).exit_code == 0
         assert _run(["grant", "acme", "--principal", "bob", "--by", "alice"], workdir).exit_code == 0
+        # A third event so the one edited below has a successor: ``broken_link``
+        # is the detector for an event whose recomputed hash no longer matches
+        # what the next event points at, so the segment must have a next event.
+        # Tampering with the tail is caught by the HMAC chain instead.
+        assert _run(["grant", "acme", "--principal", "carol", "--by", "alice"], workdir).exit_code == 0
 
         log_path = next(iter(sorted((workdir / ".sdd" / "audit").glob("*.jsonl"))))
         patched: list[str] = []
@@ -306,12 +311,13 @@ class TestCharterSurvivesRetentionThroughTheCli:
 
 class TestVerifyReportsDamageInsteadOfCrashing:
     def _corrupt_budget(self, workdir: Path) -> None:
+        """Rewrite whichever recorded event carries the budget into an unusable one."""
         log_path = next(iter(sorted((workdir / ".sdd" / "audit").glob("*.jsonl"))))
         patched: list[str] = []
         for line in log_path.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
             body = (row.get("details") or {}).get("charter") or {}
-            if row.get("event_type") == EVENT_TENANT_CHARTER and body.get("kind") == "charter.budget_set":
+            if row.get("event_type") == EVENT_TENANT_CHARTER and "budget_usd" in (body.get("body") or {}):
                 body["body"]["budget_usd"] = "1e9"
             patched.append(json.dumps(row))
         log_path.write_text("\n".join(patched) + "\n", encoding="utf-8")
@@ -336,3 +342,107 @@ class TestVerifyReportsDamageInsteadOfCrashing:
         assert result.exit_code != 0
         # A ClickException, not a traceback the operator has to interpret.
         assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+
+
+class TestOpeningACharterIsOneAppend:
+    """An interrupted ``create`` must leave nothing, not half a charter.
+
+    The chain transaction is exclusion, not atomicity: a batch stopped midway
+    commits the prefix already written, and an append-only log has no rollback.
+    Opening as a batch (open, then member_add, then optionally budget_set) put a
+    reachable state on the chain in which a Ctrl-C left an opened charter with
+    nobody in it - folded as healthy by ``tenant verify``, ``tenant show`` and
+    the ``audit verify`` charter pillar, and impossible to complete because the
+    tenant id was taken.
+
+    The opening now carries its whole meaning in one event, so there is no
+    prefix to commit.
+    """
+
+    def _charter_records(self, workdir: Path) -> list[dict]:
+        out: list[dict] = []
+        for segment in sorted((workdir / ".sdd" / "audit").glob("*.jsonl")):
+            for line in segment.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("event_type") == EVENT_TENANT_CHARTER:
+                    out.append(row)
+        return out
+
+    def test_create_appends_exactly_one_charter_record(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice", "--role", "owner"], workdir).exit_code == 0
+        assert len(self._charter_records(workdir)) == 1
+
+    def test_create_with_a_budget_still_appends_exactly_one(self, workdir: Path) -> None:
+        created = _run(["create", "acme", "--principal", "alice", "--budget-usd", "250.000000000", "--json"], workdir)
+        assert created.exit_code == 0, created.output
+        assert len(self._charter_records(workdir)) == 1
+        state = json.loads(created.output)["state"]
+        assert state["budget_usd"] == "250.000000000"
+        assert state["members"] == [{"principal": "alice", "role": "owner"}]
+
+    @pytest.mark.parametrize("interrupt_at", [1, 2, 3])
+    def test_an_interrupted_create_never_leaves_a_charter_without_its_owner(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch, interrupt_at: int
+    ) -> None:
+        """Ctrl-C at any append of the create: nothing, or a complete charter.
+
+        ``KeyboardInterrupt`` from inside the Nth charter append is where an
+        operator's Ctrl-C lands. Whatever survives must be diagnosable: an
+        opened charter with nobody in it folds as healthy for every verifier,
+        cannot be completed because the tenant id is taken, and cannot be undone
+        because the log is append-only.
+        """
+        from bernstein.core.security.audit import AuditLog
+
+        real_log = AuditLog.log
+        seen = {"n": 0}
+
+        def _interrupted(self: AuditLog, event_type: str, *args: object, **kwargs: object) -> object:
+            if event_type == EVENT_TENANT_CHARTER:
+                seen["n"] += 1
+                if seen["n"] == interrupt_at:
+                    raise KeyboardInterrupt
+            return real_log(self, event_type, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(AuditLog, "log", _interrupted)
+        _run(["create", "acme", "--principal", "alice", "--budget-usd", "250.000000000"], workdir)
+        monkeypatch.undo()
+
+        records = self._charter_records(workdir)
+        if not records:
+            # Nothing committed: the tenant id is still free, so a retry works.
+            retried = _run(["create", "acme", "--principal", "alice", "--json"], workdir)
+            assert retried.exit_code == 0, retried.output
+            assert json.loads(retried.output)["state"]["members"] == [{"principal": "alice", "role": "owner"}]
+            return
+
+        shown = _run(["show", "acme", "--json"], workdir)
+        assert shown.exit_code == 0, shown.output
+        assert json.loads(shown.output)["state"]["members"], (
+            f"an interrupt at append {interrupt_at} left an opened charter with no members; "
+            "every verifier folds that as healthy and no operator can complete or undo it"
+        )
+
+    def test_a_charter_opened_without_a_member_is_still_readable(self, workdir: Path) -> None:
+        """The API can still open an empty charter and enrol afterwards.
+
+        The CLI no longer produces one, but the fold must not start refusing a
+        shape it accepted, or an existing recorded charter would stop reading.
+        """
+        from bernstein.core.security.audit import load_or_create_audit_key
+        from bernstein.core.security.audit_chain import AuditChainStore
+        from bernstein.core.security.tenant_charter import (
+            CHARTER_OPEN,
+            next_event,
+            record_charter_event,
+        )
+
+        chain = AuditChainStore(workdir / ".sdd" / "audit", key=load_or_create_audit_key())
+        record_charter_event(chain, next_event(None, tenant_id="legacy", kind=CHARTER_OPEN, principal="ops"))
+
+        shown = _run(["show", "legacy", "--json"], workdir)
+        assert shown.exit_code == 0, shown.output
+        assert json.loads(shown.output)["state"]["members"] == []
+        assert _run(["grant", "legacy", "--principal", "alice", "--by", "ops"], workdir).exit_code == 0

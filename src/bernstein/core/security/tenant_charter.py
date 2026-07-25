@@ -62,7 +62,7 @@ from bernstein.core.identity.delegation_scope import DecisionBinding
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
-    from bernstein.core.security.audit import AuditEvent
+    from bernstein.core.security.audit import AuditEvent, ChainSegments
     from bernstein.core.security.audit_chain import AuditChainStore
 
 __all__ = [
@@ -87,6 +87,7 @@ __all__ = [
     "load_charter",
     "load_charter_segment",
     "next_event",
+    "open_event",
     "read_charter_events",
     "record_charter_event",
     "verify_charter",
@@ -476,6 +477,81 @@ def _apply(
     )
 
 
+def _apply_opening_body(
+    state: CharterState,
+    event: CharterEvent,
+    members: dict[str, str],
+) -> CharterState:
+    """Apply the opening event's own body: the first member, and the budget.
+
+    Kept separate from :func:`_apply`, which refuses ``charter.open`` outright
+    so a second opening event can never be folded as an ordinary one.
+    """
+    principal = event.body.get("principal")
+    if principal is not None:
+        members[_require_id(str(principal), what="member principal")] = _require_id(
+            str(event.body.get("role", "owner")), what="member role"
+        )
+
+    raw_budget = event.body.get("budget_usd")
+    budget = None if raw_budget is None else nano_usd_from_decimal_str(str(raw_budget))
+    if budget is not None and budget < 0:
+        raise CharterChainError("bad_budget", f"budget must be non-negative at seq {event.seq}", seq=event.seq)
+
+    return CharterState(
+        tenant_id=state.tenant_id,
+        version=state.version,
+        members=tuple(sorted(members.items())),
+        quota_max_concurrent=state.quota_max_concurrent,
+        budget_nano_usd=budget,
+        closed=state.closed,
+        head_event_hash=state.head_event_hash,
+    )
+
+
+def open_event(
+    *,
+    tenant_id: str,
+    principal: str,
+    role: str = "owner",
+    budget_usd: str | None = None,
+    recorded_at: str | None = None,
+) -> CharterEvent:
+    """Mint the single event that opens a charter with its first member.
+
+    One event, therefore one chain append, therefore one ``write``. Opening a
+    charter as a *batch* - open, then member_add, then optionally budget_set -
+    put a reachable partial state on the chain: the transaction around the batch
+    is exclusion, not atomicity, so a Ctrl-C between two appends committed the
+    prefix already written. What that left was an opened charter with nobody in
+    it, which every verifier folded as healthy, which nothing could complete
+    because the tenant id was taken, and which an append-only log cannot undo.
+    Carrying the opening's whole meaning in one record removes the prefix rather
+    than diagnosing it.
+
+    Args:
+        tenant_id: The tenant to open.
+        principal: The first member, enrolled by this same event.
+        role: That member's role.
+        budget_usd: Optional budget envelope, as a decimal string.
+        recorded_at: Optional explicit instant (defaults to now).
+
+    Returns:
+        The opening event, pointing at the genesis sentinel at ``seq`` 0.
+    """
+    body: dict[str, Any] = {"principal": principal, "role": role}
+    if budget_usd is not None:
+        body["budget_usd"] = budget_usd
+    return next_event(
+        None,
+        tenant_id=tenant_id,
+        kind=CHARTER_OPEN,
+        principal=principal,
+        body=body,
+        recorded_at=recorded_at,
+    )
+
+
 def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
     """Fold a charter event segment into its state, or refuse.
 
@@ -493,6 +569,11 @@ def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
       rewritten budget, quota, principal, or role). Reported as a chain error
       naming the event rather than raised as a bare value error, so a verifier
       never crashes on the tampering it exists to detect.
+
+    The opening event may carry the charter's first member and its budget in
+    its own body (``principal`` / ``role`` / ``budget_usd``), which is what lets
+    a charter be opened by a single append; see :func:`open_event`. An opening
+    event without them opens an empty charter, as before.
 
     Raises:
         CharterChainError: on any of the above, and only that.
@@ -519,6 +600,8 @@ def fold_charter(events: Sequence[CharterEvent]) -> CharterState:
     members: dict[str, str] = {}
     with _as_chain_error(first.seq, f"opening event of {tenant_id!r} cannot be hashed"):
         state = CharterState(tenant_id=tenant_id, version=1, head_event_hash=first.event_hash())
+    with _as_chain_error(first.seq, f"opening event of {tenant_id!r} has an unusable body"):
+        state = _apply_opening_body(state, first, members)
     previous = first
 
     for event in events[1:]:
@@ -616,16 +699,28 @@ def verify_charter_events(events: Sequence[CharterEvent], *, tenant_id: str = ""
     return CharterVerification(ok=True, tenant_id=state.tenant_id, state=state)
 
 
-def verify_charter(chain: AuditChainStore, tenant_id: str) -> CharterVerification:
+def verify_charter(
+    chain: AuditChainStore,
+    tenant_id: str,
+    *,
+    segments: ChainSegments | None = None,
+) -> CharterVerification:
     """Read *tenant_id*'s charter from the chain and fold it, reporting either way.
 
     Reading is inside the guarded path deliberately: rebuilding a
     :class:`CharterEvent` from a tampered body is itself a place that can fail,
     so a caller that read first and folded inside a ``try`` would still crash on
     exactly the input this is meant to diagnose.
+
+    Args:
+        chain: The store to read from.
+        tenant_id: The tenant to verify.
+        segments: Read a snapshot already pinned by
+            :meth:`AuditChainStore.pin_segments` (see
+            :func:`read_charter_events`).
     """
     try:
-        events = read_charter_events(chain, tenant_id)
+        events = read_charter_events(chain, tenant_id, segments=segments)
     except CharterChainError as exc:
         return CharterVerification(ok=False, tenant_id=tenant_id, reason=exc.reason, detail=str(exc), seq=exc.seq)
     return _verdict_for(events, tenant_id)
@@ -743,7 +838,12 @@ def record_charter_event(chain: AuditChainStore, event: CharterEvent) -> str:
     return event.event_hash()
 
 
-def read_charter_events(chain: AuditChainStore, tenant_id: str) -> list[CharterEvent]:
+def read_charter_events(
+    chain: AuditChainStore,
+    tenant_id: str,
+    *,
+    segments: ChainSegments | None = None,
+) -> list[CharterEvent]:
     """Read one tenant's charter events back from the chain, in chain order.
 
     ``include_archived=True`` is not an optimisation knob here, it is a
@@ -766,11 +866,29 @@ def read_charter_events(chain: AuditChainStore, tenant_id: str) -> list[CharterE
     and the append must be inside *one* transaction, so such callers wrap both
     in :meth:`AuditChainStore.transaction` and this nests within it.
 
+    Args:
+        chain: The store to read from.
+        tenant_id: The tenant whose charter to read.
+        segments: A snapshot already pinned by
+            :meth:`AuditChainStore.pin_segments`. Reading against it skips the
+            transaction, because the pin is what excludes the archive window,
+            and it is what a read-only caller uses: pinning can degrade to an
+            unlocked listing on a directory that will not grant the lock, while
+            this transaction cannot.
+
     Raises:
         CharterChainError: if a recorded event body cannot be rebuilt.
     """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
+    if segments is not None:
+        entries = chain.query(
+            event_type=EVENT_TENANT_CHARTER,
+            resource_id=tenant_id,
+            include_archived=True,
+            segments=segments,
+        )
+        return charter_events_from_entries(entries, tenant_id)
     with chain.transaction():
         entries = chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True)
     return charter_events_from_entries(entries, tenant_id)
@@ -808,14 +926,26 @@ def charter_events_from_entries(entries: Sequence[AuditEvent], tenant_id: str) -
     return out
 
 
-def load_charter(chain: AuditChainStore, tenant_id: str) -> CharterState:
+def load_charter(
+    chain: AuditChainStore,
+    tenant_id: str,
+    *,
+    segments: ChainSegments | None = None,
+) -> CharterState:
     """Read and fold one tenant's charter from the chain.
+
+    Args:
+        chain: The store to read from.
+        tenant_id: The tenant whose charter to load.
+        segments: Read a snapshot already pinned by
+            :meth:`AuditChainStore.pin_segments` (see
+            :func:`read_charter_events`).
 
     Raises:
         CharterChainError: if no charter exists for *tenant_id*, or its event
             segment does not fold.
     """
-    events = read_charter_events(chain, tenant_id)
+    events = read_charter_events(chain, tenant_id, segments=segments)
     if not events:
         raise CharterChainError("no_charter", f"no charter events recorded for tenant {tenant_id!r}")
     return fold_charter(events)

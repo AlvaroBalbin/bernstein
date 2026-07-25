@@ -62,12 +62,9 @@ def tenant_group() -> None:
 def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None, workdir: Path, as_json: bool) -> None:
     """Open a charter for TENANT_ID and enrol its first principal."""
     from bernstein.core.security.tenant_charter import (
-        CHARTER_BUDGET_SET,
-        CHARTER_MEMBER_ADD,
-        CHARTER_OPEN,
         CharterChainError,
         fold_charter,
-        next_event,
+        open_event,
         read_charter_events,
         record_charter_event,
     )
@@ -78,13 +75,18 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
     # existing tenant once retention archived the opening day - an ownership
     # takeover requiring no forgery, just patience.
     #
-    # The read, the decision, and every append of the batch run inside ONE
-    # transaction. Reading first and locking only for the appends is the same
-    # defect with extra latency: the decision was already taken from a snapshot
-    # the other writer has since invalidated, and two processes each conclude
-    # "no charter exists". Both appends are individually valid, so the HMAC
-    # chain still verifies while the fold reports a duplicate seq - permanently,
-    # because the log is append-only.
+    # The read, the decision, and the append run inside ONE transaction.
+    # Reading first and locking only for the append is the same defect with
+    # extra latency: the decision was already taken from a snapshot the other
+    # writer has since invalidated, and two processes each conclude "no charter
+    # exists". Both appends are individually valid, so the HMAC chain still
+    # verifies while the fold reports a duplicate seq - permanently, because the
+    # log is append-only.
+    #
+    # The opening is exactly one event, so the transaction wraps a single
+    # append. That is deliberate: the transaction is exclusion, not atomicity,
+    # so a batch interrupted midway commits the prefix already written. See
+    # ``open_event``.
     with chain.transaction():
         try:
             existing = read_charter_events(chain, tenant_id)
@@ -97,32 +99,12 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
             raise click.ClickException(f"a charter already exists for tenant {tenant_id!r}")
 
         try:
-            events = [next_event(None, tenant_id=tenant_id, kind=CHARTER_OPEN, principal=principal)]
-            events.append(
-                next_event(
-                    events[-1],
-                    tenant_id=tenant_id,
-                    kind=CHARTER_MEMBER_ADD,
-                    principal=principal,
-                    body={"principal": principal, "role": role},
-                )
-            )
-            if budget_usd is not None:
-                events.append(
-                    next_event(
-                        events[-1],
-                        tenant_id=tenant_id,
-                        kind=CHARTER_BUDGET_SET,
-                        principal=principal,
-                        body={"budget_usd": budget_usd},
-                    )
-                )
-            state = fold_charter(events)
+            event = open_event(tenant_id=tenant_id, principal=principal, role=role, budget_usd=budget_usd)
+            state = fold_charter([event])
         except CharterChainError as exc:
             raise click.ClickException(str(exc)) from exc
 
-        for event in events:
-            record_charter_event(chain, event)
+        record_charter_event(chain, event)
 
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
@@ -246,8 +228,14 @@ def show_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
     """Fold and print TENANT_ID's charter state."""
     from bernstein.core.security.tenant_charter import CharterChainError, load_charter
 
+    chain = _chain(workdir)
+    # Read-only, so it pins the segment set rather than holding the chain lock
+    # across the read, and tolerates a directory that will not grant the lock at
+    # all - a read-only incident snapshot is exactly where an operator asks what
+    # a charter says.
+    segments = chain.pin_segments(best_effort=True)
     try:
-        state = load_charter(_chain(workdir), tenant_id)
+        state = load_charter(chain, tenant_id, segments=segments)
     except CharterChainError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -286,14 +274,21 @@ def verify_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
     from bernstein.core.security.tenant_charter import verify_charter
 
     chain = _chain(workdir)
-    # Both reads under one transaction. Retention alone can make a charter read
-    # as a duplicated or missing day for the width of an archive operation, and
-    # an operator cannot tell such a transient FAIL from a real one - so the
-    # verifier must not be able to observe that window at all. It also pins the
-    # fold verdict and the HMAC verdict to the same snapshot.
-    with chain.transaction():
-        result = verify_charter(chain, tenant_id)
-        chain_ok, chain_errors = chain.verify()
+    # Both reads against one pinned segment set. Retention alone can make a
+    # charter read as a duplicated or missing day for the width of an archive
+    # operation, and an operator cannot tell such a transient FAIL from a real
+    # one - so the verifier must not be able to observe that window at all. The
+    # pin closes that window and pins the fold verdict and the HMAC verdict to
+    # the same snapshot.
+    #
+    # What the pin deliberately does *not* do is hold the chain lock across
+    # ``chain.verify()``. That recomputation is O(history) - measured at roughly
+    # 30 seconds of exclusive hold per gigabyte of chain - and every other
+    # writer fails rather than waits past 30s, so a scheduled verify would take
+    # ordinary appends down with it.
+    segments = chain.pin_segments(best_effort=True)
+    result = verify_charter(chain, tenant_id, segments=segments)
+    chain_ok, chain_errors = chain.verify(segments)
 
     payload = result.to_dict()
     payload["audit_chain_ok"] = chain_ok

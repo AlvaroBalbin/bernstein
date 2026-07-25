@@ -433,12 +433,57 @@ what an operator needs to know about it:
   the lock alive through the duplicated descriptor. the same `lsof`
   will show it.
 
-expensive work is deliberately kept out of the locked section. the
-charter pillar of `audit verify` reads the chain once under the lock
-and folds every tenant afterwards; retention compresses outside it.
+expensive work is deliberately kept out of the locked section.
 anything whose cost grows with history size must not hold this lock,
 or an unrelated `bernstein tenant create` running alongside a
-scheduled verify fails outright with nothing created.
+scheduled verify fails outright with nothing created. measured, a
+walk held under the lock costs roughly **30 seconds of exclusive hold
+per gigabyte of chain**, against that same 30 second budget.
+
+so every reader whose own cost is O(history) - `audit verify`'s
+charter and tear pillars, `tenant verify`, `tenant show`, and the
+verify-then-project path used by `skills package verify` - takes the
+lock only long enough to **pin the segment set**: a directory listing
+plus one `stat` per segment. it then reads the pinned segments, up to
+their pinned lengths, with no lock held. that is the same snapshot the
+lock used to provide, for two reasons:
+
+- the log is append-only, so an append can only extend a live segment
+  past the length that was pinned, and readers stop at that length;
+- retention's publish step - the `.gz` landing and the `.jsonl` being
+  unlinked - runs inside the transaction, so it cannot straddle the
+  pin. a segment archived *after* the pin is still read at its pinned
+  length, out of the archived copy.
+
+retention compresses outside the lock and takes it only for the two
+renames that publish the result.
+
+### verification on a read-only copy
+
+taking the lock needs a *writable* descriptor on the sentinel, because
+an exclusive OS lock cannot be taken on a read-only one. reads
+therefore pin **best effort**: on an audit directory that refuses a
+writable descriptor - a read-only incident snapshot, a mounted
+archive, a sentinel owned by the writing account - the pin proceeds
+without the lock and the command prints
+
+```
+note: the audit directory did not grant the chain lock (read-only copy),
+so these reads are not isolated from a concurrent archive.
+```
+
+`bernstein audit verify` exits on the state of the chain either way,
+so the recovery procedure below still works against a read-only
+snapshot.
+
+anything that **appends** still requires the lock. an audit directory
+that will not grant it fails the command by name rather than with a
+permission traceback:
+
+```
+Error: cannot take the audit chain transaction on .sdd/audit: its lock
+sentinel .sdd/audit/.chain.lock is not writable (Permission denied). ...
+```
 
 ## Shipping to a SIEM
 
@@ -535,7 +580,17 @@ pillar goes from FAILED back to Passed. a cron job watching the exit
 code would stop alerting on its own, with nobody having looked.
 
 the `chain.torn_record` event is therefore its own durable fact, and
-`bernstein audit verify` keeps failing on it until an operator
+the repair and that fact are **one write**: the terminator and the
+event are emitted in a single `write()` into the same segment. there
+is no instant at which the segment is healed and nothing records that
+it was damaged - which matters because a full volume is one of the two
+classic causes of a tear, so the crash that erases the evidence tends
+to arrive with the tear itself. a write that lands only partly leaves
+a fresh unterminated fragment, which the next append seals and reports
+in turn; the appending command is refused rather than allowed to
+concatenate onto that fragment.
+
+`bernstein audit verify` keeps failing on the tear until an operator
 acknowledges it:
 
 ```

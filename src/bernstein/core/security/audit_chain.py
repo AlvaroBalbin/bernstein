@@ -42,6 +42,7 @@ from bernstein.core.security.audit import (
     ChainLockUnavailable,
     ChainScanCursor,
     ChainScanResult,
+    ChainSegments,
     chain_transaction,
 )
 
@@ -962,8 +963,21 @@ class AuditChainStore:
         Wrap read + decide + append in one of these whenever the append depends
         on what the read returned. Nesting is safe: every append inside takes
         the same transaction and re-enters it.
+
+        A read whose own cost grows with history size does not belong in one of
+        these: use :meth:`pin_segments` instead, which pins the same snapshot in
+        a section bounded by the number of segments rather than by their size.
         """
         return chain_transaction(self._audit_dir, timeout=timeout)
+
+    def pin_segments(self, *, best_effort: bool = False, timeout: float | None = None) -> ChainSegments:
+        """Pin the chain's segment set for reads that must agree on one history.
+
+        Delegates to :meth:`AuditLog.pin_segments`. Pass the result to
+        :meth:`verify` and :meth:`query` to have them describe the same
+        snapshot without either holding the chain lock across its own walk.
+        """
+        return self._log.pin_segments(best_effort=best_effort, timeout=timeout)
 
     @property
     def prev_chain_digest(self) -> str:
@@ -1045,6 +1059,7 @@ class AuditChainStore:
         until: str | None = None,
         resource_id: str | None = None,
         include_archived: bool = False,
+        segments: ChainSegments | None = None,
     ) -> list[AuditEvent]:
         """Delegate to the underlying :class:`AuditLog`.
 
@@ -1055,6 +1070,10 @@ class AuditChainStore:
         ``include_archived`` also replays archived ``*.jsonl.gz`` segments, so
         a caller reasoning about linkage across the retention boundary sees
         the same events :meth:`verify` does.
+
+        ``segments`` reads a snapshot pinned by :meth:`pin_segments` rather than
+        the directory as it stands, so several reads can describe one history
+        without any of them holding the chain lock while they run.
         """
         return self._log.query(
             event_type=event_type,
@@ -1063,6 +1082,7 @@ class AuditChainStore:
             until=until,
             resource_id=resource_id,
             include_archived=include_archived,
+            segments=segments,
         )
 
     def scan_verified(
@@ -1079,9 +1099,9 @@ class AuditChainStore:
         """
         return self._log.scan_verified(cursor, event_type=event_type)
 
-    def verify(self) -> tuple[bool, list[str]]:
+    def verify(self, segments: ChainSegments | None = None) -> tuple[bool, list[str]]:
         """Delegate to the underlying :class:`AuditLog`."""
-        return self._log.verify()
+        return self._log.verify(segments)
 
     def verify_and_query(
         self,
@@ -1098,27 +1118,35 @@ class AuditChainStore:
         :meth:`verify` and :meth:`query` are otherwise two independent reads: a
         concurrent append landing between them lets a caller act on a
         projection the verification never covered (a verify/query TOCTOU).
-        Holding :class:`chain_transaction` across both reads pins a single
-        snapshot -- the events returned are exactly the events that were
-        verified -- because every append takes the same transaction before
-        touching the log. The guarantee is now cross-process: previously an
-        append from a *second* process could still land between the two reads.
+        Both reads run against one pinned segment set, so the events returned
+        are exactly the events that were verified, cross-process.
+
+        The pin - not the walk - is the guarded section. Holding
+        :class:`chain_transaction` across the HMAC recomputation instead put
+        every writer in the deployment behind a hold proportional to history
+        size: measured at roughly 30 seconds of exclusive hold per gigabyte of
+        chain, against the 30s budget past which other callers fail outright
+        rather than wait. A ``bernstein tenant create`` alongside a scheduled
+        read exited non-zero with nothing created. Verification is a pure
+        recomputation over bytes that are already pinned, so it needs no
+        exclusion of its own.
 
         Returns:
             ``(ok, errors, events)``: the verification verdict and its per-entry
-            errors alongside the events matching the filters, all read under
-            one lock.
+            errors alongside the events matching the filters, both read from one
+            pinned snapshot.
         """
-        with chain_transaction(self._audit_dir):
-            ok, errors = self._log.verify()
-            events = self._log.query(
-                event_type=event_type,
-                actor=actor,
-                since=since,
-                until=until,
-                resource_id=resource_id,
-                include_archived=include_archived,
-            )
+        segments = self._log.pin_segments()
+        ok, errors = self._log.verify(segments)
+        events = self._log.query(
+            event_type=event_type,
+            actor=actor,
+            since=since,
+            until=until,
+            resource_id=resource_id,
+            include_archived=include_archived,
+            segments=segments,
+        )
         return ok, errors, events
 
 

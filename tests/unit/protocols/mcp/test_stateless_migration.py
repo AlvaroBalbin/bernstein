@@ -573,70 +573,84 @@ class TestChainReconstruction:
         assert [e.details["call_index"] for e in events] == [0, 1, 2]
         assert events == chain.query(event_type=EVENT_MCP_STATELESS_CALL)
 
-    def test_verify_and_query_holds_the_chain_transaction(self, tmp_path: Path) -> None:
-        """AC6: an append cannot interleave between the verify and the query.
+    def test_verify_and_query_is_one_snapshot_an_append_cannot_enter(self, tmp_path: Path) -> None:
+        """AC6: an append landing mid-operation is outside both reads, not between them.
 
-        The operation holds the chain transaction across both reads. That
-        guarantee is now cross-process rather than per-store: the probe below
-        opens a *fresh* descriptor on the lock file, which is exactly what a
-        second process's descriptor is - ``flock`` state belongs to the open
-        file description, not to the process - so a failed acquisition on it
-        proves a second process would block too.
+        The snapshot is what the guarantee rests on, not the duration of a lock.
+        The append below is a genuine second writer - its own ``AuditLog``, its
+        own descriptor - landing after the verify has begun. It must be invisible
+        to *both* reads: seen by neither, the verdict and the projection still
+        describe one history.
+        """
+        from bernstein.core.security.audit import AuditLog
+
+        audit_dir = tmp_path / "audit"
+        chain = self._seed(tmp_path)
+        real_verify = chain._log.verify
+        intruder_id = "run-intruder"
+
+        def _spy_verify(segments: object = None) -> tuple[bool, list[str]]:
+            AuditLog(audit_dir, key=b"k" * 32).log(
+                event_type=EVENT_MCP_STATELESS_CALL,
+                actor="second-writer",
+                resource_type="run",
+                resource_id=intruder_id,
+                details={"call_index": 99},
+            )
+            return real_verify(segments)  # type: ignore[arg-type]
+
+        chain._log.verify = _spy_verify  # type: ignore[method-assign]
+        ok, errors, events = chain.verify_and_query(event_type=EVENT_MCP_STATELESS_CALL)
+
+        assert ok, errors
+        assert intruder_id not in {e.resource_id for e in events}
+        assert [e.details["call_index"] for e in events] == [0, 1, 2]
+        # And the record is genuinely on the chain: it was excluded by the
+        # snapshot, not lost.
+        chain._log.verify = real_verify  # type: ignore[method-assign]
+        assert intruder_id in {e.resource_id for e in chain.query(event_type=EVENT_MCP_STATELESS_CALL)}
+
+    def test_verify_and_query_does_not_hold_the_chain_lock_across_the_walk(self, tmp_path: Path) -> None:
+        """AC6: the exclusive section is the segment pin, not the HMAC walk.
+
+        Holding the transaction across ``verify()`` put every writer in the
+        deployment behind a hold proportional to history size - measured at
+        roughly 30 seconds per gigabyte of chain, against the 30s budget past
+        which callers fail rather than wait. The probe opens a *fresh*
+        descriptor on the lock file, which is exactly what a second process's
+        descriptor is: ``flock`` state belongs to the open file description, not
+        to the process, so an acquisition that succeeds on it proves a second
+        process could append.
         """
         import os
-        import threading
 
         from bernstein.core.persistence.file_locks import os_try_lock_fd, os_unlock_fd
-        from bernstein.core.security.audit import (
-            _CHAIN_LOCK_NAME,
-            ChainLockUnavailable,
-            chain_transaction,
-        )
+        from bernstein.core.security.audit import _CHAIN_LOCK_NAME
 
         audit_dir = tmp_path / "audit"
         chain = self._seed(tmp_path)
         observed: dict[str, bool] = {}
         real_verify = chain._log.verify
 
-        def _probe_os_lock_is_held() -> bool:
-            """True when a fresh descriptor cannot take the OS lock."""
+        def _os_lock_is_free() -> bool:
             fd = os.open(str(audit_dir / _CHAIN_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 if os_try_lock_fd(fd):
                     os_unlock_fd(fd)
-                    return False
-                return True
+                    return True
+                return False
             finally:
                 os.close(fd)
 
-        def _probe_foreign_thread_blocked() -> bool:
-            """True when another thread cannot enter the transaction."""
-            blocked: list[bool] = []
-
-            def _attempt() -> None:
-                try:
-                    with chain_transaction(audit_dir, timeout=0):
-                        blocked.append(False)
-                except ChainLockUnavailable:
-                    blocked.append(True)
-
-            thread = threading.Thread(target=_attempt)
-            thread.start()
-            thread.join(timeout=30)
-            return bool(blocked and blocked[0])
-
-        def _spy_verify() -> tuple[bool, list[str]]:
-            observed["os_lock_held_during_verify"] = _probe_os_lock_is_held()
-            observed["foreign_thread_blocked_during_verify"] = _probe_foreign_thread_blocked()
-            return real_verify()
+        def _spy_verify(segments: object = None) -> tuple[bool, list[str]]:
+            observed["lock_free_during_verify"] = _os_lock_is_free()
+            return real_verify(segments)  # type: ignore[arg-type]
 
         chain._log.verify = _spy_verify  # type: ignore[method-assign]
         ok, _, _ = chain.verify_and_query(event_type=EVENT_MCP_STATELESS_CALL)
         assert ok
-        assert observed["os_lock_held_during_verify"] is True
-        assert observed["foreign_thread_blocked_during_verify"] is True
-        # Released once the operation returns, so the next caller is not wedged.
-        assert _probe_os_lock_is_held() is False
+        assert observed["lock_free_during_verify"] is True
+        assert _os_lock_is_free() is True
 
 
 # ---------------------------------------------------------------------------

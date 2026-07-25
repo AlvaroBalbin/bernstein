@@ -1,4 +1,4 @@
-"""How long the charter pillar and retention may hold the chain lock.
+"""How long the chain's readers and retention may hold the chain lock.
 
 The chain transaction is exclusive across processes and has a fixed budget
 (:data:`CHAIN_LOCK_TIMEOUT_S`, 30s) that every other caller fails against rather
@@ -7,15 +7,21 @@ denies unrelated writers: a scheduled ``bernstein audit verify`` in flight, and
 an ordinary ``bernstein tenant create`` alongside it exits non-zero with nothing
 created.
 
-Two holders had that shape:
+Holders that had that shape:
 
 * the charter pillar re-read the whole chain once per charter *inside* one
   transaction, so the hold was O(charters x history);
 * ``AuditLog.archive`` gzipped every expired segment inside the transaction, so
-  the hold was O(bytes in the retention window).
+  the hold was O(bytes in the retention window);
+* ``AuditChainStore.verify_and_query``, ``bernstein tenant verify`` and the two
+  new ``audit verify`` pillars held the transaction across a full-history walk,
+  measured at roughly 30 seconds of exclusive hold per gigabyte of chain.
 
-Both are now snapshot-then-work: the exclusive section covers the read (or the
-two renames), and the expensive part runs outside it.
+All of them are now snapshot-then-work: the exclusive section covers the
+segment pin (or the two renames), and the expensive part runs outside it.
+
+Every hold test is paired with a verdict test, because the cheap way to pass a
+hold budget is to stop doing the work.
 
 **Budget shape.** The assertions are calibrated against the cost of the one
 chain read the work genuinely needs, measured on the same machine in the same
@@ -78,6 +84,23 @@ ARCHIVE_HOLD_FRACTION = 0.12
 #: Floor for the archive budget, so probe granularity and scheduler noise on a
 #: fast machine cannot fail the test on their own.
 ARCHIVE_HOLD_FLOOR_S = 0.08
+
+#: Filler events for the reader-hold tests. Large enough that one full-history
+#: walk costs several hundred milliseconds, which is what separates "held the
+#: lock across the walk" from probe granularity.
+READER_FILLER_EVENTS = 25000
+
+#: What fraction of a reader's own wall time the exclusive lock may cover. The
+#: honest locked work is a directory listing plus one ``stat`` per segment, so
+#: the measured fraction is near zero; holding the lock across the walk puts it
+#: at ~100%. Calibrated as a fraction rather than against one chain read,
+#: because the read these callers make is a filtered query - far cheaper than
+#: the HMAC walk that was being held.
+READER_HOLD_FRACTION = 0.35
+
+#: Floor for the reader budgets, so probe granularity and scheduler noise on a
+#: fast machine cannot fail the test on their own.
+READER_HOLD_FLOOR_S = 0.08
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +167,38 @@ def _seed(audit_dir: Path, *, tenants: int, filler: int) -> None:
         record_charter_event(chain, added)
         for pad in range(filler // max(tenants, 1)):
             log.log("filler", "test", "resource", f"{tenant_id}-{pad}", {})
+
+
+def _os_lock_is_free(audit_dir: Path) -> bool:
+    """Whether a *foreign* descriptor can take the chain lock right now.
+
+    ``flock`` state belongs to the open file description, not to the process, so
+    a fresh descriptor is refused by exactly the same check a second process is.
+    """
+    from bernstein.core.persistence.file_locks import os_try_lock_fd, os_unlock_fd
+    from bernstein.core.security.audit import _CHAIN_LOCK_NAME
+
+    fd = os.open(str(audit_dir / _CHAIN_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os_try_lock_fd(fd):
+            os_unlock_fd(fd)
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+
+def _spy_on_queries(monkeypatch: pytest.MonkeyPatch, audit_dir: Path) -> list[bool]:
+    """Record, per ``AuditChainStore.query`` call, whether the chain lock was free."""
+    observed: list[bool] = []
+    real_query = AuditChainStore.query
+
+    def _query(self: AuditChainStore, **kwargs: object) -> object:
+        observed.append(_os_lock_is_free(audit_dir))
+        return real_query(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(AuditChainStore, "query", _query)
+    return observed
 
 
 def _one_snapshot_read_s(audit_dir: Path) -> float:
@@ -281,3 +336,136 @@ class TestArchiveHold:
         assert stale.exists(), "a segment that grew under the compress was unlinked anyway"
         assert not (audit_dir / "archive" / "2020-01-01.jsonl.gz").exists()
         assert not list((audit_dir / "archive").glob("*.tmp")), "the discarded temp file was left behind"
+
+
+class TestReaderHoldsAreBoundedByThePin:
+    """Readers whose own cost is O(history) must not hold the lock across it.
+
+    Each of these pins the segment set under the transaction - a listing plus
+    one ``stat`` per segment - and then walks the pinned bytes with no lock
+    held. The budget is calibrated against one honest chain read on the same
+    machine in the same run; a walk held under the lock costs at least that.
+    """
+
+    def test_verify_and_query_does_not_hold_the_lock_across_the_walk(self, tmp_path: Path) -> None:
+        audit_dir = tmp_path / "audit"
+        _seed(audit_dir, tenants=4, filler=READER_FILLER_EVENTS)
+        chain = AuditChainStore(audit_dir, key=KEY)
+
+        with _HoldProbe(audit_dir) as probe:
+            started = time.monotonic()
+            ok, errors, events = chain.verify_and_query(event_type="filler")
+            total = time.monotonic() - started
+        held = probe.longest_denial_s
+        budget = max(READER_HOLD_FLOOR_S, total * READER_HOLD_FRACTION)
+
+        assert ok, errors
+        assert events, "the projection came back empty, so the budget proves nothing"
+        assert held <= budget, (
+            f"verify_and_query held the exclusive chain lock for {held:.3f}s of a {total:.3f}s "
+            f"call ({held / total:.1%}); the budget is {budget:.3f}s. The HMAC recomputation is a "
+            "pure walk over pinned bytes and needs no exclusion of its own."
+        )
+
+    def test_verify_and_query_still_reports_a_broken_chain(self, tmp_path: Path) -> None:
+        """Guards the cheap way to pass the budget above: stop verifying."""
+        audit_dir = tmp_path / "audit"
+        _seed(audit_dir, tenants=1, filler=4)
+        segment = next(iter(sorted(audit_dir.glob("*.jsonl"))))
+        raw = segment.read_text(encoding="utf-8")
+        segment.write_text(raw.replace('"actor": "test"', '"actor": "mallory"', 1), encoding="utf-8")
+
+        ok, errors, _ = AuditChainStore(audit_dir, key=KEY).verify_and_query(event_type="filler")
+        assert ok is False
+        assert errors
+
+    def test_the_tear_pillar_reads_with_no_lock_held(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Structural, not timed: the reads themselves must be outside the section.
+
+        The pillar runs two full-history reads. Their cost grows with the chain,
+        so whether *this* chain makes them slow enough to measure is beside the
+        point - what must hold is that a second process can take the lock while
+        they run.
+        """
+        audit_dir = tmp_path / "audit"
+        monkeypatch.setattr(audit_cmd, "AUDIT_DIR", audit_dir)
+        _seed(audit_dir, tenants=2, filler=200)
+
+        observed = _spy_on_queries(monkeypatch, audit_dir)
+        assert audit_cmd._verify_chain_tears() is True
+        monkeypatch.undo()
+
+        assert len(observed) == 2, f"the tear pillar made {len(observed)} reads, expected 2"
+        assert all(observed), "the tear pillar read the chain with the exclusive lock held"
+        assert _os_lock_is_free(audit_dir) is True
+
+    def test_the_charter_pillar_reads_with_no_lock_held(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        audit_dir = tmp_path / "audit"
+        monkeypatch.setattr(audit_cmd, "AUDIT_DIR", audit_dir)
+        _seed(audit_dir, tenants=2, filler=200)
+
+        observed = _spy_on_queries(monkeypatch, audit_dir)
+        assert audit_cmd._verify_tenant_charters() is True
+        monkeypatch.undo()
+
+        assert observed, "the charter pillar made no chain read at all"
+        assert all(observed), "the charter pillar read the chain with the exclusive lock held"
+
+    def test_the_tear_pillar_still_reports_an_unacknowledged_tear(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guards the cheap way to pass the budget above: stop looking for tears."""
+        audit_dir = tmp_path / "audit"
+        monkeypatch.setattr(audit_cmd, "AUDIT_DIR", audit_dir)
+        log = AuditLog(audit_dir=audit_dir, key=KEY)
+        log.log("filler", "test", "resource", "r0", {})
+
+        segment = next(iter(sorted(audit_dir.glob("*.jsonl"))))
+        os.truncate(segment, segment.stat().st_size - 1)
+        AuditLog(audit_dir=audit_dir, key=KEY).log("filler", "test", "resource", "r1", {})
+
+        assert audit_cmd._verify_chain_tears() is False
+
+    def test_tenant_verify_does_not_hold_the_lock_across_the_chain_verify(self, tmp_path: Path) -> None:
+        """``bernstein tenant verify`` is a read; it must not deny writers for a full walk."""
+        from click.testing import CliRunner
+
+        from bernstein.cli.commands.tenant_cmd import tenant_group
+
+        workdir = tmp_path / "project"
+        audit_dir = workdir / ".sdd" / "audit"
+        _seed(audit_dir, tenants=2, filler=READER_FILLER_EVENTS)
+
+        runner = CliRunner()
+        with _HoldProbe(audit_dir) as probe:
+            started = time.monotonic()
+            result = runner.invoke(tenant_group, ["verify", "tenant-000", "--workdir", str(workdir), "--json"])
+            total = time.monotonic() - started
+        held = probe.longest_denial_s
+        budget = max(READER_HOLD_FLOOR_S, total * READER_HOLD_FRACTION)
+
+        assert result.exit_code == 0, result.output
+        assert held <= budget, (
+            f"'tenant verify' held the exclusive chain lock for {held:.3f}s of a {total:.3f}s "
+            f"command ({held / total:.1%}); the budget is {budget:.3f}s. chain.verify() is a walk "
+            "over pinned bytes and belongs outside the exclusive section."
+        )
+
+    def test_tenant_verify_still_fails_on_a_broken_chain(self, tmp_path: Path) -> None:
+        """Guards the cheap way to pass the budget above: stop calling chain.verify()."""
+        import json as _json
+
+        from click.testing import CliRunner
+
+        from bernstein.cli.commands.tenant_cmd import tenant_group
+
+        workdir = tmp_path / "project"
+        audit_dir = workdir / ".sdd" / "audit"
+        _seed(audit_dir, tenants=1, filler=4)
+        segment = next(iter(sorted(audit_dir.glob("*.jsonl"))))
+        raw = segment.read_text(encoding="utf-8")
+        segment.write_text(raw.replace('"actor": "test"', '"actor": "mallory"', 1), encoding="utf-8")
+
+        result = CliRunner().invoke(tenant_group, ["verify", "tenant-000", "--workdir", str(workdir), "--json"])
+        assert result.exit_code == 1
+        assert _json.loads(result.output)["audit_chain_ok"] is False

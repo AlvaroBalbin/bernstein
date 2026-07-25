@@ -14,15 +14,15 @@ Current charter state is the deterministic fold of an append-only sequence of
 charter events on the HMAC audit chain:
 
 ```text
-open -> member_add -> member_add -> budget_set -> member_remove -> ...
-                                |
-                                v
-                        CharterState (members, roles, quota, budget)
+open -> member_add -> role_set -> budget_set -> member_remove -> ...
+                             |
+                             v
+                     CharterState (members, roles, quota, budget)
 ```
 
 | Event kind | Body | Effect on the fold |
 |---|---|---|
-| `charter.open` | – | starts the segment; must be first, must point at the genesis sentinel |
+| `charter.open` | `{principal, role, budget_usd?}` | starts the segment; must be first, must point at the genesis sentinel. Enrols the named principal and sets the budget in the same event; a body without them opens an empty charter |
 | `charter.member_add` | `{principal, role}` | enrols a principal (duplicate enrolment is refused) |
 | `charter.role_set` | `{principal, role}` | rebinds an existing member's role |
 | `charter.member_remove` | `{principal}` | removes a member (removing a non-member is refused) |
@@ -43,6 +43,20 @@ segment therefore reach the same hash on any machine.
 The hash covers `head_event_hash`, so "which charter was in force" names one
 exact history rather than one membership snapshot. Two different histories that
 happen to reach the same member list are still two charters.
+
+## Opening a charter is one append
+
+`charter.open` carries the first member and the optional budget in its own body,
+so `bernstein tenant create` appends exactly one chain record. That is not a
+convenience: the chain transaction is exclusion, not atomicity, so a batch of
+appends interrupted midway commits the prefix already written and an append-only
+log has no rollback. Opening as a batch left a reachable state — an opened
+charter with nobody in it — that `tenant verify`, `tenant show` and the
+`audit verify` charter pillar all folded as healthy, that nothing could complete
+because the tenant id was taken, and that no operator could undo.
+
+A `charter.open` with no `principal` remains valid and opens an empty charter,
+so a caller that enrols separately still reads back.
 
 ## Backdating breaks verification
 

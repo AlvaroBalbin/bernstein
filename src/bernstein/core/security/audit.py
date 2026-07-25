@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import gzip
 import hashlib
 import hmac as _hmac
@@ -329,6 +330,48 @@ class ArchiveResult:
 
 
 @dataclass(frozen=True)
+class ChainSegments:
+    """The chain's segment set and lengths as they stood at one instant.
+
+    A reader that verifies the chain and then projects events out of it needs
+    both reads to describe the same chain; otherwise it can report a verdict
+    for one history and a projection of another. Holding
+    :class:`chain_transaction` across both reads gives that, and costs the
+    whole deployment its write availability: every append waits behind a hold
+    that grows with history size, against a fixed 30s budget past which callers
+    fail rather than wait. Measured at roughly 30 seconds of exclusive hold per
+    gigabyte of chain.
+
+    Pinning the segment set instead separates the two. Taking this *is* the
+    guarded section: it is a directory listing plus one ``stat`` per segment,
+    so the hold is proportional to the number of segments (hundreds) and not to
+    their size (gigabytes). Reading the pinned set afterwards needs no lock,
+    because everything the lock protected against is already excluded:
+
+    * an append can only extend a live segment past the length recorded here,
+      and readers stop at that length;
+    * retention's publish step - the ``.gz`` landing and the ``.jsonl``
+      unlinking, the window in which a day is visible twice or not at all -
+      runs inside the transaction, so it cannot straddle this listing;
+    * a segment archived *after* the pin is still readable at its pinned
+      length, from the archived copy (see :func:`read_pinned_segment`).
+
+    Attributes:
+        archived: Archived segments in replay (chronological) order.
+        live: Live segments in replay order, each with the byte length it had
+            when the set was pinned.
+        degraded: True when the pin ran without the OS lock because the audit
+            directory refuses a writable descriptor (``best_effort`` readers on
+            a read-only copy). The pinned set is then only as consistent as the
+            directory was during the listing.
+    """
+
+    archived: tuple[Path, ...] = ()
+    live: tuple[tuple[Path, int], ...] = ()
+    degraded: bool = False
+
+
+@dataclass(frozen=True)
 class AuditEvent:
     """A single HMAC-chained audit log entry.
 
@@ -405,6 +448,25 @@ class ChainLockUnavailable(RuntimeError):
     Deliberately distinct from a caller losing a benign race (for example, a
     second ``tenant create`` finding the charter already opened). Collapsing the
     two would turn "you lost a race, re-read and retry" into a page.
+    """
+
+
+class ChainLockUnwritable(ChainLockUnavailable):
+    """The lock sentinel could not be opened because the audit directory is not writable.
+
+    Taking the transaction requires a writable descriptor on
+    ``.chain.lock``: an exclusive OS lock cannot be taken on a read-only one.
+    So a read-only audit directory - a snapshot taken for an incident, a
+    mounted archive, a sentinel owned by the writing account - refuses the
+    lock for a reason that has nothing to do with contention.
+
+    Raised instead of letting :class:`PermissionError` reach the terminal,
+    which prints a traceback pointing into this module and reads as chain
+    corruption. A subclass of :class:`ChainLockUnavailable` so the CLI
+    boundary that already maps that class needs no second case.
+
+    Read-only callers should not see this at all: they pass ``best_effort``
+    and get an unlocked read instead (see :func:`chain_transaction`).
     """
 
 
@@ -599,12 +661,21 @@ def _reclaim_idle_entries() -> None:
             os.close(entry.fd)
 
 
-def _entry_for(audit_dir: Path) -> _ChainLockEntry | None:
+#: ``errno`` values that mean "this audit directory will not give anyone a
+#: writable descriptor", as opposed to "something is wrong with this call".
+#: A read-only mount reports ``EROFS``; a directory or sentinel the caller
+#: cannot write reports ``EACCES`` or ``EPERM``.
+_UNWRITABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
+
+def _entry_for(audit_dir: Path, *, best_effort: bool = False) -> _ChainLockEntry | None:
     """Return the lock entry for *audit_dir* with a user reference taken.
 
     Returns ``None`` when the platform offers no OS lock primitive - the one
     preserved degradation path, on which the transaction becomes a pass-through
     rather than raising or hanging. Every supported platform has one of the two.
+    With *best_effort* it also returns ``None`` when the directory will not
+    yield a writable descriptor at all; see :func:`chain_transaction`.
 
     This runs on every append, so the already-registered case costs one ``stat``
     and nothing else. ``stat`` resolves the same inode ``open`` would, through
@@ -625,34 +696,55 @@ def _entry_for(audit_dir: Path) -> _ChainLockEntry | None:
     try:
         st = os.stat(lock_path)
     except OSError:
-        return _register_entry(audit_dir, lock_path, shims)
+        return _register_entry(audit_dir, lock_path, shims, best_effort=best_effort)
 
     with _CHAIN_TABLE_GUARD:
         entry = _CHAIN_TABLE.get((st.st_dev, st.st_ino))
         if entry is not None:
             entry.users += 1
             return entry
-    return _register_entry(audit_dir, lock_path, shims)
+    return _register_entry(audit_dir, lock_path, shims, best_effort=best_effort)
 
 
 def _register_entry(
     audit_dir: Path,
     lock_path: str,
     shims: tuple[Callable[[int], bool], Callable[[int], None]],
-) -> _ChainLockEntry:
+    *,
+    best_effort: bool = False,
+) -> _ChainLockEntry | None:
     """Open (creating if needed) the lock file and return its table entry.
 
     The slow path behind :func:`_entry_for`: taken the first time a process
     touches an audit directory, and whenever the lock file's inode is not the
     one the table already knows.
+
+    Returns ``None`` only under *best_effort* on a directory that refuses a
+    writable descriptor. Otherwise that refusal is raised as
+    :class:`ChainLockUnwritable`, which names the sentinel: the bare
+    :class:`PermissionError` it replaces surfaced as a traceback into this
+    module, which on the audit substrate reads as corruption.
     """
     try_lock, unlock = shims
 
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    # Read+write because Windows ``msvcrt.locking`` cannot take an exclusive
-    # lock on a write-only descriptor; ``0o600`` because the sentinel lives
-    # inside the audit directory.
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        # Read+write because Windows ``msvcrt.locking`` cannot take an exclusive
+        # lock on a write-only descriptor; ``0o600`` because the sentinel lives
+        # inside the audit directory.
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    except OSError as exc:
+        if exc.errno not in _UNWRITABLE_ERRNOS:
+            raise
+        if best_effort:
+            return None
+        raise ChainLockUnwritable(
+            f"cannot take the audit chain transaction on {audit_dir}: its lock sentinel "
+            f"{lock_path} is not writable ({exc.strerror}). Taking the lock needs a writable "
+            "descriptor on that file, so a read-only audit directory refuses it. Commands that "
+            "only read the chain work on a read-only copy; anything that appends needs write "
+            "access to the directory."
+        ) from exc
     try:
         st = os.fstat(fd)
     except OSError:
@@ -750,25 +842,57 @@ class chain_transaction:
             Defaults to :data:`CHAIN_LOCK_TIMEOUT_S`. One deadline covers the
             in-process wait and the cross-process wait together; bounding only
             the second lets a caller wait twice the budget.
+        best_effort: Degrade to an unlocked section when the audit directory
+            will not yield a writable descriptor on the lock sentinel, instead
+            of raising :class:`ChainLockUnwritable`. **Read-only callers only.**
+            Taking the OS lock needs a writable descriptor, so verification of a
+            read-only snapshot - the first step of this project's own recovery
+            runbook - cannot take it at all, and failing there turns "I cannot
+            look" into "the chain is broken" at the moment an operator is trying
+            to establish which one it is. A caller that appends must never pass
+            this: silently losing exclusion is the defect the transaction
+            exists to prevent. Whether the section degraded is readable
+            afterwards from :attr:`degraded`, so a caller can report it rather
+            than pass a weaker read off as the guarded one.
 
     Raises:
         ChainLockUnavailable: The lock was not acquired within *timeout*.
+        ChainLockUnwritable: The lock sentinel is not writable and *best_effort*
+            was not set.
         ChainLockMisuse: Re-entered while already open, exited out of order,
             entered by a second asyncio task on a thread that already holds it,
             or exited from a different thread or task.
     """
 
-    __slots__ = ("_audit_dir", "_depth", "_entered", "_entry", "_outermost", "_task", "_thread", "_timeout")
+    __slots__ = (
+        "_audit_dir",
+        "_best_effort",
+        "_degraded",
+        "_depth",
+        "_entered",
+        "_entry",
+        "_outermost",
+        "_task",
+        "_thread",
+        "_timeout",
+    )
 
-    def __init__(self, audit_dir: Path, *, timeout: float | None = None) -> None:
+    def __init__(self, audit_dir: Path, *, timeout: float | None = None, best_effort: bool = False) -> None:
         self._audit_dir = audit_dir if isinstance(audit_dir, Path) else Path(audit_dir)
         self._timeout = CHAIN_LOCK_TIMEOUT_S if timeout is None else timeout
+        self._best_effort = best_effort
         self._entry: _ChainLockEntry | None = None
         self._thread: threading.Thread | None = None
         self._task: object | None = None
         self._depth = 0
         self._outermost = False
         self._entered = False
+        self._degraded = False
+
+    @property
+    def degraded(self) -> bool:
+        """Whether the section ran without the OS lock (``best_effort`` only)."""
+        return self._degraded
 
     def __enter__(self) -> None:
         if self._entered:
@@ -779,9 +903,11 @@ class chain_transaction:
             )
         self._outermost = False
         self._depth = 0
-        entry = _entry_for(self._audit_dir)
+        self._degraded = False
+        entry = _entry_for(self._audit_dir, best_effort=self._best_effort)
         self._entry = entry
-        if entry is None:  # pragma: no cover - no OS lock primitive
+        if entry is None:  # pragma: no cover - no OS lock primitive on some paths
+            self._degraded = True
             self._entered = True
             return
 
@@ -1027,6 +1153,44 @@ def _verify_log_file(log_path: Path, prev_hmac: str, key: bytes, errors: list[st
     return _verify_log_bytes(log_path.read_bytes(), log_path.name, prev_hmac, key, errors)
 
 
+def read_pinned_segment(log_path: Path, size: int, errors: list[str]) -> bytes | None:
+    """Read the first *size* bytes of a live segment pinned by :class:`ChainSegments`.
+
+    Follows the segment into the archive if retention published it between the
+    pin and this read. That is not a fallback for a missing file: ``archive``
+    compresses the live segment, re-checks that it did not move, and only then
+    unlinks it, so the archived copy holds exactly the bytes the pin measured.
+    Reading the pinned prefix out of it yields the same bytes the live file
+    would have, which is what makes a pinned read independent of retention
+    without holding the lock across it.
+
+    Args:
+        log_path: The live segment as it was pinned.
+        size: Its byte length at pin time. Reads stop there, so an append that
+            landed since is outside the pinned view.
+        errors: Collector for a segment that can be read from neither place.
+
+    Returns:
+        The pinned bytes, or ``None`` if the segment is gone from both the live
+        directory and the archive (an error is appended in that case).
+    """
+    try:
+        with log_path.open("rb") as fh:
+            return fh.read(size)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        errors.append(f"{log_path.name}: unreadable segment - {exc}")
+        return None
+
+    gz_path = log_path.parent / RetentionPolicy().archive_subdir / f"{log_path.name}.gz"
+    if not gz_path.exists():
+        errors.append(f"{log_path.name}: segment disappeared while it was being read")
+        return None
+    raw = _read_archived_segment(gz_path, errors)
+    return None if raw is None else raw[:size]
+
+
 def _read_archived_segment(gz_path: Path, errors: list[str]) -> bytes | None:
     """Decompress an archived ``*.jsonl.gz`` segment to its original bytes.
 
@@ -1252,14 +1416,16 @@ def _events_from_text(
         raw = raw_line.strip()
         if not raw:
             continue
-        # Line-level superset test: within a segment that does mention the id,
-        # only parse the lines that could carry it. A record holds
-        # ``resource_id`` as a field value only if that value appears verbatim
-        # in the line, so a line without it is a definite miss and is skipped
-        # before ``json.loads``. The exact comparison in
+        # Line-level superset test: within a segment that does mention the id or
+        # the event type, only parse the lines that could carry it. A record
+        # holds ``resource_id`` / ``event_type`` as a field value only if that
+        # value appears verbatim in the line, so a line without it is a definite
+        # miss and is skipped before ``json.loads``. The exact comparison in
         # ``_matches_query_filters`` still rejects a coincidental substring
         # match, so this can never drop a genuine match.
         if resource_id and resource_id not in raw:
+            continue
+        if event_type and event_type not in raw:
             continue
         try:
             entry = json.loads(raw)
@@ -1372,9 +1538,6 @@ class AuditLog:
         # ``-1`` force a re-sync on the first append.
         self._synced_path: Path | None = None
         self._synced_size = -1
-        # Guards the one-level recursion in ``_seal_torn_tail``: sealing a torn
-        # final line records an event, which re-enters ``log``.
-        self._sealing = False
 
     # -- chain recovery -----------------------------------------------------
 
@@ -1454,29 +1617,14 @@ class AuditLog:
 
             self._sync_for_append(log_path)
 
-            entry_dict: dict[str, Any] = {
-                "timestamp": ts,
-                "event_type": event_type,
-                "actor": actor,
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-                "details": details or {},
-                "prev_hmac": self._prev_hmac,
-            }
-            computed_hmac = _compute_hmac(self._key, self._prev_hmac, entry_dict)
-
-            event = AuditEvent(
-                timestamp=ts,
+            event, line = self._mint_record(
+                ts=ts,
                 event_type=event_type,
                 actor=actor,
                 resource_type=resource_type,
                 resource_id=resource_id,
                 details=details or {},
-                prev_hmac=self._prev_hmac,
-                hmac=computed_hmac,
             )
-
-            entry_dict["hmac"] = computed_hmac
 
             # ``newline=""`` disables Python's universal-newline translation so
             # the literal ``\n`` we append survives byte-for-byte on Windows
@@ -1493,12 +1641,55 @@ class AuditLog:
             # reads for every reader of the log. Do not change the shape of this
             # write.
             with log_path.open("a", encoding="utf-8", newline="") as fh:
-                fh.write(json.dumps(entry_dict, sort_keys=True) + "\n")
+                fh.write(line)
 
-            self._prev_hmac = computed_hmac
+            self._prev_hmac = event.hmac
             self._synced_path = log_path
             self._synced_size = _path_size(log_path)
         return event
+
+    def _mint_record(
+        self,
+        *,
+        ts: str,
+        event_type: str,
+        actor: str,
+        resource_type: str,
+        resource_id: str,
+        details: dict[str, Any],
+    ) -> tuple[AuditEvent, str]:
+        """Build one record against the current head and return it with its wire line.
+
+        Minting and writing are separate so the tear seal can put a record and
+        the terminator that precedes it into one ``write`` (see
+        :meth:`_seal_torn_tail`). The line is the canonical serialisation
+        including its terminator, so every writer emits byte-identical framing.
+
+        Does not advance the head: the caller does that once the bytes are on
+        disk.
+        """
+        entry_dict: dict[str, Any] = {
+            "timestamp": ts,
+            "event_type": event_type,
+            "actor": actor,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "details": details,
+            "prev_hmac": self._prev_hmac,
+        }
+        computed_hmac = _compute_hmac(self._key, self._prev_hmac, entry_dict)
+        entry_dict["hmac"] = computed_hmac
+        event = AuditEvent(
+            timestamp=ts,
+            event_type=event_type,
+            actor=actor,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            details=details,
+            prev_hmac=self._prev_hmac,
+            hmac=computed_hmac,
+        )
+        return event, json.dumps(entry_dict, sort_keys=True) + "\n"
 
     def _sync_for_append(self, log_path: Path) -> None:
         """Bring this instance's chain head in line with *log_path* before appending.
@@ -1529,7 +1720,7 @@ class AuditLog:
         if log_path == self._synced_path and size == self._synced_size:
             return
         if self._seal_torn_tail(log_path, size):
-            # Sealing appended through ``log``, which left the head and the size
+            # Sealing appended its own record and left the head and the size
             # markers current. Re-reading would only re-derive what it wrote.
             return
         self._prev_hmac = self._recover_chain_tail()
@@ -1574,6 +1765,21 @@ class AuditLog:
         verifies clean: without the event the damage would stop being reportable
         the moment anything appended.
 
+        **The repair and its evidence are one write.** Writing the terminator
+        first and recording the tear second leaves a state in which the segment
+        is healed and nothing says it was ever damaged: ``bernstein audit
+        verify`` goes from exit 1 to exit 0 with no operator action. That state
+        is reachable by a crash, a ``SIGKILL``, or a full volume - and a full
+        volume is one of the two classic causes of the tear in the first place,
+        so the damage and its eraser arrive together. Emitting the terminator
+        and the record in one ``write`` removes the state entirely: a torn write
+        of the combined buffer leaves a fresh unterminated fragment, which the
+        next append seals and reports in turn.
+
+        Both go into *this* segment rather than into whatever day it is when the
+        record is minted, so a tear found across a UTC midnight cannot land its
+        evidence in the next day's file.
+
         The caller must hold :class:`chain_transaction`.
 
         Args:
@@ -1583,7 +1789,7 @@ class AuditLog:
         Returns:
             Whether a tear was sealed, and therefore whether this call appended.
         """
-        if self._sealing or size <= 0:
+        if size <= 0:
             return False
         try:
             with log_path.open("rb") as fh:
@@ -1594,22 +1800,40 @@ class AuditLog:
         if last == b"\n":
             return False
 
+        # Recovery frames records by splitting on ``b"\n"``, and splitting
+        # ``...\nfragment`` yields the same records as ``...\nfragment\n``. So
+        # the head read here is already the head the sealed segment ends on, and
+        # the record minted against it is the record the segment would carry had
+        # the terminator been written first.
+        self._prev_hmac = self._recover_chain_tail()
+        event, line = self._mint_record(
+            ts=datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            event_type=EVENT_CHAIN_TORN_RECORD,
+            actor="audit-log",
+            resource_type="audit_segment",
+            resource_id=log_path.name,
+            details={"segment": log_path.name, "byte_offset": size},
+        )
+        buffer = b"\n" + line.encode("utf-8")
         with log_path.open("ab") as fh:
-            fh.write(b"\n")
+            fh.write(buffer)
 
-        # Recording the seal re-enters ``log``; the flag bounds that to one
-        # level, and by then the file already ends in a newline anyway.
-        self._sealing = True
-        try:
-            self.log(
-                event_type=EVENT_CHAIN_TORN_RECORD,
-                actor="audit-log",
-                resource_type="audit_segment",
-                resource_id=log_path.name,
-                details={"segment": log_path.name, "byte_offset": size},
+        # A short write leaves the segment ending in a fresh fragment. Returning
+        # normally here would let the caller append its own record straight onto
+        # that fragment and fuse the two into one unparseable line, swallowing a
+        # real record - which is the outcome sealing exists to prevent. Refusing
+        # leaves the damage exactly as it was, and therefore still reportable.
+        landed = _path_size(log_path)
+        if landed != size + len(buffer):
+            raise OSError(
+                f"could not seal the torn tail of {log_path.name}: {landed - size} of "
+                f"{len(buffer)} bytes were written. The segment is still torn and 'bernstein "
+                "audit verify' still reports it."
             )
-        finally:
-            self._sealing = False
+
+        self._prev_hmac = event.hmac
+        self._synced_path = log_path
+        self._synced_size = landed
         return True
 
     # -- verify -------------------------------------------------------------
@@ -1797,7 +2021,37 @@ class AuditLog:
             rescanned=not resume,
         )
 
-    def verify(self) -> tuple[bool, list[str]]:
+    def pin_segments(self, *, best_effort: bool = False, timeout: float | None = None) -> ChainSegments:
+        """Record the chain's segment set under one transaction; see :class:`ChainSegments`.
+
+        This is the guarded read for anything whose own cost grows with history
+        size. The transaction covers a directory listing and one ``stat`` per
+        segment, so the exclusive hold is bounded by the number of segments
+        rather than by their total size, and every other writer stays live
+        while the caller does its O(history) work outside the section.
+
+        Args:
+            best_effort: Pin without the lock when the audit directory refuses
+                a writable descriptor, rather than raising. Read-only callers
+                only; the result carries ``degraded=True``.
+            timeout: Passed to :class:`chain_transaction`.
+
+        Returns:
+            The pinned segment set.
+        """
+        transaction = chain_transaction(self._audit_dir, timeout=timeout, best_effort=best_effort)
+        with transaction:
+            archived = tuple(_archived_segment_paths(self._audit_dir))
+            live: list[tuple[Path, int]] = []
+            for path in sorted(self._audit_dir.glob(_JSONL_GLOB)):
+                try:
+                    live.append((path, path.stat().st_size))
+                except OSError:  # pragma: no cover - filesystem race
+                    continue
+            degraded = transaction.degraded
+        return ChainSegments(archived=archived, live=tuple(live), degraded=degraded)
+
+    def verify(self, segments: ChainSegments | None = None) -> tuple[bool, list[str]]:
         """Walk archived then live JSONL segments and verify the HMAC chain.
 
         Archived ``*.jsonl.gz`` segments are replayed first, in chronological
@@ -1807,13 +2061,25 @@ class AuditLog:
         ``.gz`` segment, or a deleted segment, surfaces as an HMAC/linkage
         error naming the segment rather than passing silently.
 
+        Args:
+            segments: Verify exactly this pinned segment set (see
+                :meth:`pin_segments`) instead of whatever the directory holds
+                when the walk reaches it. A caller that must reconcile this
+                verdict with a second read passes the same pin to both, which
+                is what makes the two describe one history without either
+                holding the chain lock for the length of the walk.
+
         Returns:
             ``(valid, errors)`` where *valid* is True when the entire chain
             is intact and *errors* lists any violations found.
         """
         errors: list[str] = []
-        archived = _archived_segment_paths(self._audit_dir)
-        live_files = sorted(self._audit_dir.glob(_JSONL_GLOB))
+        if segments is None:
+            archived = _archived_segment_paths(self._audit_dir)
+            live_files = [(path, -1) for path in sorted(self._audit_dir.glob(_JSONL_GLOB))]
+        else:
+            archived = list(segments.archived)
+            live_files = list(segments.live)
         if not archived and not live_files:
             return True, []
 
@@ -1826,8 +2092,14 @@ class AuditLog:
                 # live files from a wrong (genesis) prev_hmac.
                 return False, errors
             prev_hmac = _verify_log_bytes(raw, gz_path.name, prev_hmac, self._key, errors)
-        for log_path in live_files:
-            prev_hmac = _verify_log_file(log_path, prev_hmac, self._key, errors)
+        for log_path, size in live_files:
+            if size < 0:
+                prev_hmac = _verify_log_file(log_path, prev_hmac, self._key, errors)
+                continue
+            raw = read_pinned_segment(log_path, size, errors)
+            if raw is None:
+                return False, errors
+            prev_hmac = _verify_log_bytes(raw, log_path.name, prev_hmac, self._key, errors)
 
         return len(errors) == 0, errors
 
@@ -1970,11 +2242,15 @@ class AuditLog:
         until: str | None = None,
         resource_id: str | None = None,
         include_archived: bool = False,
+        segments: ChainSegments | None = None,
     ) -> list[AuditEvent]:
         """Filter audit events by type, actor, resource, and/or time range.
 
         Args:
-            event_type: If set, only return events matching this type.
+            event_type: If set, only return events matching this type. A
+                non-empty value also enables the same raw-line prefilter
+                ``resource_id`` gets, for the same reason and with the same
+                superset argument.
             actor: If set, only return events from this actor.
             since: ISO 8601 lower bound (inclusive).
             until: ISO 8601 upper bound (inclusive).
@@ -1998,6 +2274,11 @@ class AuditLog:
                 a live-only read makes an intact chain look broken. Reading
                 archives costs a decompress per segment, so it belongs on the
                 paths that need completeness, not on every query.
+            segments: Read exactly this pinned segment set (see
+                :meth:`pin_segments`) instead of whatever the directory holds
+                when the read reaches it. Live segments are read only up to
+                their pinned length, so a concurrent append is outside the
+                view rather than half inside it.
 
         Returns:
             List of matching AuditEvent instances (chronological order).
@@ -2011,10 +2292,15 @@ class AuditLog:
         """
         results: list[AuditEvent] = []
         sources: list[bytes | None] = []
-        if include_archived:
-            discarded: list[str] = []
-            sources.extend(_read_archived_segment(gz, discarded) for gz in _archived_segment_paths(self._audit_dir))
-        sources.extend(path.read_bytes() for path in sorted(self._audit_dir.glob(_JSONL_GLOB)))
+        discarded: list[str] = []
+        if segments is None:
+            if include_archived:
+                sources.extend(_read_archived_segment(gz, discarded) for gz in _archived_segment_paths(self._audit_dir))
+            sources.extend(path.read_bytes() for path in sorted(self._audit_dir.glob(_JSONL_GLOB)))
+        else:
+            if include_archived:
+                sources.extend(_read_archived_segment(gz, discarded) for gz in segments.archived)
+            sources.extend(read_pinned_segment(path, size, discarded) for path, size in segments.live)
 
         for blob in sources:
             if blob is None:
@@ -2025,13 +2311,16 @@ class AuditLog:
             # than becoming replacement characters, so a query never reports a
             # record that differs from the bytes ``verify`` hashed.
             text = blob.decode("utf-8")
-            # Segment-level reject: a record can only carry ``resource_id`` as a
-            # field value if that value appears verbatim in the segment's bytes.
-            # A segment that never mentions the id holds no match, so skip it
-            # whole - no line split, no per-line work. This is what keeps a
-            # first-time approval resolve, and a stream of unknown card hashes,
-            # off an O(chain) parse of the entire log.
+            # Segment-level reject: a record can only carry ``resource_id`` or
+            # ``event_type`` as a field value if that value appears verbatim in
+            # the segment's bytes. A segment that never mentions it holds no
+            # match, so skip it whole - no line split, no per-line work. This is
+            # what keeps a first-time approval resolve, a stream of unknown card
+            # hashes, and the verifier's scan for rare chain-damage records off
+            # an O(chain) parse of the entire log.
             if resource_id and resource_id not in text:
+                continue
+            if event_type and event_type not in text:
                 continue
             results.extend(
                 _events_from_text(

@@ -546,23 +546,24 @@ def _verify_tenant_charters() -> bool:
 
     When no charter events exist the check is a silent no-op.
 
-    One chain read, taken under one transaction, feeds every fold; the folds
-    themselves run after the transaction has been released. Folding per tenant
-    *inside* the transaction re-read the whole chain once per charter, so the
-    exclusive hold grew as (charters x history) and passed the primitive's
-    30s budget on an ordinary multi-tenant deployment - at which point an
-    unrelated ``tenant create`` running alongside a scheduled verify failed
-    outright with nothing created. The snapshot is what makes the verdict
-    consistent; holding the lock past the read adds nothing to that.
+    One chain read feeds every fold, and neither the read nor the folds hold
+    the chain lock. The exclusive section is the segment pin alone (see
+    :meth:`~bernstein.core.security.audit.AuditLog.pin_segments`), which costs
+    one ``stat`` per segment instead of one pass over history. Anything longer
+    denies every writer in the deployment for its duration: a scheduled verify
+    would take an unrelated ``bernstein tenant create`` down with it, and that
+    caller exits non-zero with nothing created.
     """
+    from bernstein.core.security.audit import ChainLockUnavailable
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER, AuditChainStore
     from bernstein.core.security.tenant_charter import verify_charter_from_entries
 
     chain = AuditChainStore(AUDIT_DIR)
     try:
-        with chain.transaction():
-            entries = chain.query(event_type=EVENT_TENANT_CHARTER, include_archived=True)
-    except OSError as exc:  # pragma: no cover - filesystem race
+        segments = chain.pin_segments(best_effort=True)
+        _report_degraded_pin(segments)
+        entries = chain.query(event_type=EVENT_TENANT_CHARTER, include_archived=True, segments=segments)
+    except (OSError, ChainLockUnavailable) as exc:  # pragma: no cover - filesystem race
         console.print(f"[red]Failed to read tenant charter events: {exc}[/red]")
         return False
 
@@ -598,20 +599,45 @@ def _tear_key(event: object) -> tuple[str, int]:
     return (str(details.get("segment", "")), int(details.get("byte_offset", 0) or 0))
 
 
+#: Whether this process has already said that its reads are running unlocked.
+#: The notice is per run, not per pillar: it describes the directory, and
+#: repeating it once per read would bury the verdicts it sits next to.
+_DEGRADED_PIN_REPORTED = False
+
+
+def _report_degraded_pin(segments: object) -> None:
+    """Say so when a read ran without the chain lock, rather than passing it off as guarded."""
+    global _DEGRADED_PIN_REPORTED
+    if not getattr(segments, "degraded", False) or _DEGRADED_PIN_REPORTED:
+        return
+    _DEGRADED_PIN_REPORTED = True
+    console.print(
+        "  [dim]note: the audit directory did not grant the chain lock (read-only copy), "
+        "so these reads are not isolated from a concurrent archive.[/dim]"
+    )
+
+
 def _unacknowledged_tears() -> list[tuple[str, int, str]]:
     """Return ``(segment, byte_offset, recorded_at)`` for every tear nobody has signed off.
 
-    Both reads happen under one transaction so the pair is consistent: an
+    Both reads run against one pinned segment set so the pair is consistent: an
     acknowledgement landing between them would otherwise clear a tear this call
-    had not yet seen. The set arithmetic runs after the transaction is released.
+    had not yet seen. Only the pin is exclusive; the two reads and the set
+    arithmetic run with no lock held, because holding it across two full-history
+    parses denied every writer in the deployment for as long as the parses took.
+
+    Both event types are rare enough that the query's raw-line prefilter rejects
+    almost every line before ``json.loads`` sees it, so the two passes cost far
+    less than one unfiltered one.
     """
     from bernstein.core.security.audit import EVENT_CHAIN_TEAR_ACKNOWLEDGED, EVENT_CHAIN_TORN_RECORD
     from bernstein.core.security.audit_chain import AuditChainStore
 
     chain = AuditChainStore(AUDIT_DIR)
-    with chain.transaction():
-        tears = chain.query(event_type=EVENT_CHAIN_TORN_RECORD, include_archived=True)
-        acks = chain.query(event_type=EVENT_CHAIN_TEAR_ACKNOWLEDGED, include_archived=True)
+    segments = chain.pin_segments(best_effort=True)
+    _report_degraded_pin(segments)
+    tears = chain.query(event_type=EVENT_CHAIN_TORN_RECORD, include_archived=True, segments=segments)
+    acks = chain.query(event_type=EVENT_CHAIN_TEAR_ACKNOWLEDGED, include_archived=True, segments=segments)
 
     acked = {_tear_key(a) for a in acks}
     return [(key[0], key[1], tear.timestamp) for tear in tears if (key := _tear_key(tear)) not in acked]
