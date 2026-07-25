@@ -27,17 +27,35 @@ from bernstein.cli.main import cli
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Every compose file this repo ships as an operator-facing example/deployment
-# (docker/, examples/, and the top-level dev-stack file). Add new shipped
-# compose files here so this guard covers them too.
-SHIPPED_COMPOSE_FILES: list[Path] = [
-    REPO_ROOT / "docker-compose.yaml",
-    REPO_ROOT / "docker" / "demo" / "docker-compose.yaml",
-    REPO_ROOT / "docker" / "sandbox" / "docker-compose.yaml",
-    REPO_ROOT / "docker" / "sandbox" / "docker-compose.researcher.yaml",
-    REPO_ROOT / "examples" / "cluster" / "tailscale" / "docker-compose.yml",
-    REPO_ROOT / "examples" / "cluster" / "cloudflared" / "docker-compose.yml",
-]
+# Directories that never hold an operator-facing compose file.
+_EXCLUDED_DIRS = frozenset({".git", ".venv", "venv", "node_modules", ".tox", ".mypy_cache"})
+
+# Filename shapes Compose itself recognises, so a file named `compose.yaml`
+# is covered the same as `docker-compose.yaml`.
+_COMPOSE_GLOBS = ("docker-compose*.yaml", "docker-compose*.yml", "compose.yaml", "compose.yml")
+
+
+def _discover_shipped_compose_files() -> list[Path]:
+    """Find every compose file this repo ships, by walking the tree.
+
+    Discovered rather than hand-listed: a manually maintained list silently
+    stops covering compose files added later, which turns this guard green on
+    a file it never actually checked. Anything matching a Compose filename
+    outside the excluded directories is in scope automatically.
+    """
+    found: set[Path] = set()
+    for pattern in _COMPOSE_GLOBS:
+        for path in REPO_ROOT.rglob(pattern):
+            if _EXCLUDED_DIRS.isdisjoint(path.relative_to(REPO_ROOT).parts):
+                found.add(path)
+    return sorted(found)
+
+
+SHIPPED_COMPOSE_FILES: list[Path] = _discover_shipped_compose_files()
+
+# A glob that silently matches nothing would make every parametrized case
+# below vacuous, so assert discovery actually found the shipped files.
+assert SHIPPED_COMPOSE_FILES, f"no shipped compose files discovered under {REPO_ROOT}"
 
 # Dummy values for the `${VAR:?required}` env vars some of these compose
 # files declare, so `docker compose config` can resolve them without a real
