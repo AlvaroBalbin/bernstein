@@ -22,10 +22,15 @@ once per process.
 Zero-trust enforcement
 ----------------------
 When an agent presents a task-scoped JWT, the middleware extracts the task ID
-from the URL path for mutating operations (complete, fail, progress, cancel,
-block) and validates that the task ID appears in the token's ``task_ids``
-claim.  A token without a task scope (``task_ids == []``) is treated as
-unrestricted (manager / orchestrator tokens).
+from the URL path of every mutating request that addresses a single task and
+validates that the task ID appears in the token's ``task_ids`` claim.  The
+check is deny-by-default over the whole ``/tasks/{id}/...`` surface (and its
+``/api/v1`` mirror) rather than an enumeration of action names, so a task
+route added later is covered without touching this module; only the
+collection routes in ``TASK_COLLECTION_SEGMENTS`` are exempt.  A token
+without a task scope (``task_ids == []``) is treated as unrestricted
+(manager / orchestrator tokens), and non-agent credentials (SSO users, the
+legacy operator bearer, the cluster secret) never reach this check at all.
 
 RFC 8707 resource indicators
 ----------------------------
@@ -70,8 +75,53 @@ _EMPTY_EXPECTED_RESOURCES: Final[tuple[str, ...]] = ()
 
 logger = logging.getLogger(__name__)
 
-# Regex to extract task ID from paths like /tasks/{id}/complete
-_TASK_ID_PATH_RE = re.compile(r"^/tasks/([^/]+)/(?:complete|fail|progress|cancel|block|steal)$")
+# Regex to extract the addressed task ID from any per-task path.
+#
+# Deny-by-default: this matches ``/tasks/<id>`` and every sub-path below it,
+# on the root mount and on the versioned mirrors the app also registers
+# (``/api/v1/tasks/...``).  It deliberately does NOT enumerate action names -
+# the previous alternation (``complete|fail|progress|cancel|block|steal``)
+# was hand-maintained, drifted from the route table as routes were added,
+# and still named ``steal``, which is not a task route at all (the real one
+# is ``POST /cluster/steal``).  Anything that addresses a single task by id
+# is now scope-checked; only the collection segments listed in
+# ``TASK_COLLECTION_SEGMENTS`` are exempt.
+_TASK_ID_PATH_RE = re.compile(r"^(?:/api/v\d+)?/tasks/(?P<task_id>[^/]+)(?:/.*)?$")
+
+# Segments that sit where a task id would but are NOT task ids: collection
+# routes registered directly under ``/tasks/``.  Each entry is exempt because
+# it addresses the task collection rather than one task, so there is no task
+# id to bind the agent identity to:
+#
+#   archive, counts, graph, search  - read-only collection queries
+#   next                            - ``GET /tasks/next/{role}`` claim-next
+#   batch, claim-batch, batch-ops   - collection writes; the affected ids
+#                                     live in the request body, which this
+#                                     path-level gate cannot inspect
+#   claim-receipt                   - claim receipt lookup for the caller
+#   self-create                     - an agent decomposing its own work
+#                                     creates a NEW task, so no existing id
+#                                     can be in scope yet
+#
+# ``tests/unit/test_auth_middleware_task_scope_routes.py`` pins this set to
+# the literal segments actually registered under ``/tasks/``: a new
+# collection route fails that test until it is exempted deliberately, and a
+# new ``/tasks/{task_id}/...`` route needs no change here because it is
+# covered by default.
+TASK_COLLECTION_SEGMENTS: Final[frozenset[str]] = frozenset(
+    {
+        "archive",
+        "batch",
+        "batch-ops",
+        "claim-batch",
+        "claim-receipt",
+        "counts",
+        "graph",
+        "next",
+        "search",
+        "self-create",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Public and HMAC-authenticated paths
@@ -716,8 +766,14 @@ def _check_agent_task_scope(path: str, allowed_task_ids: list[str]) -> str | Non
 
     Returns None when the request is permitted.
 
-    Only task-mutating operations are checked - reads and non-task paths are
-    always allowed so agents can query status and post to the bulletin board.
+    The caller (:meth:`SSOAuthMiddleware._try_agent_jwt`) invokes this only
+    for mutating requests carrying a task-scoped agent identity, so reads and
+    every non-agent credential are unaffected.  Within that population the
+    rule is deny-by-default: any path addressing a single task by id is
+    checked, whatever the action segment below it, on both the root mount and
+    the ``/api/v<n>`` mirrors.  Paths that are not task-addressed (bulletin,
+    status, ...) and the collection routes listed in
+    ``TASK_COLLECTION_SEGMENTS`` are allowed.
 
     Args:
         path: Request URL path.
@@ -728,9 +784,12 @@ def _check_agent_task_scope(path: str, allowed_task_ids: list[str]) -> str | Non
     """
     m = _TASK_ID_PATH_RE.match(path)
     if m is None:
-        # Not a task-specific mutating path - allow (bulletin, status, etc.)
+        # Not a path addressing a single task - allow (bulletin, status, ...).
         return None
-    task_id = m.group(1)
+    task_id = m.group("task_id")
+    if task_id in TASK_COLLECTION_SEGMENTS:
+        # A collection route under /tasks/, not a task id.
+        return None
     if task_id not in allowed_task_ids:
         return f"Task {task_id!r} is not in this agent's task scope (allowed: {allowed_task_ids})"
     return None

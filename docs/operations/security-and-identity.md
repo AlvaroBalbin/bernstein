@@ -83,8 +83,13 @@ rejected.
    expiry.
 3. Resolves the user (operator) or identity (agent), populates
    `request.state.user` / `request.state.identity`, and enforces
-   `task_ids` scoping for `/tasks/{id}/{complete,fail,progress,cancel,
-   block,steal}` paths (`auth_middleware.py:55`).
+   `task_ids` scoping on every mutating request that addresses a single
+   task - `/tasks/{id}` and anything below it, plus the `/api/v1` mirror.
+   The check is deny-by-default rather than an allowlist of action names,
+   so a task route added later is covered without editing the middleware;
+   the only exemptions are the collection routes under `/tasks/`
+   (`TASK_COLLECTION_SEGMENTS` in `auth_middleware.py`), which address the
+   collection rather than one task.
 4. Returns `JSONResponse(401)` on any verification failure.
 
 **Revocation.**
