@@ -348,6 +348,13 @@ def _compute_hmac(key: bytes, prev_hmac: str, entry: dict[str, Any]) -> str:
 #: while inner ones pass through, and the per-dir ``RLock`` keeps a *different*
 #: thread out for the whole nested section, so re-entrancy never widens the
 #: window it exists to close.
+#:
+#: Guards are keyed by the *resolved* audit dir and never evicted. Resolving is
+#: load-bearing, not tidiness: two spellings of one directory would map to two
+#: guards, and a thread that entered under one spelling and re-entered under the
+#: other would see depth 0 and re-take the ``flock`` it already holds. Eviction
+#: is unsafe for the same reason a lock cannot be recreated while held, and the
+#: live set is one entry per audit dir a process actually writes to.
 _APPEND_GUARDS: dict[str, threading.RLock] = {}
 _APPEND_GUARDS_LOCK = threading.Lock()
 _APPEND_DEPTH = threading.local()
@@ -958,14 +965,21 @@ class AuditLog:
         Returns:
             The chain head as recovered from disk under the verifier's framing.
         """
-        self._prev_hmac = self._recover_chain_tail()
-        # Re-point ``log``'s (path, size) fast path at what we just read, so an
-        # append inside the same section does not pay a second full-file scan.
-        # The day file is re-derived rather than assumed: if the clock rolls over
-        # between here and the append, the paths differ and ``log`` re-syncs.
+        # Shares ``log``'s (path, size) fast path, in both directions. Reading it:
+        # when the day file is byte-length-identical to what our own last append
+        # or resync left it at, nothing has been appended since and the cached
+        # head still stands, so nesting two resyncs inside one section costs one
+        # scan rather than two. Writing it: an append later in the same section
+        # skips its own scan. The day file is re-derived rather than assumed, so a
+        # clock rollover between here and the append shows up as a path mismatch
+        # and re-syncs. An append only ever grows the file, so a changed tail
+        # cannot hide behind an unchanged size.
         day_path = self._audit_dir / f"{datetime.now(tz=UTC).strftime('%Y-%m-%d')}.jsonl"
-        self._synced_path = day_path
-        self._synced_size = _path_size(day_path)
+        day_size = _path_size(day_path)
+        if day_path != self._synced_path or day_size != self._synced_size:
+            self._prev_hmac = self._recover_chain_tail()
+            self._synced_path = day_path
+            self._synced_size = day_size
         return self._prev_hmac
 
     # -- write --------------------------------------------------------------
