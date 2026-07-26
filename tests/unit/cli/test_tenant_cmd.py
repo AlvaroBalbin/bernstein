@@ -279,6 +279,137 @@ class TestTenantCli:
         assert "charter hash" in shown.output
 
 
+class TestExportGateCoversEveryVerifyPillar:
+    """The export gate must match the verdict ``bernstein audit verify`` prints.
+
+    Gating exports on the HMAC walk alone let ``tenant slice`` and
+    ``tenant showback`` sign exports cut from a chain state the top-level
+    verifier rejects: a truncation back to a record boundary keeps the walk
+    green while the checkpoint pillar reports divergence. The gate now runs
+    every damage-detecting pillar (HMAC walk and tears, checkpoint extension,
+    charter head pins, the tenant's own fold), so a state ``audit verify``
+    rejects as damaged cannot mint a signed bundle.
+    """
+
+    def _seal(self) -> None:
+        from bernstein.cli.commands.audit_cmd import audit_group
+
+        sealed = CliRunner().invoke(audit_group, ["seal"])
+        assert sealed.exit_code == 0, sealed.output
+
+    def _drop_last_record(self, workdir: Path) -> None:
+        segment = max((workdir / ".sdd" / "audit").glob("*.jsonl"))
+        records = segment.read_bytes().split(b"\n")[:-1]
+        segment.write_bytes(b"\n".join(records[:-1]) + b"\n")
+
+    def _diverge_checkpoint(self, workdir: Path) -> None:
+        """Reach a state only the checkpoint pillar rejects.
+
+        The dropped record is a generic chained event, not a charter event, so
+        the HMAC walk stays green and no charter head regresses: the refusal
+        below can only come from the checkpoint-extension verdict.
+        """
+        from bernstein.core.security.audit_chain import AuditChainStore
+
+        assert _run(["create", "acme", "--principal", "alice"], workdir).exit_code == 0
+        chain = AuditChainStore(workdir / ".sdd" / "audit", key=(workdir / "audit.key").read_bytes())
+        chain.log_with_prev_digest(
+            event_type="task.transition",
+            actor="orchestrator",
+            resource_type="task",
+            resource_id="t1",
+            details={"principal": "alice", "tenant_id": "acme"},
+        )
+        self._seal()
+        self._drop_last_record(workdir)
+
+    def test_slice_refuses_after_a_checkpoint_divergence(self, workdir: Path) -> None:
+        from bernstein.cli.commands.audit_cmd import audit_group
+
+        self._diverge_checkpoint(workdir)
+        # Sanity: this is a state the top-level verifier rejects.
+        assert CliRunner().invoke(audit_group, ["verify"]).exit_code == 1
+
+        result = _run(["slice", "acme", "--since", "2000-01-01", "--until", "2999-01-01"], workdir)
+        assert result.exit_code != 0
+        assert "refusing to mint an audit slice" in result.output, result.output
+        assert "bernstein audit verify" in result.output
+        evidence = workdir / ".sdd" / "evidence"
+        assert not (evidence.is_dir() and list(evidence.glob("*")))
+
+    def test_showback_refuses_after_a_checkpoint_divergence(self, workdir: Path) -> None:
+        self._diverge_checkpoint(workdir)
+        out = workdir / "statement.json"
+        result = _run(
+            ["showback", "acme", "--from", "2000-01-01", "--to", "2999-01-01", "--out", str(out)],
+            workdir,
+        )
+        assert result.exit_code != 0
+        assert "refusing to mint a showback statement" in result.output, result.output
+        assert not out.exists()
+
+
+class TestUnwritableExportTarget:
+    """Export writes must refuse by name, never traceback.
+
+    The module promises the read-only commands work on a read-only snapshot,
+    and the slice's default output directory sits beside the audit dir - so an
+    unwritable target is an ordinary operator situation, not an internal
+    error.
+    """
+
+    def test_slice_refuses_cleanly_when_the_out_dir_cannot_be_created(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice"], workdir).exit_code == 0
+        blocked = workdir / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        try:
+            result = _run(
+                [
+                    "slice",
+                    "acme",
+                    "--since",
+                    "2000-01-01",
+                    "--until",
+                    "2999-01-01",
+                    "--out",
+                    str(blocked / "evidence"),
+                ],
+                workdir,
+            )
+        finally:
+            blocked.chmod(0o700)
+        assert result.exit_code != 0
+        assert "not writable" in result.output, result.output
+        assert "--out" in result.output
+        assert not isinstance(result.exception, PermissionError)
+
+    def test_showback_refuses_cleanly_when_the_out_path_is_unwritable(self, workdir: Path) -> None:
+        assert _run(["create", "acme", "--principal", "alice"], workdir).exit_code == 0
+        blocked = workdir / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        try:
+            result = _run(
+                [
+                    "showback",
+                    "acme",
+                    "--from",
+                    "2000-01-01",
+                    "--to",
+                    "2999-01-01",
+                    "--out",
+                    str(blocked / "deeper" / "statement.json"),
+                ],
+                workdir,
+            )
+        finally:
+            blocked.chmod(0o700)
+        assert result.exit_code != 0
+        assert "not writable" in result.output, result.output
+        assert not isinstance(result.exception, PermissionError)
+
+
 def test_group_is_registered_on_the_root_cli() -> None:
     from bernstein.cli.main import cli
 

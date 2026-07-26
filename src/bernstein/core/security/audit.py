@@ -529,6 +529,55 @@ def _segment_stamp(path: Path) -> tuple[int, int, int, int]:
     )
 
 
+#: Bytes read from the end of the day segment when an append must re-sync its
+#: cached head from disk. Under multi-process contention nearly every append
+#: re-syncs, and the head only ever lives in the segment's final records, so a
+#: bounded window keeps the cost of a contended append independent of how
+#: large the day has grown; an unbounded read made it O(segment bytes) per
+#: append and O(N^2) across a day. Records are a few hundred bytes, so this
+#: covers hundreds of them; a single record larger than the window simply
+#: forces the whole-segment fallback.
+_TAIL_SYNC_WINDOW = 256 * 1024
+
+
+def _read_whole_segment(log_path: Path) -> bytes:
+    """Read a live segment's full bytes; absent or unreadable reads as empty."""
+    try:
+        return log_path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _read_tail_window(log_path: Path, window: int) -> tuple[bytes, int] | None:
+    """Return ``(bytes, base_offset)`` for the segment's line-aligned tail.
+
+    The window starts either at byte 0 (the segment fits inside it) or just
+    after the first ``b"\\n"`` found within the final *window* bytes, so it
+    always begins on a boundary the verifier's framing agrees with - a head
+    adopted from a mid-record fragment would not be a record the chain walk
+    recognises. ``None`` means the tail cannot be line-aligned (no newline
+    inside the window, or nothing after the only one): the caller must read
+    the whole segment and judge from that. Absent or unreadable segments
+    return ``(b"", 0)``, the same shape :func:`_read_whole_segment` produces
+    for them.
+    """
+    try:
+        with log_path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            if size <= window:
+                fh.seek(0)
+                return fh.read(), 0
+            start = size - window
+            fh.seek(start)
+            chunk = fh.read()
+    except OSError:
+        return b"", 0
+    boundary = chunk.find(b"\n")
+    if boundary == -1 or boundary == len(chunk) - 1:
+        return None
+    return chunk[boundary + 1 :], start + boundary + 1
+
+
 def _read_live_segment(log_path: Path, audit_dir: Path) -> bytes | None:
     """Read a live segment, following retention when it archived it mid-read.
 
@@ -1669,32 +1718,46 @@ class AuditLog:
         same ``append_transaction`` section takes the fast path instead of
         re-scanning the segment it just scanned. The caller must hold the
         chain append lock.
+
+        The slow path reads a bounded, line-aligned tail window rather than
+        the whole segment (:func:`_read_tail_window`). Under multi-process
+        contention nearly every append lands here while holding the exclusive
+        cross-process flock, so a whole-segment read made the contended append
+        cost grow with the day's size - O(segment bytes) per append, O(N^2)
+        summed over a day - for a head that only ever lives in the final
+        records. The whole segment is read only when the window cannot
+        decide: no line boundary inside it, or a tail the window rejects,
+        whose seal must record offsets computed over the segment's true byte
+        count and whose verdict must not depend on where a window happens to
+        start.
         """
         stamp = _segment_stamp(log_path)
         if log_path == self._synced_path and stamp == self._synced_stamp:
             return
-        # One read serves both the tear gate and head recovery, so the slow
-        # path costs a single pass over the day segment - the same order as
-        # the plain re-sync it replaces.
-        try:
-            raw = log_path.read_bytes()
-        except OSError:
-            raw = b""
-        if raw:
-            verified_prefix, local_head = _local_tail_state(raw, self._key)
-            if verified_prefix != len(raw) or not raw.endswith(b"\n"):
+        window = _read_tail_window(log_path, _TAIL_SYNC_WINDOW)
+        raw, base = (_read_whole_segment(log_path), 0) if window is None else window
+        verified_prefix, local_head = _local_tail_state(raw, self._key) if raw else (0, None)
+        if raw and (verified_prefix != len(raw) or not raw.endswith(b"\n")):
+            if base:
+                # The window's rejection may be an artifact of its start (no
+                # locally valid record inside it), and sealing needs the whole
+                # segment in hand either way. Re-judge over the full bytes.
+                raw, base = _read_whole_segment(log_path), 0
+                verified_prefix, local_head = _local_tail_state(raw, self._key) if raw else (0, None)
+            if raw and (verified_prefix != len(raw) or not raw.endswith(b"\n")):
                 self._seal_torn_tail(log_path, raw, verified_prefix, local_head)
                 return
-            if local_head is not None:
-                self._prev_hmac = local_head
-                self._synced_path = log_path
-                # Length comes from the bytes actually read, not from a second
-                # stat: a writer that appended between the stat and the read
-                # would otherwise have its record folded into a stamp whose
-                # head predates it. Recording the shorter length errs towards
-                # a wasted rescan, which is the safe direction.
-                self._synced_stamp = (stamp[0], stamp[1], len(raw), stamp[3])
-                return
+        if raw and local_head is not None:
+            self._prev_hmac = local_head
+            self._synced_path = log_path
+            # Length comes from the bytes actually read (window base plus
+            # window length), not from a second stat: a writer that appended
+            # between the stat and the read would otherwise have its record
+            # folded into a stamp whose head predates it. Recording the
+            # shorter length errs towards a wasted rescan, which is the safe
+            # direction.
+            self._synced_stamp = (stamp[0], stamp[1], base + len(raw), stamp[3])
+            return
         self._prev_hmac = self._recover_chain_tail()
         self._synced_path = log_path
         self._synced_stamp = _segment_stamp(log_path)

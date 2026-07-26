@@ -978,6 +978,29 @@ class AuditChainStore:
         return self._log.resync_head()
 
     @property
+    def audit_dir(self) -> Path:
+        """The directory holding this chain's daily segments.
+
+        Exposed for the substrate that writes signed records *beside* the
+        chain (checkpoints, charter head pins): those records live under the
+        audit directory and must be keyed to the same store the chain append
+        went through.
+        """
+        return self._log._audit_dir  # pyright: ignore[reportPrivateUsage]
+
+    @property
+    def hmac_key(self) -> bytes:
+        """The HMAC key this chain signs with.
+
+        Checkpoint-adjacent records (charter head pins) are signed with the
+        same key as the chain itself, so a verifier that can authenticate the
+        chain can authenticate them with the same secret; signing them with a
+        separately resolved key would silently fork the trust root whenever a
+        store was constructed with an explicit key.
+        """
+        return self._log._key  # pyright: ignore[reportPrivateUsage]
+
+    @property
     def prev_chain_digest(self) -> str:
         """Return the HMAC of the most recent event (the chain head).
 

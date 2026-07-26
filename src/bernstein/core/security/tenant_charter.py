@@ -88,8 +88,10 @@ __all__ = [
     "load_charter_segment",
     "next_event",
     "open_event",
+    "read_charter_entries",
     "read_charter_events",
     "record_charter_event",
+    "refreshed_charter_events",
     "verify_charter",
     "verify_charter_events",
     "verify_charter_from_entries",
@@ -763,6 +765,7 @@ def _verdict_for(events: Sequence[CharterEvent], tenant_id: str) -> CharterVerif
 def _require_current_predecessor(
     chain: AuditChainStore,
     event: CharterEvent,
+    prior_entries: Sequence[AuditEvent] | None = None,
 ) -> None:
     """Refuse *event* unless the recorded tail is exactly the predecessor it claims.
 
@@ -777,20 +780,28 @@ def _require_current_predecessor(
     corrupt the fold).
 
     The caller must already hold :meth:`AuditChainStore.chain_transaction`,
-    otherwise the tail this reads can move before the append lands. The full
-    history is re-read here: charter histories are small (one event per
-    lifecycle change, not per run), so the read costs the guarded section
-    little, and it is what makes the check exact rather than incremental.
+    otherwise the tail this reads can move before the append lands. With
+    *prior_entries* supplied, only live segments are read here (see
+    :func:`refreshed_charter_events`), which is what keeps the exclusive
+    section from holding an archive-wide decompression; without it the full
+    history is re-read, which is exact but costs the section O(total history
+    bytes) once retention has archived anything.
 
     Args:
         chain: The store to check against.
         event: The event about to be appended.
+        prior_entries: Optional full-history charter read (see
+            :func:`read_charter_entries`) taken before the section.
 
     Raises:
         CharterChainError: with reason ``"stale_predecessor"`` when the recorded
             tail is not the event's declared predecessor.
     """
-    recorded = read_charter_events(chain, event.tenant_id)
+    recorded = (
+        refreshed_charter_events(chain, event.tenant_id, prior_entries)
+        if prior_entries is not None
+        else read_charter_events(chain, event.tenant_id)
+    )
     if not recorded:
         if event.seq != 0 or event.prev_event_hash != CHARTER_GENESIS:
             raise CharterChainError(
@@ -816,6 +827,8 @@ def _require_current_predecessor(
 def record_charter_event(
     chain: AuditChainStore,
     event: CharterEvent,
+    *,
+    prior_entries: Sequence[AuditEvent] | None = None,
 ) -> str:
     """Append *event* to the HMAC audit chain and return its content address.
 
@@ -831,27 +844,42 @@ def record_charter_event(
     than interleaving. Appending an event whose predecessor is no longer the
     tail is refused rather than written: the log is append-only, so a duplicate
     ``seq`` can never be removed and the fold would stay unreadable forever.
-    Charter histories are small (one event per lifecycle change), so holding
-    the section across the read is cheap.
+
+    Pass *prior_entries* - a full-history charter read taken with
+    :func:`read_charter_entries` at any earlier moment - to keep the in-section
+    read bounded: only live segments are re-read under the lock and merged
+    onto the pre-read history (see :func:`refreshed_charter_events`). Without
+    it the section holds a full-history read, whose cost is O(total history
+    bytes) once retention has archived anything - every archived segment is
+    decompressed while every other audit writer in every process waits.
 
     The record is written durably: a charter event is a decision someone acts
     on, and an append that returns from the page cache can be dropped off the
     tail of the newest segment by a host crash, silently reverting the change
-    with every verifier still reporting the chain as healthy.
+    with every verifier still reporting the chain as healthy. The append also
+    advances the tenant's durable head pin
+    (:func:`bernstein.core.persistence.chain_checkpoint.record_charter_head`)
+    under the same section: the pin is the detector for whole-record tail loss
+    the chain walk, the fold, and a not-yet-taken seal cannot see. Pin first
+    would pin an event that may never land, so the chain append goes first; a
+    crash between the two leaves the pin one event behind, which is never a
+    conflict.
 
     Args:
         chain: The store to append to.
         event: The charter event to record.
+        prior_entries: Optional full-history charter read (see above).
 
     Raises:
         CharterChainError: with reason ``"stale_predecessor"`` when the recorded
             tail is not the predecessor *event* was minted against.
     """
+    from bernstein.core.persistence.chain_checkpoint import record_charter_head
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
     details: dict[str, Any] = {"charter": event.to_body(), "tenant_id": event.tenant_id}
     with chain.chain_transaction():
-        _require_current_predecessor(chain, event)
+        _require_current_predecessor(chain, event, prior_entries)
         chain.log_with_prev_digest(
             event_type=EVENT_TENANT_CHARTER,
             actor=event.principal,
@@ -859,6 +887,13 @@ def record_charter_event(
             resource_id=event.tenant_id,
             details=details,
             durable=True,
+        )
+        record_charter_head(
+            chain.audit_dir,
+            chain.hmac_key,
+            tenant_id=event.tenant_id,
+            seq=event.seq,
+            event_hash=event.event_hash(),
         )
     return event.event_hash()
 
@@ -879,12 +914,13 @@ def read_charter_events(
 
     Takes no lock of its own, so it works on a read-only copy of the audit
     directory, where opening the lock sentinel for writing would fail. A caller
-    that *decides and then appends* on what this returns must call it inside
-    :meth:`AuditChainStore.chain_transaction` (the section is re-entrant, and
-    :meth:`AuditLog.archive` publishes a segment's ``.gz``-swap and unlink
-    under the same section, so a read holding it can never straddle the
-    archive window and see a day twice or not at all). A read-only caller
-    needs no section: a genuinely read-only snapshot has no concurrent
+    that *decides and then appends* on what this returns uses the two-phase
+    shape instead of calling this inside the section: take the full-history
+    entries with :func:`read_charter_entries` before the section, then rebuild
+    inside it with :func:`refreshed_charter_events`, which re-reads live
+    segments only - holding the exclusive section across an archive-wide
+    decompression stalls every audit writer in every process. A read-only
+    caller needs no section: a genuinely read-only snapshot has no concurrent
     archiver, so the unlocked read is exact there.
 
     Args:
@@ -894,10 +930,72 @@ def read_charter_events(
     Raises:
         CharterChainError: if a recorded event body cannot be rebuilt.
     """
+    return charter_events_from_entries(read_charter_entries(chain, tenant_id), tenant_id)
+
+
+def read_charter_entries(
+    chain: AuditChainStore,
+    tenant_id: str,
+) -> list[AuditEvent]:
+    """Read one tenant's raw charter chain entries, full history, no lock.
+
+    This is the expensive half of the two-phase write read: it decompresses
+    every archived segment, so a write command runs it *before* entering the
+    append section and hands the result to :func:`refreshed_charter_events`
+    inside it. Holding the exclusive cross-process section across this read
+    would stall every audit writer in every process for a duration that grows
+    with total history size.
+
+    Args:
+        chain: The store to read from.
+        tenant_id: The tenant whose charter entries to read.
+    """
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
 
-    entries = chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True)
-    return charter_events_from_entries(entries, tenant_id)
+    return chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=True)
+
+
+def refreshed_charter_events(
+    chain: AuditChainStore,
+    tenant_id: str,
+    prior_entries: Sequence[AuditEvent],
+) -> list[CharterEvent]:
+    """Bring a pre-section full-history read up to date, reading live segments only.
+
+    The caller holds :meth:`AuditChainStore.chain_transaction` and took
+    *prior_entries* with :func:`read_charter_entries` before entering it. The
+    merge is exact rather than heuristic: every charter append lands in the
+    current day's live segment, and retention never archives the current day,
+    so any event recorded after *prior_entries* was taken is present in the
+    live re-read. Entries are identified by their chain ``hmac`` (unique by
+    construction: it covers the predecessor digest), so the overlap between
+    the two reads - segments live at both moments, or a day observed both
+    live and archived while retention published it - deduplicates without
+    dropping anything the fold needs to see.
+
+    Staleness of *prior_entries* is therefore safe; an *incomplete* list is
+    not - it must be a genuine full-history read, or archived events would be
+    invisible to the fold and the duplicate/predecessor guards.
+
+    Args:
+        chain: The store to read from (inside its transaction).
+        tenant_id: The tenant whose charter to rebuild.
+        prior_entries: Full-history charter entries read before the section.
+
+    Raises:
+        CharterChainError: if a recorded event body cannot be rebuilt.
+    """
+    from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
+
+    live = chain.query(event_type=EVENT_TENANT_CHARTER, resource_id=tenant_id, include_archived=False)
+    merged: list[AuditEvent] = []
+    seen: set[str] = set()
+    for entry in [*prior_entries, *live]:
+        if entry.hmac in seen:
+            continue
+        seen.add(entry.hmac)
+        merged.append(entry)
+    return charter_events_from_entries(merged, tenant_id)
 
 
 def charter_events_from_entries(entries: Sequence[AuditEvent], tenant_id: str) -> list[CharterEvent]:

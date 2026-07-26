@@ -75,11 +75,21 @@ CHECKPOINTS_SUBDIR = "checkpoints"
 #: File name of the append-only checkpoint log.
 CHECKPOINTS_FILE = "checkpoints.jsonl"
 
+#: File name of the append-only charter head pin log (same directory).
+CHARTER_HEADS_FILE = "charter-heads.jsonl"
+
+#: Schema version for charter head pin payloads.
+CHARTER_HEAD_VERSION = 1
+
 #: ``prev_checkpoint_sha256`` of the first checkpoint in a file.
 GENESIS_PREV = "0" * 64
 
 #: Ack detail key that authorises advancing past a conflicting checkpoint.
 ACK_CHECKPOINT_ROOT_KEY = "checkpoint_root"
+
+#: Ack detail key that authorises a charter head regression: the value must be
+#: the pinned ``event_hash`` the acknowledged history no longer reaches.
+ACK_CHARTER_HEAD_KEY = "charter_head"
 
 
 class CheckpointFileError(RuntimeError):
@@ -548,6 +558,314 @@ def authorize_divergence(
 
 
 # ---------------------------------------------------------------------------
+# Charter head pins
+# ---------------------------------------------------------------------------
+#
+# The checkpoint above pins what existed at seal time; records appended after
+# the pin are outside its coverage until the next seal. Charter events are
+# exactly the records for which that window is unacceptable: a revocation is a
+# decision someone acts on, its loss folds away silently (a shorter charter
+# history still folds and still HMAC-verifies, one version behind), and the
+# Merkle seal only binds bytes it already sealed. So every charter append also
+# records a **head pin** - ``(tenant_id, seq, event_hash)`` - in an
+# append-only, audit-key-signed, predecessor-linked file beside the
+# checkpoints, fsynced under the same append section as the chain record it
+# pins. A history whose fold is behind its pinned head (or whose event at the
+# pinned seq no longer hashes to the pin) conflicts until an operator
+# acknowledges it with ``bernstein audit ack-tear``; sealing refuses over an
+# unacknowledged conflict rather than adopting the shrunk history.
+#
+# The last valid pin *in file order* is authoritative, per tenant. Forward
+# motion is the normal case (every charter write appends the new head); a pin
+# that moves backwards exists only on the acknowledged-recovery path, where
+# the next charter write supersedes the conflicting pin at the tenant's
+# current head. The same residual documented for checkpoints applies: an
+# actor with write access to both the chain and this file can truncate both
+# to a mutually consistent earlier state.
+
+
+@dataclass(frozen=True)
+class CharterHeadPin:
+    """The durable head one tenant's charter last advanced to.
+
+    Attributes:
+        tenant_id: The tenant whose charter this pins.
+        seq: Sequence number of the pinned head event.
+        event_hash: Recomputed content address of that event.
+    """
+
+    tenant_id: str
+    seq: int
+    event_hash: str
+
+
+class CharterHeadRegressionError(RuntimeError):
+    """Raised when a charter's recorded history is behind its pinned head.
+
+    Carries the structured conflicts so the CLI can name the tenant, the
+    pinned sequence number, and the acknowledgement an operator would record.
+    """
+
+    def __init__(self, conflicts: list[CheckpointConflict]) -> None:
+        self.conflicts = conflicts
+        lines = "; ".join(f"{c.segment}: {c.detail}" for c in conflicts[:3])
+        super().__init__(f"Tenant charter heads regressed behind their durable pins; refusing: {lines}")
+
+
+def charter_heads_path(audit_dir: Path) -> Path:
+    """Return the append-only charter head pin file path for *audit_dir*."""
+    return audit_dir / CHECKPOINTS_SUBDIR / CHARTER_HEADS_FILE
+
+
+def _load_charter_head_file(audit_dir: Path, key: bytes) -> tuple[dict[str, CharterHeadPin], str]:
+    """Validate the pin file; return ``(pins_by_tenant, prev_sha_for_append)``.
+
+    Same discipline as :func:`load_checkpoints`: every complete line must
+    parse, carry a valid audit-key HMAC, and link to the SHA-256 of its
+    predecessor's canonical form; a torn trailing fragment is a
+    crash-interrupted append and is skipped, leaving the previous pin in
+    force. Anything else raises :class:`CheckpointFileError`.
+    """
+    path = charter_heads_path(audit_dir)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}, GENESIS_PREV
+    except OSError as exc:
+        raise CheckpointFileError([f"unreadable charter head pin file: {exc}"]) from exc
+    if not raw:
+        return {}, GENESIS_PREV
+
+    lines = raw.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+
+    pins: dict[str, CharterHeadPin] = {}
+    errors: list[str] = []
+    prev_sha = GENESIS_PREV
+    last_index = len(lines) - 1
+    for line_no, line in enumerate(lines):
+        is_last = line_no == last_index
+        try:
+            doc = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if is_last:
+                break  # crash-interrupted append: previous pin stays in force
+            errors.append(f"{CHARTER_HEADS_FILE}:{line_no + 1}: unparsable committed line")
+            break
+        if not isinstance(doc, dict):
+            errors.append(f"{CHARTER_HEADS_FILE}:{line_no + 1}: not a JSON object")
+            break
+        doc = cast("dict[str, Any]", doc)
+        payload = doc.get("payload")
+        if not isinstance(payload, dict):
+            errors.append(f"{CHARTER_HEADS_FILE}:{line_no + 1}: missing payload")
+            break
+        payload = cast("dict[str, Any]", payload)
+        if not _hmac.compare_digest(str(doc.get("hmac", "")), _sign(payload, key)):
+            errors.append(f"{CHARTER_HEADS_FILE}:{line_no + 1}: signature mismatch")
+            break
+        if str(payload.get("prev_pin_sha256", "")) != prev_sha:
+            errors.append(f"{CHARTER_HEADS_FILE}:{line_no + 1}: predecessor linkage broken")
+            break
+        if payload.get("version") != CHARTER_HEAD_VERSION:
+            errors.append(f"{CHARTER_HEADS_FILE}:{line_no + 1}: unsupported version {payload.get('version')!r}")
+            break
+        tenant_id = str(payload.get("tenant_id", ""))
+        pins[tenant_id] = CharterHeadPin(
+            tenant_id=tenant_id,
+            seq=int(payload.get("seq", 0) or 0),
+            event_hash=str(payload.get("event_hash", "")),
+        )
+        prev_sha = _record_sha256(doc)
+
+    if errors:
+        raise CheckpointFileError(errors)
+    return pins, prev_sha
+
+
+def load_charter_heads(audit_dir: Path, key: bytes) -> dict[str, CharterHeadPin]:
+    """Read and validate the charter head pins, newest per tenant.
+
+    Raises:
+        CheckpointFileError: On any committed-line validation failure.
+    """
+    pins, _prev_sha = _load_charter_head_file(audit_dir, key)
+    return pins
+
+
+def record_charter_head(audit_dir: Path, key: bytes, *, tenant_id: str, seq: int, event_hash: str) -> None:
+    """Append the pin for *tenant_id*'s new charter head, durably.
+
+    Runs under the chain's cross-process append section (re-entrant for the
+    thread already holding it, which is how the charter append path calls
+    this), so two writers cannot fork the pin file's predecessor linkage.
+    Idempotent for an unchanged head.
+    """
+    from bernstein.core.security.audit import _chain_append_lock
+
+    with _chain_append_lock(audit_dir):
+        pins, prev_sha = _load_charter_head_file(audit_dir, key)
+        current = pins.get(tenant_id)
+        if current is not None and current.seq == seq and current.event_hash == event_hash:
+            return
+        payload: dict[str, Any] = {
+            "version": CHARTER_HEAD_VERSION,
+            "tenant_id": tenant_id,
+            "seq": seq,
+            "event_hash": event_hash,
+            "prev_pin_sha256": prev_sha,
+        }
+        doc = {"payload": payload, "hmac": _sign(payload, key)}
+        path = charter_heads_path(audit_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = _canonical(doc) + b"\n"
+        # Append + fsync: the pin is the only durable statement that this head
+        # ever existed, written to survive exactly the crash class that makes
+        # the chain's own tail loss invisible.
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def check_charter_heads(
+    audit_dir: Path,
+    key: bytes,
+    *,
+    entries: list[Any] | None = None,
+) -> list[CheckpointConflict]:
+    """Compare every pinned charter head against the recorded history's fold.
+
+    Returns one conflict per tenant whose history no longer reaches its pin:
+    ``charter_head_behind`` when the recorded events end before the pinned
+    seq (tail loss), ``charter_head_mismatch`` when an event exists at the
+    pinned seq but no longer hashes to the pin (rewrite). A tenant whose
+    recorded events cannot be rebuilt at all is left to the charter fold
+    pillar, which names the offending event more precisely than a head
+    comparison could.
+
+    Args:
+        audit_dir: The audit directory.
+        key: Audit HMAC key.
+        entries: Optional pre-read chain entries of the charter event type
+            (archived segments included), so a verifier that already walked
+            the chain does not read it again.
+
+    Raises:
+        CheckpointFileError: When the pin file itself fails validation.
+    """
+    pins = load_charter_heads(audit_dir, key)
+    if not pins:
+        return []
+
+    from bernstein.core.security.audit import AuditLog
+    from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER
+    from bernstein.core.security.tenant_charter import CharterChainError, charter_events_from_entries
+
+    if entries is None:
+        entries = list(AuditLog(audit_dir, key=key).query(event_type=EVENT_TENANT_CHARTER, include_archived=True))
+
+    conflicts: list[CheckpointConflict] = []
+    for tenant_id in sorted(pins):
+        pin = pins[tenant_id]
+        try:
+            events = charter_events_from_entries(entries, tenant_id)
+        except CharterChainError:
+            continue
+        top = max((event.seq for event in events), default=-1)
+        segment = f"charter:{tenant_id}"
+        if top < pin.seq:
+            recorded = f"the recorded history ends at seq {top}" if events else "no charter events are recorded"
+            conflicts.append(
+                CheckpointConflict(
+                    kind="charter_head_behind",
+                    segment=segment,
+                    offset=pin.seq,
+                    detail=(f"charter head pinned at seq {pin.seq} but {recorded} (events after the pin are gone)"),
+                )
+            )
+            continue
+        if not any(event.seq == pin.seq and event.event_hash() == pin.event_hash for event in events):
+            conflicts.append(
+                CheckpointConflict(
+                    kind="charter_head_mismatch",
+                    segment=segment,
+                    offset=pin.seq,
+                    detail=(
+                        f"the recorded event at seq {pin.seq} no longer matches the pinned "
+                        f"charter head {pin.event_hash}"
+                    ),
+                )
+            )
+    return conflicts
+
+
+def find_charter_head_acks(audit_dir: Path, key: bytes) -> dict[tuple[str, int], dict[str, Any]]:
+    """Return charter-head acknowledgements keyed by ``(segment, offset)``.
+
+    An acknowledgement is a ``chain.tear_acknowledged`` record whose details
+    carry :data:`ACK_CHARTER_HEAD_KEY` naming the pinned event hash. It is
+    chain-resident, so it is exactly as tamper-evident as the loss it clears.
+    """
+    from bernstein.core.security.audit import EVENT_CHAIN_TEAR_ACKNOWLEDGED, AuditLog
+
+    acks: dict[tuple[str, int], dict[str, Any]] = {}
+    log = AuditLog(audit_dir, key=key)
+    for event in log.query(event_type=EVENT_CHAIN_TEAR_ACKNOWLEDGED, include_archived=True):
+        details = event.details or {}
+        if not str(details.get(ACK_CHARTER_HEAD_KEY, "")):
+            continue
+        segment = str(details.get("segment", ""))
+        offset = int(details.get("byte_offset", -1) or 0)
+        if segment:
+            acks[segment, offset] = details
+    return acks
+
+
+def unacknowledged_charter_head_conflicts(
+    audit_dir: Path,
+    key: bytes,
+    *,
+    entries: list[Any] | None = None,
+) -> list[CheckpointConflict]:
+    """Charter head conflicts no operator has acknowledged yet.
+
+    A conflict is acknowledged only by an ack naming its exact
+    ``(segment, offset)`` and the pinned event hash, so an acknowledgement
+    recorded for one loss cannot silently cover the next one.
+    """
+    conflicts = check_charter_heads(audit_dir, key, entries=entries)
+    if not conflicts:
+        return []
+    pins = load_charter_heads(audit_dir, key)
+    acks = find_charter_head_acks(audit_dir, key)
+    outstanding: list[CheckpointConflict] = []
+    for conflict in conflicts:
+        tenant_id = conflict.segment.removeprefix("charter:")
+        pin = pins.get(tenant_id)
+        ack = acks.get((conflict.segment, conflict.offset))
+        if pin is not None and ack is not None and str(ack.get(ACK_CHARTER_HEAD_KEY, "")) == pin.event_hash:
+            continue
+        outstanding.append(conflict)
+    return outstanding
+
+
+def enforce_charter_heads(audit_dir: Path, key: bytes) -> None:
+    """Raise unless every charter head pin is reached or acknowledged.
+
+    Raises:
+        CharterHeadRegressionError: On any unacknowledged regression.
+        CheckpointFileError: When the pin file fails validation.
+    """
+    conflicts = unacknowledged_charter_head_conflicts(audit_dir, key)
+    if conflicts:
+        raise CharterHeadRegressionError(conflicts)
+
+
+# ---------------------------------------------------------------------------
 # Advance (append) after a successful seal
 # ---------------------------------------------------------------------------
 
@@ -667,21 +985,32 @@ def _record_checkpoint_locked(
 
 
 __all__ = [
+    "ACK_CHARTER_HEAD_KEY",
     "ACK_CHECKPOINT_ROOT_KEY",
+    "CHARTER_HEADS_FILE",
+    "CHARTER_HEAD_VERSION",
     "CHECKPOINTS_FILE",
     "CHECKPOINTS_SUBDIR",
     "CHECKPOINT_VERSION",
+    "CharterHeadPin",
+    "CharterHeadRegressionError",
     "CheckpointConflict",
     "CheckpointConsistencyError",
     "CheckpointFileError",
     "CheckpointFileState",
     "authorize_divergence",
     "chain_snapshot",
+    "charter_heads_path",
+    "check_charter_heads",
     "check_extension",
     "checkpoints_path",
     "compute_origin",
     "count_entries",
+    "enforce_charter_heads",
+    "find_charter_head_acks",
     "find_divergence_acks",
+    "load_charter_heads",
     "load_checkpoints",
-    "record_checkpoint",
+    "record_charter_head",
+    "unacknowledged_charter_head_conflicts",
 ]

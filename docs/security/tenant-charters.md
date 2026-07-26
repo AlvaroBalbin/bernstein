@@ -69,34 +69,47 @@ go unnoticed:
 | Edit a recorded event's timestamp or body | successor's `prev_event_hash` no longer matches | `CharterChainError(reason="broken_link")` naming the orphaned seq |
 | Same, on disk | chain HMAC over `details` | `bernstein audit verify` fails |
 | Reorder or delete an event **other than the newest** | `seq` contiguity + hash linkage | `gap` / `broken_link` |
-| Delete the newest event(s) | not detected by `tenant verify`; see below | none |
+| Delete the newest event(s) | durable charter head pin; see below | `charter_head_behind` conflict |
 | Splice a sibling tenant's events in | tenant-id equality across the segment | `tenant_mismatch` |
 
 `bernstein tenant verify <id>` runs both layers and exits non-zero on either,
 printing the reason and the offending sequence number.
 
-### The newest event is the blind spot
+### The newest event was the blind spot; the head pin closes it
 
-Both detectors are internal to the recorded segment: contiguity and hash linkage
-compare each event against the one before it. Cutting events off the *end* leaves
-a shorter history that is still contiguous and still correctly linked, so
-`tenant verify` folds it and reports `OK`, one version behind. A revocation
-removed that way reads as if it never happened, and `tenant slice` will sign the
-reverted membership.
+Both fold detectors are internal to the recorded segment: contiguity and hash
+linkage compare each event against the one before it. Cutting events off the
+*end* leaves a shorter history that is still contiguous and still correctly
+linked, so the fold reads it as healthy, one version behind. A revocation
+removed that way would read as if it never happened. The Merkle seal cannot
+close this on its own: it only binds bytes it already sealed, so a truncation
+back to the last seal boundary passes it, and loss of records appended after
+the seal used to be adopted by the next ordinary `bernstein audit seal`.
 
-Two things close it, and they cover different causes:
+Three layers close it, and they cover different causes:
 
 - **A crash cannot cause it.** Charter events are written durably: `create`,
   `grant` and `revoke` return only once the record is on stable storage, so an
   acknowledged charter change is not in the group of records a host crash drops
   off the tail. See "What an append guarantees against a crash" in
   [audit-log.md](audit-log.md).
-- **Deliberate truncation is caught by the Merkle seal, not by this layer.**
-  `bernstein audit seal` binds each segment's whole byte content, so a truncated
-  segment fails the Merkle pillar of a full `bernstein audit verify`. It needs a
-  seal to compare against, and `bernstein audit verify --hmac-only` does not
-  consult it: run the full verify from the alerting job and pair it with a
-  sealing job.
+- **Host-level tail loss and truncation are caught by the charter head pin.**
+  Every charter append also records `(tenant_id, seq, event_hash)` in
+  `.sdd/audit/checkpoints/charter-heads.jsonl` - append-only, signed with the
+  audit key, predecessor-linked, and fsynced under the same append section as
+  the chain record it pins. A history whose fold is behind its pinned head (or
+  whose event at the pinned seq no longer matches it) fails the tenant-charter
+  pillar of `bernstein audit verify`, fails `tenant verify`, blocks
+  `bernstein audit seal`, and blocks `tenant slice` / `tenant showback`. The
+  conflict does not depend on a seal ever having been taken and does not clear
+  itself; after investigating, acknowledge it with
+  `bernstein audit ack-tear --segment charter:<tenant> --offset <pinned seq>
+  --reason "..."`. The acknowledgement is a chain record naming the pinned
+  head, so it authorises exactly one loss, and the evidence stays recorded.
+- **Truncation of already-sealed bytes is caught by the checkpoint pillar**,
+  which pins entry counts and byte prefixes at seal time; see
+  [audit-log.md](audit-log.md). `bernstein audit verify --hmac-only` consults
+  neither seal-derived pillar: run the full verify from the alerting job.
 
 A recorded body that cannot be interpreted at all — a rewritten `budget_usd`,
 quota, principal, or role — is reported as `malformed_body` (or
@@ -154,9 +167,18 @@ So a write command holds the chain's cross-process append section - a blocking
 `flock` on `.sdd/audit/.chain.lock`, the same section every chained append in
 the deployment takes - across read + decide + append. A second writer waits for
 the section rather than racing it, then reads the winner's event and applies to
-the new tail. A charter's history is one event per lifecycle change, not per
-run, so the read the section holds is small; the section is re-entrant for the
-holding thread and exclusive against every other thread and process.
+the new tail. The section is re-entrant for the holding thread and exclusive
+against every other thread and process.
+
+The read under the section is bounded. Charter reads cover the full history,
+archived segments included, and decompressing the archive under the exclusive
+section would stall every audit writer in every process for a duration that
+grows with total history size. Write commands therefore read in two phases:
+the full-history read runs *before* the section, and inside it only live
+segments are re-read and merged onto the pre-read history. The merge is exact,
+not heuristic - a competing writer's append lands in the current day's live
+segment, and retention never archives the current day, so nothing recorded
+between the two phases can be missed.
 
 The append is **durable**: a charter event is a decision someone acts on, so it
 is flushed to stable storage before the command returns. An append that only
@@ -169,6 +191,7 @@ Two outcomes are reported, and the distinction matters:
 |---|---|---|
 | Another writer opened this charter first | `a charter already exists for tenant 'acme'`, exit 1 | Nothing. This is the same answer you would get running the commands a minute apart. |
 | The audit directory is not writable | `Error: the audit directory is not writable ...`, exit 1 | Run the write command where `.sdd/audit` is writable. The read-only commands work in place. |
+| An export target is not writable | `Error: cannot write the slice bundle: ... not writable ...`, exit 1 | Pass `--out` pointing at a writable location. Reading stays possible on the read-only copy. |
 
 Do not delete `.sdd/audit/.chain.lock` to "unstick" anything: the lock's
 identity is the file's inode, so a fresh file admits a second writer alongside
@@ -187,10 +210,19 @@ Read-only commands - `tenant show`, `tenant verify`, `tenant slice`,
 `tenant showback` - take no lock at all. They work on a read-only copy of the
 audit directory (an incident snapshot, a mounted archive), where even opening
 the lock sentinel for writing would fail; a genuinely read-only copy has no
-concurrent archiver, so the unlocked read is exact there. `tenant slice` and
-`tenant showback` still refuse to mint an export when `bernstein audit verify`
-rejects the chain, because a bundle whose slice-local chain verifies cleanly
-must not launder a source history that does not.
+concurrent archiver, so the unlocked read is exact there.
+
+`tenant slice` and `tenant showback` refuse to mint an export from a chain
+state `bernstein audit verify` reports as damaged, because a bundle whose
+slice-local chain verifies cleanly must not launder a source history that does
+not. The refusal runs one shared gate over the damage-detecting pillars: the
+HMAC walk with its tear model, checkpoint extension of the last signed pin,
+the charter head pins, and the exporting tenant's own charter fold. The gate
+deliberately does not compare current file hashes against the last Merkle
+seal: any legitimate append after a seal changes every file hash, so that
+comparison separates "sealed just now" from "sealed a while ago" rather than
+damage from health, and the rewrite-of-sealed-bytes case it would catch is
+already the checkpoint pillar's prefix check.
 
 ## Certificates: what a run may do
 

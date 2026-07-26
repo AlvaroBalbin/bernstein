@@ -311,6 +311,10 @@ def compute_seal(
         bernstein.core.persistence.chain_checkpoint.CheckpointConsistencyError:
             If *checkpoint_gate* is set and the tree does not extend the last
             checkpoint (and no chain-resident acknowledgement authorises it).
+        bernstein.core.persistence.chain_checkpoint.CharterHeadRegressionError:
+            If *checkpoint_gate* is set and a tenant charter's recorded
+            history folds behind its durable head pin (and no chain-resident
+            acknowledgement authorises it).
     """
     if not audit_dir.is_dir():
         msg = f"Audit directory does not exist: {audit_dir}"
@@ -322,7 +326,15 @@ def compute_seal(
         raise ValueError(msg)
 
     if checkpoint_gate:
-        _enforce_checkpoint_extension(audit_dir, _resolve_key(key, key_path))
+        gate_key = _resolve_key(key, key_path)
+        _enforce_checkpoint_extension(audit_dir, gate_key)
+        # Charter head pins are the checkpoint's counterpart for records the
+        # last seal never covered: a charter history that folds behind its
+        # durable pin (post-seal tail loss, or loss before any seal existed)
+        # must not be adopted by a fresh seal, or the loss is laundered on
+        # the schedule of a cron job. Conflicts persist until acknowledged
+        # via 'bernstein audit ack-tear --segment charter:<tenant>'.
+        _enforce_charter_heads(audit_dir, gate_key)
 
     if verify_chain:
         _enforce_chain_verifies(audit_dir, key=key, key_path=key_path)
@@ -384,6 +396,13 @@ def _enforce_checkpoint_extension(audit_dir: Path, key: bytes) -> None:
     acks = find_divergence_acks(audit_dir, key, str(prev.get("root_hash", "")))
     if authorize_divergence(conflicts, acks) is None:
         raise CheckpointConsistencyError(prev, conflicts)
+
+
+def _enforce_charter_heads(audit_dir: Path, key: bytes) -> None:
+    """Refuse unless every tenant charter head pin is reached or acknowledged."""
+    from bernstein.core.persistence.chain_checkpoint import enforce_charter_heads
+
+    enforce_charter_heads(audit_dir, key)
 
 
 def _enforce_chain_verifies(

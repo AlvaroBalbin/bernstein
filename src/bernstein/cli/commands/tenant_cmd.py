@@ -7,10 +7,13 @@ it, ``show`` and ``verify`` fold it, and ``slice`` / ``showback`` /
 
 Write commands hold the chain's cross-process append section
 (:meth:`AuditChainStore.chain_transaction`) across read + decide + append, so
-two operators editing one charter are serialised rather than raced. Read-only
-commands take no lock at all: they must work on a read-only copy of the audit
-directory - an incident snapshot, a mounted archive - where even opening the
-lock sentinel for writing would fail.
+two operators editing one charter are serialised rather than raced. The read
+under the section is bounded: the full-history read (archives decompressed)
+runs before the section, and only live segments are re-read inside it, so the
+exclusive hold does not grow with total history size. Read-only commands take
+no lock at all: they must work on a read-only copy of the audit directory -
+an incident snapshot, a mounted archive - where even opening the lock
+sentinel for writing would fail.
 
 The verbs are ``tenant`` rather than ``team`` or ``workspace``: ``team`` is
 taken by agent role manifests and ``workspace`` by multi-repo management.
@@ -82,7 +85,7 @@ def _charter_write_section(chain: Any) -> Iterator[None]:
         raise click.ClickException(f"could not hold the audit chain's append section: {exc}") from exc
 
 
-def _append_charter_event(chain: Any, event: Any) -> None:
+def _append_charter_event(chain: Any, event: Any, prior_entries: list[Any]) -> None:
     """Append a minted charter event, turning a refusal into an ``Error:`` line.
 
     ``record_charter_event`` refuses an event whose declared predecessor is no
@@ -91,33 +94,44 @@ def _append_charter_event(chain: Any, event: Any) -> None:
     recording API is public and a refusal must read as a refusal, not as a
     traceback an operator cannot tell from a broken tool.
 
+    *prior_entries* is the command's pre-section full-history read, passed
+    through so the predecessor check re-reads live segments only instead of
+    decompressing the archive under the exclusive section.
+
     The message ``CharterChainError`` carries already names the offending seq
     and says to re-read and mint again, so it is passed through unchanged.
     """
     from bernstein.core.security.tenant_charter import CharterChainError, record_charter_event
 
     try:
-        record_charter_event(chain, event)
+        record_charter_event(chain, event, prior_entries=prior_entries)
     except CharterChainError as exc:
         raise click.ClickException(str(exc)) from exc
 
 
-def _refuse_unverified_chain(chain: Any, *, tenant_id: str, minting: str) -> None:
+def _refuse_unverified_chain(workdir: Path, *, tenant_id: str, minting: str) -> None:
     """Refuse to mint an export from a chain state ``audit verify`` rejects.
 
     A slice or a statement is a claim a second party recomputes. Minting one
-    from a chain whose HMAC walk fails would launder the damage: the bundle's
-    slice-local chain verifies cleanly even when the history it was cut from
-    does not. The refusal names the first error and the command that shows
-    the rest.
+    from a damaged chain would launder the damage: the bundle's slice-local
+    chain verifies cleanly even when the history it was cut from does not.
+
+    The verdict is the shared export gate
+    (:func:`bernstein.core.security.audit_export_gate.export_gate_errors`),
+    not the HMAC walk alone: a truncation back to a record boundary keeps the
+    walk green while the checkpoint pillar reports divergence, and post-seal
+    charter tail loss is visible only to the charter head pins. The refusal
+    names the first error and the command that shows the rest.
     """
-    chain_ok, chain_errors = chain.verify()
-    if chain_ok:
+    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit_export_gate import export_gate_errors
+
+    errors = export_gate_errors(workdir / ".sdd" / "audit", load_or_create_audit_key(), tenant_id=tenant_id)
+    if not errors:
         return
-    first = chain_errors[0] if chain_errors else "-"
     raise click.ClickException(
         f"refusing to mint {minting} for {tenant_id!r}: the audit chain does not verify "
-        f"({len(chain_errors)} error(s); first: {first}). Run 'bernstein audit verify' and "
+        f"({len(errors)} error(s); first: {errors[0]}). Run 'bernstein audit verify' and "
         "resolve the damage first."
     )
 
@@ -159,7 +173,8 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
         CharterChainError,
         fold_charter,
         open_event,
-        read_charter_events,
+        read_charter_entries,
+        refreshed_charter_events,
     )
 
     chain = _chain(workdir)
@@ -169,22 +184,30 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
     # existing tenant once retention archived the opening day - an ownership
     # takeover requiring no forgery, just patience.
     #
+    # The read is two-phase. The expensive half - decompressing every archived
+    # segment - runs BEFORE the append section: holding the exclusive
+    # cross-process flock across it stalls every audit writer in every
+    # bernstein process for a duration that grows with total history size.
+    # Inside the section only live segments are re-read and merged onto the
+    # pre-read history, which is exact: a competing writer's append lands in
+    # the current day's live segment, and retention never archives the
+    # current day (see ``refreshed_charter_events``).
+    #
     # Guard, mint, and append run inside one cross-process append section.
     # Without it, two processes each reading "no charter exists" and each
     # appending an opening event leave a segment with two events claiming
     # seq 0: both records are individually valid, so the HMAC chain still
     # verifies while the fold is permanently unreadable. Inside the section
     # the second ``create`` reads the winner's opening and is refused.
-    # Charter histories are one event per lifecycle change, so the read the
-    # section holds is small.
     #
     # The opening is exactly one event, so the section wraps a single append.
     # That is deliberate: the section is exclusion, not atomicity, so a batch
     # interrupted midway would commit the prefix already written. See
     # ``open_event``.
+    prior_entries = read_charter_entries(chain, tenant_id)
     with _charter_write_section(chain):
         try:
-            existing = read_charter_events(chain, tenant_id)
+            existing = refreshed_charter_events(chain, tenant_id, prior_entries)
         except CharterChainError as exc:
             raise click.ClickException(
                 f"refusing to create {tenant_id!r}: its recorded charter history is unreadable ({exc}). "
@@ -199,7 +222,7 @@ def create_cmd(tenant_id: str, principal: str, role: str, budget_usd: str | None
         except CharterChainError as exc:
             raise click.ClickException(str(exc)) from exc
 
-        _append_charter_event(chain, event)
+        _append_charter_event(chain, event, prior_entries)
 
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
@@ -228,19 +251,23 @@ def grant_cmd(tenant_id: str, principal: str, role: str, actor: str | None, work
         CharterChainError,
         fold_charter,
         next_event,
-        read_charter_events,
+        read_charter_entries,
+        refreshed_charter_events,
     )
 
     chain = _chain(workdir)
     _warn_if_lock_degraded()
-    # Read, fold, mint, and append inside one append section: the event is
-    # minted against the tail the read observed, and no other writer can move
-    # that tail before the append lands. A concurrent charter write from
+    # Two-phase read (see ``create``): the archive-decompressing full-history
+    # read runs before the section; inside it only live segments are re-read.
+    # Fold, mint, and append stay inside the section: the event is minted
+    # against the tail the in-section read observed, and no other writer can
+    # move that tail before the append lands. A concurrent charter write from
     # another process waits on the section and then applies to the new tail -
     # serialised, not refused.
+    prior_entries = read_charter_entries(chain, tenant_id)
     with _charter_write_section(chain):
         try:
-            events = read_charter_events(chain, tenant_id)
+            events = refreshed_charter_events(chain, tenant_id, prior_entries)
             if not events:
                 raise click.ClickException(f"no charter for tenant {tenant_id!r}; run 'bernstein tenant create' first")
             current = fold_charter(events)
@@ -256,7 +283,7 @@ def grant_cmd(tenant_id: str, principal: str, role: str, actor: str | None, work
         except CharterChainError as exc:
             raise click.ClickException(str(exc)) from exc
 
-        _append_charter_event(chain, event)
+        _append_charter_event(chain, event, prior_entries)
 
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
@@ -282,17 +309,20 @@ def revoke_cmd(tenant_id: str, principal: str, actor: str | None, workdir: Path,
         CharterChainError,
         fold_charter,
         next_event,
-        read_charter_events,
+        read_charter_entries,
+        refreshed_charter_events,
     )
 
     chain = _chain(workdir)
     _warn_if_lock_degraded()
-    # Read, mint, and append inside one append section (see ``grant``). A
-    # revocation is a decision someone acts on, so the append underneath is
-    # durable: it survives a host crash rather than silently reverting.
+    # Two-phase read, then mint and append inside one append section (see
+    # ``grant``). A revocation is a decision someone acts on, so the append
+    # underneath is durable: it survives a host crash rather than silently
+    # reverting.
+    prior_entries = read_charter_entries(chain, tenant_id)
     with _charter_write_section(chain):
         try:
-            events = read_charter_events(chain, tenant_id)
+            events = refreshed_charter_events(chain, tenant_id, prior_entries)
             if not events:
                 raise click.ClickException(f"no charter for tenant {tenant_id!r}")
             event = next_event(
@@ -306,7 +336,7 @@ def revoke_cmd(tenant_id: str, principal: str, actor: str | None, workdir: Path,
         except CharterChainError as exc:
             raise click.ClickException(str(exc)) from exc
 
-        _append_charter_event(chain, event)
+        _append_charter_event(chain, event, prior_entries)
 
     payload = {"charter_hash": state.charter_hash(), "state": state.to_body()}
     _emit(
@@ -368,6 +398,11 @@ def verify_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
     offending event - never a traceback, which an operator cannot distinguish
     from a broken tool.
     """
+    from bernstein.core.persistence.chain_checkpoint import (
+        CheckpointFileError,
+        unacknowledged_charter_head_conflicts,
+    )
+    from bernstein.core.security.audit import load_or_create_audit_key
     from bernstein.core.security.tenant_charter import verify_charter
 
     chain = _chain(workdir)
@@ -379,12 +414,24 @@ def verify_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
     result = verify_charter(chain, tenant_id)
     chain_ok, chain_errors = chain.verify()
 
+    # The fold and the HMAC walk are both internal to the recorded bytes, so
+    # neither can see whole records cut off the tail. The durable head pin
+    # can; report it here so 'tenant verify' answers "is this the charter's
+    # true head", not just "does what remains fold".
+    try:
+        conflicts = unacknowledged_charter_head_conflicts(workdir / ".sdd" / "audit", load_or_create_audit_key())
+        head_errors = [conflict.detail for conflict in conflicts if conflict.segment == f"charter:{tenant_id}"]
+    except CheckpointFileError as exc:
+        head_errors = list(exc.errors)
+
     payload = result.to_dict()
     payload["audit_chain_ok"] = chain_ok
     payload["audit_chain_errors"] = chain_errors[:20]
+    payload["charter_head_ok"] = not head_errors
+    payload["charter_head_errors"] = head_errors
 
     lines: list[str]
-    if result.ok and chain_ok:
+    if result.ok and chain_ok and not head_errors:
         state = result.state
         lines = [
             f"[green]OK[/green] charter {tenant_id} folds cleanly (v{state.version if state else 0})",
@@ -397,9 +444,11 @@ def verify_cmd(tenant_id: str, workdir: Path, as_json: bool) -> None:
         if not chain_ok:
             first = chain_errors[0] if chain_errors else "-"
             lines.append(f"  audit chain: {len(chain_errors)} error(s); first: {first}")
+        for head_error in head_errors:
+            lines.append(f"  charter head: {head_error}")
 
     _emit(payload, as_json=as_json, lines=lines)
-    if not (result.ok and chain_ok):
+    if not (result.ok and chain_ok and not head_errors):
         raise SystemExit(1)
 
 
@@ -425,20 +474,32 @@ def slice_cmd(tenant_id: str, since: str, until: str, out: Path | None, workdir:
     # Read-only (no lock, works on a read-only snapshot), but not
     # unconditional: a slice is a claim a second party recomputes, so it is
     # never minted from a chain state 'bernstein audit verify' rejects.
-    _refuse_unverified_chain(chain, tenant_id=tenant_id, minting="an audit slice")
+    _refuse_unverified_chain(workdir, tenant_id=tenant_id, minting="an audit slice")
     try:
         state = load_charter(chain, tenant_id)
     except CharterChainError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    result = export_charter_slice(
-        workdir / ".sdd" / "audit",
-        state,
-        since=since,
-        until=until,
-        key=load_or_create_audit_key(),
-        output_dir=out,
-    )
+    # The default output directory sits beside the audit dir, and the module
+    # promise that read-only commands work on a read-only snapshot makes an
+    # unwritable target an ordinary operator situation: refuse by name, in
+    # the same shape as the write commands' refusal, never a traceback.
+    try:
+        result = export_charter_slice(
+            workdir / ".sdd" / "audit",
+            state,
+            since=since,
+            until=until,
+            key=load_or_create_audit_key(),
+            output_dir=out,
+        )
+    except PermissionError as exc:
+        raise click.ClickException(
+            f"cannot write the slice bundle: the output directory is not writable ({exc}); "
+            "pass --out pointing at a writable location."
+        ) from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot write the slice bundle: {exc}") from exc
     payload = result.to_dict()
     lines = [
         f"[green]Slice written[/green] for {tenant_id}: {result.export.event_count} event(s)",
@@ -483,7 +544,7 @@ def showback_cmd(
     # Read-only (no lock, works on a read-only snapshot), but a statement is a
     # billing claim anchored to the chain head, so it is never minted from a
     # chain state 'bernstein audit verify' rejects.
-    _refuse_unverified_chain(chain, tenant_id=tenant_id, minting="a showback statement")
+    _refuse_unverified_chain(workdir, tenant_id=tenant_id, minting="a showback statement")
     try:
         state = load_charter(chain, tenant_id)
     except CharterChainError as exc:
@@ -512,8 +573,16 @@ def showback_cmd(
     )
     raw = statement_bytes(statement)
     if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(raw)
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(raw)
+        except PermissionError as exc:
+            raise click.ClickException(
+                f"cannot write the statement: the output path is not writable ({exc}); "
+                "pass --out pointing at a writable location."
+            ) from exc
+        except OSError as exc:
+            raise click.ClickException(f"cannot write the statement: {exc}") from exc
 
     if as_json:
         click.echo(raw.decode("utf-8"))

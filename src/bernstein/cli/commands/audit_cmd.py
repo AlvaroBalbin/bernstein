@@ -44,6 +44,8 @@ from bernstein.cli.helpers import console
 if TYPE_CHECKING:
     from datetime import date
 
+    from bernstein.core.persistence.chain_checkpoint import CheckpointConflict
+
 AUDIT_DIR = Path(".sdd/audit")
 MERKLE_DIR = AUDIT_DIR / "merkle"
 
@@ -130,6 +132,7 @@ def seal_cmd(anchor_git: bool, allow_broken_chain: bool) -> None:
     """
     from bernstein.core.merkle import ChainBrokenError, anchor_to_git, compute_seal, save_seal
     from bernstein.core.persistence.chain_checkpoint import (
+        CharterHeadRegressionError,
         CheckpointConsistencyError,
         CheckpointFileError,
         record_checkpoint,
@@ -168,6 +171,18 @@ def seal_cmd(anchor_git: bool, allow_broken_chain: bool) -> None:
         raise SystemExit(1) from None
     except CheckpointConsistencyError as exc:
         _print_checkpoint_conflict(exc)
+        raise SystemExit(1) from None
+    except CharterHeadRegressionError as exc:
+        console.print("[red]Refusing to seal: a tenant charter's history is behind its durable head pin.[/red]")
+        for conflict in exc.conflicts:
+            console.print(f"  [red]![/red] {conflict.segment}: {conflict.detail}")
+        first = exc.conflicts[0]
+        console.print(
+            "  [dim]Charter events recorded after the last seal are gone. Sealing now would adopt\n"
+            "  the shrunk history permanently. After investigating:[/dim]\n"
+            f"  [dim]bernstein audit ack-tear --segment {first.segment} "
+            f'--offset {first.offset} --reason "..."[/dim]'
+        )
         raise SystemExit(1) from None
     except CheckpointFileError as exc:
         console.print(f"[red]Refusing to seal: {exc}[/red]")
@@ -741,7 +756,21 @@ def _verify_tenant_charters() -> bool:
     and holds nothing against writers. The ``event_type`` prefilter rejects
     segments and lines that never mention ``tenant.charter_event`` before any
     JSON parsing, so a chain-wide scan does not cost a full parse of history.
+
+    The fold alone cannot see whole records cut off the tail: a shorter
+    history still folds and still HMAC-verifies, one version behind. The same
+    chain read therefore also feeds the charter head pin comparison
+    (:func:`bernstein.core.persistence.chain_checkpoint.check_charter_heads`),
+    so a lost revocation fails this pillar - by name, with the pinned seq -
+    instead of the pillar reporting "Passed" over a history it cannot vouch
+    for. The head check runs even when no charter events remain at all,
+    which is exactly the shape total tail loss produces.
     """
+    from bernstein.core.persistence.chain_checkpoint import (
+        CheckpointFileError,
+        check_charter_heads,
+        unacknowledged_charter_head_conflicts,
+    )
     from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
     from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER, AuditChainStore
     from bernstein.core.security.tenant_charter import verify_charter_from_entries
@@ -769,15 +798,25 @@ def _verify_tenant_charters() -> bool:
         console.print(f"[red]Failed to read tenant charter events: {exc}[/red]")
         return False
 
+    pin_file_errors: list[str] = []
+    head_conflicts: list[CheckpointConflict] = []
+    acked_conflicts = 0
+    try:
+        all_head_conflicts = check_charter_heads(AUDIT_DIR, key, entries=list(entries))
+        head_conflicts = unacknowledged_charter_head_conflicts(AUDIT_DIR, key, entries=list(entries))
+        acked_conflicts = len(all_head_conflicts) - len(head_conflicts)
+    except CheckpointFileError as exc:
+        pin_file_errors = list(exc.errors)
+
     tenants = sorted({entry.resource_id for entry in entries if entry.resource_id})
-    if not tenants:
-        return True  # no charters recorded; nothing to fold
+    if not tenants and not head_conflicts and not pin_file_errors:
+        return True  # no charters recorded, no pins outstanding; nothing to fold
 
     results = [verify_charter_from_entries(entries, tenant_id) for tenant_id in tenants]
 
     failures = [r for r in results if not r.ok]
     console.print()
-    if not failures:
+    if not failures and not head_conflicts and not pin_file_errors:
         console.print(
             Panel("[bold green]Tenant Charter Verification Passed[/bold green]", border_style="green", expand=False)
         )
@@ -786,12 +825,22 @@ def _verify_tenant_charters() -> bool:
         table.add_column("Value")
         table.add_row("Charters", str(len(results)))
         console.print(table)
+        if acked_conflicts:
+            console.print(f"  [dim]{acked_conflicts} acknowledged charter head regression(s) remain recorded.[/dim]")
         return True
 
     console.print(Panel("[bold red]Tenant Charter Verification FAILED[/bold red]", border_style="red", expand=False))
     for result in failures:
         where = f" at seq {result.seq}" if result.seq is not None else ""
         console.print(f"  [red]![/red] charter {result.tenant_id}: {result.reason}{where}: {result.detail}")
+    for conflict in head_conflicts:
+        console.print(f"  [red]![/red] {conflict.segment}: {conflict.detail}")
+        console.print(
+            f"  [dim]After investigating: bernstein audit ack-tear --segment {conflict.segment} "
+            f'--offset {conflict.offset} --reason "..."[/dim]'
+        )
+    for error in pin_file_errors:
+        console.print(f"  [red]![/red] {error}")
     return False
 
 
@@ -823,9 +872,12 @@ def ack_tear_cmd(segment: str, offset: int, reason: str, actor: str | None) -> N
     pin. The superseded checkpoint stays in the checkpoints file permanently.
     """
     from bernstein.core.persistence.chain_checkpoint import (
+        ACK_CHARTER_HEAD_KEY,
         ACK_CHECKPOINT_ROOT_KEY,
         CheckpointFileError,
+        check_charter_heads,
         check_extension,
+        load_charter_heads,
         load_checkpoints,
     )
     from bernstein.core.security.audit import (
@@ -866,6 +918,24 @@ def ack_tear_cmd(segment: str, offset: int, reason: str, actor: str | None) -> N
                 if conflict.segment != segment or conflict.offset != offset:
                     continue
                 details[ACK_CHECKPOINT_ROOT_KEY] = str(last.get("root_hash", ""))
+                matched = True
+                break
+
+        # A charter head regression is acknowledged the same way, targeted by
+        # the (charter:<tenant>, pinned seq) pair verify printed. The record
+        # carries the pinned event hash, so an acknowledgement recorded for
+        # one loss cannot silently cover the next one.
+        if segment.startswith("charter:"):
+            try:
+                pins = load_charter_heads(AUDIT_DIR, key)
+                head_conflicts = check_charter_heads(AUDIT_DIR, key)
+            except CheckpointFileError as exc:
+                raise click.ClickException(str(exc)) from None
+            pin = pins.get(segment.removeprefix("charter:"))
+            for conflict in head_conflicts:
+                if conflict.segment != segment or conflict.offset != offset or pin is None:
+                    continue
+                details[ACK_CHARTER_HEAD_KEY] = pin.event_hash
                 matched = True
                 break
 
