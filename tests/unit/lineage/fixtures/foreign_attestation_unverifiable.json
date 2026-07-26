@@ -1,0 +1,29 @@
+{
+  "schema": "bernstein.foreign-attestation-fixture/v1",
+  "case": "foreign-attestation-with-unverifiable-issuer",
+  "lineage_record": {
+    "artefact_path": "reports/derived-conclusion.md",
+    "external_attestation": {
+      "issuer": "https://attestor.example.invalid/issuers/demo",
+      "issuer_key_id": "ed25519:unavailable-demo-key",
+      "content_hash": "sha256:7d5d4abf09e11d7466eeb7a78d2beacdf6e423a3f2b3c80b6c4e5d6f71829304",
+      "claimed_subject": "artifact://workspace/reports/derived-conclusion.md",
+      "trust_class": "third_party",
+      "envelope": {
+        "format": "dsse-envelope-v1",
+        "payload_hash": "sha256:9420ed3bfe563e5a55b5544ad56f33cb9d3a5762bf63ae149dd619ce38f95710",
+        "signature": "not-verifiable-with-local-trust-material"
+      }
+    }
+  },
+  "local_chain": {
+    "expected_verdict": "verified",
+    "evidence_source": "bernstein-lineage-only"
+  },
+  "expected": {
+    "foreign_attestation_verdict": "unverifiable",
+    "foreign_attestation_must_not_pass": true,
+    "foreign_attestation_is_not_hmac_chain_evidence": true,
+    "derived_taint": "third_party"
+  }
+}
