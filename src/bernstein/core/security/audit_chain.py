@@ -889,6 +889,27 @@ EVENT_PAYMENT_REFUSED = "payment.refused"
 EVENT_ODATA_WRITEBACK = "odata.writeback_receipt"
 
 
+#: Issue #2554 -- one row per tenant-charter lifecycle change (open, member
+#: add/remove, role set, quota set, budget set, close). The charter is not a
+#: config file the chain happens to log: current charter state is the
+#: deterministic fold of these events, so the chain *is* the charter. Each row
+#: carries the full :class:`bernstein.core.security.tenant_charter.CharterEvent`
+#: body, including its ``prev_event_hash``, so charter history is Merkle-linked
+#: inside the HMAC chain and gets two independent tamper detectors: editing a
+#: recorded event orphans its successor's ``prev_event_hash`` *and* breaks
+#: ``bernstein audit verify``. Only identifiers, roles, quotas, and the
+#: fixed-scale budget are recorded -- never run content.
+EVENT_TENANT_CHARTER = "tenant.charter_event"
+
+#: Issue #2554 -- emitted whenever a tenant certificate is asked for a duty it
+#: does not grant, or for a gated duty over a resource the same principal
+#: spawned. The refusal names the certificate hash, the charter hash in force
+#: at decision time, and the missing scope, so the negative path leaves a
+#: chain-anchored record rather than a silent denial. A run holding a
+#: spawn-only certificate that tries to approve its own gate lands here.
+EVENT_TENANT_DUTY_REFUSAL = "tenant.duty_refusal"
+
+
 # ---------------------------------------------------------------------------
 # AuditChainStore
 # ---------------------------------------------------------------------------
@@ -981,6 +1002,7 @@ class AuditChainStore:
         resource_type: str,
         resource_id: str,
         details: dict[str, Any],
+        durable: bool = False,
     ) -> AuditEvent:
         """Embed the prior chain digest into *details* and append the event.
 
@@ -996,6 +1018,11 @@ class AuditChainStore:
         disagree with the ``prev_hmac`` the record was actually written with --
         an event asserting a chain position it does not occupy, in the one field
         a reader consults to check that very linkage.
+
+        Args:
+            durable: Force the record to stable storage before returning; see
+                :meth:`AuditLog.log`. Callers whose record is a decision
+                someone acts on pass ``True``.
         """
         with self._append_lock, self._log.append_transaction():
             merged: dict[str, Any] = details.copy()
@@ -1006,6 +1033,7 @@ class AuditChainStore:
                 resource_type=resource_type,
                 resource_id=resource_id,
                 details=merged,
+                durable=durable,
             )
 
     def log(

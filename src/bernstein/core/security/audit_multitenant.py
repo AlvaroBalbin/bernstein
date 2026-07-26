@@ -256,6 +256,22 @@ def _event_tenant_id(event: dict[str, Any]) -> str:
     return normalize_tenant_id(str(raw) if raw is not None else None)
 
 
+def _event_principal(event: dict[str, Any]) -> str:
+    """Return the principal an event is attributed to.
+
+    ``details.principal`` is the explicit attribution; ``actor`` is the
+    fallback for events that never named one. Kept separate from ``actor``
+    because an orchestrator process may act *on behalf of* a principal, and
+    membership has to be judged on the principal, not the process.
+    """
+    details = event.get("details") or {}
+    if isinstance(details, dict):
+        raw = details.get("principal")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return str(event.get("actor", "")).strip()
+
+
 def _event_in_window(event: dict[str, Any], since: str, until: str) -> bool:
     """Return True when ``event.timestamp`` falls in ``[since, until)``."""
     ts = str(event.get("timestamp", ""))
@@ -269,14 +285,27 @@ def _filter_tenant_events(
     tenant_id: str,
     since: str,
     until: str,
+    principals: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter to events that match ``tenant_id`` and ``[since, until)``.
+
+    When ``principals`` is supplied the event's attributed principal must also
+    belong to that set. This is what turns a slice keyed on a free-form string
+    into one keyed on a governed membership: an event that merely *claims* the
+    tenant id, written by a principal the charter never enrolled, is not part
+    of the slice. ``None`` keeps the historical behaviour (tenant id alone).
 
     Stable order is preserved (chronological because the source log is
     append-only). If two events share a timestamp we fall back to the
     original ``hmac`` for determinism.
     """
-    matched = [e for e in events if _event_tenant_id(e) == tenant_id and _event_in_window(e, since, until)]
+    matched = [
+        e
+        for e in events
+        if _event_tenant_id(e) == tenant_id
+        and _event_in_window(e, since, until)
+        and (principals is None or _event_principal(e) in principals)
+    ]
     matched.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("hmac", ""))))
     return matched
 
@@ -404,6 +433,7 @@ def export_tenant_slice(
     offline_anchor_iso: str | None = None,
     head_kms_adapter: KMSAdapter | None = None,
     write: bool = True,
+    principals: frozenset[str] | None = None,
 ) -> TenantScopedExport:
     """Build a tenant-scoped audit-chain export bundle.
 
@@ -411,7 +441,9 @@ def export_tenant_slice(
 
     1. Walk every event in ``audit_dir`` (read-only).
     2. Filter to events whose ``details.tenant_id`` (after normalization)
-       matches ``tenant_id`` and whose timestamp falls in ``[since, until)``.
+       matches ``tenant_id`` and whose timestamp falls in ``[since, until)``;
+       when ``principals`` is supplied, the event's attributed principal
+       (``details.principal``, else ``actor``) must also be in that set.
     3. Rebuild a slice-local HMAC chain over the filtered events using
        ``key`` so the slice is offline-replay-verifiable.
     4. Optionally sign the resulting ``head_sha256`` with the operator's
@@ -457,6 +489,12 @@ def export_tenant_slice(
             to plumb a second signing key.
         write: When False, build everything in-memory and skip the disk
             write - useful for ``--dry-run`` and tests.
+        principals: Optional membership filter. Supply a charter's member
+            set (see
+            :func:`bernstein.core.security.tenant_charter_slice.export_charter_slice`)
+            to key the slice on a governed membership rather than on the
+            free-form ``tenant_id`` string alone. ``None`` preserves the
+            historical tenant-id-only behaviour.
 
     Returns:
         :class:`TenantScopedExport` with the serialized bundle bytes,
@@ -484,7 +522,7 @@ def export_tenant_slice(
         )
 
     all_events = _read_audit_events(audit_dir)
-    matched = _filter_tenant_events(all_events, normalized_tenant, since, until)
+    matched = _filter_tenant_events(all_events, normalized_tenant, since, until, principals)
     rebuilt, head_hmac = _rebuild_slice_chain(matched, key)
 
     events_canonical = _events_jsonl_bytes(rebuilt)
@@ -890,12 +928,23 @@ def _verify_head_signature(
     return []
 
 
+# Public names for the charter-keyed slice (#2554), which needs the same
+# attribution and tenant-id reading this module already does rather than a
+# second, subtly-different copy of it.
+read_audit_events = _read_audit_events
+event_tenant_id = _event_tenant_id
+event_principal = _event_principal
+
+
 __all__ = [
     "EXPORT_SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "SignatureKind",
     "TenantScopedExport",
     "TenantSliceVerification",
+    "event_principal",
+    "event_tenant_id",
     "export_tenant_slice",
+    "read_audit_events",
     "verify_tenant_slice",
 ]

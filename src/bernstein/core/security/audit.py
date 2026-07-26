@@ -478,6 +478,26 @@ def _path_size(path: Path) -> int:
         return -1
 
 
+def _fsync_directory(path: Path) -> None:
+    """Force *path*'s directory entries to stable storage, where the OS allows it.
+
+    Windows cannot open a directory as a file descriptor, so this is a no-op
+    there; that platform's crash guarantee for a freshly created file is the
+    file's own flush. Failing the append over an unsupported ``fsync`` would
+    trade a durability improvement for an availability regression.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:  # pragma: no cover - platform without directory descriptors
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - platform without directory fsync
+        pass
+    finally:
+        os.close(fd)
+
+
 #: Sentinel stamp for a segment that is absent or unreadable.
 _ABSENT_STAMP: tuple[int, int, int, int] = (-1, -1, -1, -1)
 
@@ -1391,14 +1411,16 @@ def _events_from_text(
         raw = raw_line.strip()
         if not raw:
             continue
-        # Line-level superset test: within a segment that does mention the id,
-        # only parse the lines that could carry it. A record holds
-        # ``resource_id`` as a field value only if that value appears verbatim
-        # in the line, so a line without it is a definite miss and is skipped
-        # before ``json.loads``. The exact comparison in
+        # Line-level superset test: within a segment that does mention the id or
+        # the event type, only parse the lines that could carry it. A record
+        # holds ``resource_id`` / ``event_type`` as a field value only if that
+        # value appears verbatim in the line, so a line without it is a definite
+        # miss and is skipped before ``json.loads``. The exact comparison in
         # ``_matches_query_filters`` still rejects a coincidental substring
         # match, so this can never drop a genuine match.
         if resource_id and resource_id not in raw:
+            continue
+        if event_type and event_type not in raw:
             continue
         try:
             entry = json.loads(raw)
@@ -1828,6 +1850,8 @@ class AuditLog:
         resource_type: str,
         resource_id: str,
         details: dict[str, Any] | None = None,
+        *,
+        durable: bool = False,
     ) -> AuditEvent:
         """Create an audit event, compute its HMAC, and append to the daily log.
 
@@ -1837,6 +1861,22 @@ class AuditLog:
             resource_type: Type of resource affected.
             resource_id: ID of the affected resource.
             details: Optional structured data about the event.
+            durable: Force the record to stable storage before returning.
+
+                An ordinary append returns once the bytes are in the page
+                cache, so a host crash can drop a group of acknowledged records
+                off the tail of the newest segment. That loss is invisible to a
+                chain walk: the surviving prefix is intact and correctly linked,
+                and only the *newest* records are gone, so there is no gap and
+                no broken link to find. A charter revocation lost that way
+                reverts, and every verifier still reports the chain as healthy.
+
+                Callers whose record is a decision someone will act on - a
+                charter event, the evidence that a segment was torn - pass
+                ``True`` and pay one ``fsync``. The hot path does not: an
+                ``fsync`` per append is orders of magnitude more expensive than
+                the append itself, and losing an unacknowledged telemetry event
+                to a crash is not a correctness claim anyone made.
 
         Returns:
             The newly created AuditEvent with computed HMAC.
@@ -1876,8 +1916,17 @@ class AuditLog:
             # verifier reads bytes and re-canonicalises against ``\n``-only
             # frames; without this the ``\r`` stays inside each split line and
             # the byte-equality tamper check trips.
+            fresh_segment = durable and not log_path.exists()
             with log_path.open("a", encoding="utf-8", newline="") as fh:
                 fh.write(line)
+                if durable:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            if fresh_segment:
+                # A new segment's own bytes being durable is not enough: the
+                # directory entry that names it has to survive the crash too, or
+                # the record is on the platter with nothing pointing at it.
+                _fsync_directory(self._audit_dir)
             computed_hmac = event.hmac
 
             self._prev_hmac = computed_hmac
@@ -2295,13 +2344,16 @@ class AuditLog:
             # and never raises forever over a chain carrying sealed tear
             # evidence, whose torn bytes are permanent by design.
             text = _decode_segment_text(blob)
-            # Segment-level reject: a record can only carry ``resource_id`` as a
-            # field value if that value appears verbatim in the segment's bytes.
-            # A segment that never mentions the id holds no match, so skip it
-            # whole - no line split, no per-line work. This is what keeps a
-            # first-time approval resolve, and a stream of unknown card hashes,
-            # off an O(chain) parse of the entire log.
+            # Segment-level reject: a record can only carry ``resource_id`` or
+            # ``event_type`` as a field value if that value appears verbatim in
+            # the segment's bytes. A segment that never mentions it holds no
+            # match, so skip it whole - no line split, no per-line work. This is
+            # what keeps a first-time approval resolve, a stream of unknown card
+            # hashes, and a chain-wide scan for rare event kinds off an
+            # O(chain) parse of the entire log.
             if resource_id and resource_id not in text:
+                continue
+            if event_type and event_type not in text:
                 continue
             results.extend(
                 _events_from_text(

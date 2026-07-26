@@ -293,6 +293,19 @@ from the anchor check so segments written by older versions do not
 report a defect that has been removed. those records are still fully
 covered by the MAC and by `prev_hmac` linkage.
 
+### Tenant charters must still fold
+
+`bernstein audit verify` also runs a **tenant charter** pillar: every
+recorded charter (see [tenant charters](tenant-charters.md)) is folded
+from its `tenant.charter_event` rows, and a charter that no longer
+folds - two events claiming one `seq`, a link pointing at a hash that
+is not its predecessor's, a body that cannot be parsed - fails the run
+naming the tenant and the offending sequence number. the pillar is
+orthogonal to the hmac chain on purpose: every byte of a bricked
+charter is authentically signed, so "these bytes are authentic" and
+"the recorded history is consistent" are different claims and get
+different diagnostics.
+
 run from cron (every 15 min is fine - the verify is read-only and a
 day's worth of events checks in milliseconds):
 
@@ -411,6 +424,30 @@ a mutually consistent earlier state; catching that requires retention
 outside the writer's filesystem (an independent co-signer over
 checkpoints), which is planned as a follow-up and tracked on the
 issue tracker.
+
+### Durable appends: decisions must survive the host
+
+an ordinary append returns once the record is in the page cache, so a
+host crash can drop a group of acknowledged records off the tail of
+the newest segment. that loss is invisible to a chain walk: the
+surviving prefix is intact and correctly linked, the missing records
+are the newest ones, so there is no gap and no broken link to find.
+an hmac verify passes on the truncated log.
+
+records that are somebody's decision are therefore written
+**durably** - fsynced before the call returns, and the directory
+entry fsynced too when the append created the segment:
+
+| record | durable | why |
+|---|---|---|
+| `tenant.charter_event` (`tenant create` / `grant` / `revoke`) | yes | a revocation that reverts is an access-control failure, and it reverts silently |
+| `chain.torn_record` (the tear seal) | yes | it is the only surviving statement that a record was lost |
+| everything else | no | an fsync per append costs orders of magnitude more than the append, and no correctness claim rests on an unacknowledged telemetry event |
+
+what durability does **not** cover is deliberate truncation: an
+attacker with write access can still cut records off the end, and the
+hmac chain cannot see it for the reason above. that is the checkpoint
+gate's job (see above).
 
 ## Replaying a log
 

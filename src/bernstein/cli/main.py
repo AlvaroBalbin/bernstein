@@ -995,6 +995,11 @@ cli.add_command(policy_group, "policy")
 cli.add_command(pool_group, "pool")
 cli.add_command(datasource_group, "datasource")
 cli.add_command(_role_adapter_security_group, "security")
+# Tenant charters (#2554). `team` is agent role manifests and `workspace` is
+# multi-repo management, so the governed team boundary gets its own verb.
+from bernstein.cli.commands.tenant_cmd import tenant_group as _tenant_group  # noqa: E402
+
+cli.add_command(_tenant_group, "tenant")
 cli.add_command(mcp_server, "mcp")
 # Wire the release-1.9 community catalog as a subgroup of `bernstein mcp`.
 from bernstein.cli.commands.mcp_catalog_cmd import catalog_group as _catalog_group  # noqa: E402

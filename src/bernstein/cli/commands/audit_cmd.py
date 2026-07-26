@@ -340,6 +340,15 @@ def verify_cmd(merkle_only: bool, hmac_only: bool, receipt_path: str | None, pay
     # tampered chain entry (#2518). Orthogonal to both HMAC chain and Merkle seal.
     all_passed = _verify_sovereign_attestations() and all_passed
 
+    # Tenant charters are a further integrity pillar, and the one that closes a
+    # gap between what this command reports and what operators read it to mean.
+    # The HMAC verdict answers "are these bytes authentic", not "is the
+    # guarantee intact": a charter with two events claiming the same seq is
+    # permanently unreadable while every byte of it is authentically signed, so
+    # without this pillar the command exits 0 on it (#2554). Orthogonal to both
+    # the HMAC chain and the Merkle seal.
+    all_passed = _verify_tenant_charters() and all_passed
+
     console.print()
     raise SystemExit(0 if all_passed else 1)
 
@@ -704,6 +713,85 @@ def _verify_checkpoints() -> bool:
         return True
 
     _print_checkpoint_conflict(CheckpointConsistencyError(last, conflicts))
+    return False
+
+
+def _verify_tenant_charters() -> bool:
+    """Fold every recorded tenant charter and print results. Returns True if all fold.
+
+    A charter is the deterministic fold of an append-only event segment, so it
+    can be broken in a way the HMAC chain cannot see: two events claiming the
+    same ``seq``, a link pointing at a hash that is not its predecessor's, or a
+    body that no longer parses. Every byte of such a segment is authentically
+    signed, so ``audit_chain_ok`` stays true while the charter is permanently
+    unreadable - and because the log is append-only, the offending event can
+    never be removed.
+
+    The failure reason stays distinct from an HMAC error, deliberately. They
+    have different causes and different remedies: an HMAC break means the bytes
+    were altered, a fold break means the recorded history is inconsistent while
+    every byte is authentic. Collapsing them would destroy the one diagnostic
+    that tells an operator whether they are looking at tampering or at a
+    concurrency defect.
+
+    When no charter events exist the check is a silent no-op.
+
+    One lock-free chain read feeds every fold - the same read path the HMAC
+    pillar walks - so this works on a read-only copy of the audit directory
+    and holds nothing against writers. The ``event_type`` prefilter rejects
+    segments and lines that never mention ``tenant.charter_event`` before any
+    JSON parsing, so a chain-wide scan does not cost a full parse of history.
+    """
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+    from bernstein.core.security.audit_chain import EVENT_TENANT_CHARTER, AuditChainStore
+    from bernstein.core.security.tenant_charter import verify_charter_from_entries
+
+    # Verification is read-only and must never mint key material (see
+    # ``_verify_hmac_chain``); constructing the store without a key would
+    # load-or-create one.
+    try:
+        key = load_audit_key()
+    except AuditKeyMissingError:
+        has_segments = any(AUDIT_DIR.glob("*.jsonl")) or any((AUDIT_DIR / "archive").glob("*.jsonl.gz"))
+        if not has_segments:
+            return True  # empty chain: no charters to fold, nothing skipped
+        console.print()
+        console.print(
+            "[yellow]Tenant charter verification skipped: no audit HMAC key available "
+            "(the chain read needs the store's key context).[/yellow]"
+        )
+        return True
+
+    chain = AuditChainStore(AUDIT_DIR, key=key)
+    try:
+        entries = chain.query(event_type=EVENT_TENANT_CHARTER, include_archived=True)
+    except OSError as exc:  # pragma: no cover - filesystem race
+        console.print(f"[red]Failed to read tenant charter events: {exc}[/red]")
+        return False
+
+    tenants = sorted({entry.resource_id for entry in entries if entry.resource_id})
+    if not tenants:
+        return True  # no charters recorded; nothing to fold
+
+    results = [verify_charter_from_entries(entries, tenant_id) for tenant_id in tenants]
+
+    failures = [r for r in results if not r.ok]
+    console.print()
+    if not failures:
+        console.print(
+            Panel("[bold green]Tenant Charter Verification Passed[/bold green]", border_style="green", expand=False)
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Charters", str(len(results)))
+        console.print(table)
+        return True
+
+    console.print(Panel("[bold red]Tenant Charter Verification FAILED[/bold red]", border_style="red", expand=False))
+    for result in failures:
+        where = f" at seq {result.seq}" if result.seq is not None else ""
+        console.print(f"  [red]![/red] charter {result.tenant_id}: {result.reason}{where}: {result.detail}")
     return False
 
 
