@@ -1180,22 +1180,47 @@ def _register_skill_tools(mcp: FastMCP[None]) -> None:
         mcp: FastMCP instance to register the tool on.
     """
 
+    def _skill_loader():  # type: ignore[no-untyped-def]
+        # Local imports keep the MCP module cheap to import when the skills
+        # tree is missing (for example, a dev CLI without templates).
+        from pathlib import Path as _Path
+
+        from bernstein import get_templates_dir
+        from bernstein.core.skills.loader import default_loader_from_templates
+
+        templates_root = get_templates_dir(_Path.cwd())
+        return default_loader_from_templates(templates_root / "roles")
+
+    def _skill_index_json() -> str:
+        from bernstein.core.skills.index_builder import serialize_skill_discovery_index
+
+        return serialize_skill_discovery_index(_skill_loader())
+
+    from bernstein.core.skills.index_builder import SKILL_INDEX_RESOURCE_URI
+
+    @mcp.resource(
+        SKILL_INDEX_RESOURCE_URI,
+        name="skill_index",
+        description="Compact index of loadable Bernstein skills and their content hashes.",
+        mime_type="application/json",
+    )
+    def skill_index() -> str:  # pyright: ignore[reportUnusedFunction]
+        return _skill_index_json()
+
     @mcp.tool()
     async def load_skill(  # pyright: ignore[reportUnusedFunction]
-        name: str,
+        name: str | None = None,
         reference: str | None = None,
         script: str | None = None,
     ) -> str:
-        """Load a skill pack body (and optionally a reference or script).
+        """Discover skills, or load a named skill body, reference, or script.
 
-        Agents receive only a compact skill index in their system prompt.
-        Call this tool to fetch the full ``SKILL.md`` body for a skill
-        when you decide it's relevant to the current task. Pass
-        ``reference`` to get a deeper-context file or ``script`` to read
-        the content of an executable helper.
+        Omit ``name`` to receive the compact skill index. Pass a skill name
+        to fetch its full ``SKILL.md`` body. ``reference`` and ``script``
+        are valid only with a named skill.
 
         Args:
-            name: Skill name (matches the index entry, e.g. ``"backend"``).
+            name: Optional skill name (for example ``"backend"``).
             reference: Optional filename under ``references/`` - for
                 example ``"python-conventions.md"``.
             script: Optional filename under ``scripts/`` - for example
@@ -1203,21 +1228,28 @@ def _register_skill_tools(mcp: FastMCP[None]) -> None:
                 MCP harness does not execute it.
 
         Returns:
-            JSON with ``name``, ``body``, ``available_references``,
-            ``available_scripts``, and the optional fetched content.
+            The compact index when ``name`` is omitted; otherwise JSON with
+            ``name``, ``body``, available files, and optional fetched content.
         """
+        payload = {
+            key: value
+            for key, value in {
+                "name": name,
+                "reference": reference,
+                "script": script,
+            }.items()
+            if value is not None
+        }
         err = _validate_or_error(
             "load_skill",
-            {"name": name, "reference": reference, "script": script},
+            payload,
         )
         if err is not None:
             return _validation_error_response(err)
         try:
-            # Local import so the MCP module stays cheap to import even when
-            # the skills tree is missing (e.g. dev CLI without templates).
-            from pathlib import Path as _Path
+            if name is None:
+                return _skill_index_json()
 
-            from bernstein import get_templates_dir
             from bernstein.core.skills.load_skill_tool import (
                 load_skill as _load_skill_impl,
             )
@@ -1225,13 +1257,11 @@ def _register_skill_tools(mcp: FastMCP[None]) -> None:
                 result_as_dict,
             )
 
-            templates_root = get_templates_dir(_Path.cwd())
-            templates_roles_dir = templates_root / "roles"
             result = _load_skill_impl(
                 name=name,
                 reference=reference,
                 script=script,
-                templates_roles_dir=templates_roles_dir,
+                loader=_skill_loader(),
             )
             return json.dumps(result_as_dict(result), indent=2)
         except Exception as exc:
