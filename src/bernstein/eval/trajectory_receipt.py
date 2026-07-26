@@ -33,7 +33,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from bernstein.core.lineage.spine import LineageSpine, content_hash_of
@@ -41,7 +41,7 @@ from bernstein.eval.metrics import EvalScoreComponents, TierScores
 from bernstein.eval.significance import suite_content_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
     from pathlib import Path
 
     from bernstein.core.security.audit_chain import AuditChainStore
@@ -653,8 +653,7 @@ def verify_trajectory_receipt(
             return TrajectoryVerifyResult(
                 ok=False,
                 reason=(
-                    f"best_of_n selected_index={bon.selected_index} out of range "
-                    f"[0, {bon.n_candidates}) (cherry-pick)"
+                    f"best_of_n selected_index={bon.selected_index} out of range [0, {bon.n_candidates}) (cherry-pick)"
                 ),
                 receipt=receipt,
             )
