@@ -340,8 +340,71 @@ def verify_cmd(merkle_only: bool, hmac_only: bool, receipt_path: str | None, pay
     # tampered chain entry (#2518). Orthogonal to both HMAC chain and Merkle seal.
     all_passed = _verify_sovereign_attestations() and all_passed
 
+    # Benchmark-score trajectory receipts are a further integrity pillar: a
+    # tampered published score, a contaminated suite, a fabricated scalar, or a
+    # cherry-picked best-of-N candidate must fail verify with the offending task
+    # named (#2925). Absent receipts are a silent no-op; any present-and-tampered
+    # receipt hard-fails. Orthogonal to both HMAC chain and Merkle seal.
+    all_passed = _verify_trajectory_receipts() and all_passed
+
     console.print()
     raise SystemExit(0 if all_passed else 1)
+
+
+def _verify_trajectory_receipts() -> bool:
+    """Verify every benchmark-score trajectory receipt and print results.
+
+    A tampered published score, a contaminated golden suite, a fabricated
+    scalar, or a cherry-picked best-of-N candidate makes ``bernstein audit
+    verify`` fail with the offending task named, exactly like a tampered chain
+    entry (#2925). When no trajectory receipts exist the check is a silent
+    no-op (returns True immediately).
+    """
+    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.eval.trajectory_receipt import verify_all_trajectory_receipts
+
+    workdir = AUDIT_DIR.parent.parent
+
+    try:
+        key = load_or_create_audit_key()
+    except OSError as exc:  # pragma: no cover - filesystem race
+        console.print(f"[red]Failed to load audit key for trajectory receipt verification: {exc}[/red]")
+        return False
+
+    results = verify_all_trajectory_receipts(workdir, hmac_key=key)
+    if not results:
+        return True  # no trajectory receipts recorded; nothing to verify
+
+    failures = [r for r in results if not r.ok]
+    console.print()
+    if not failures:
+        console.print(
+            Panel(
+                "[bold green]Trajectory Receipt Verification Passed[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Receipts", str(len(results)))
+        console.print(table)
+        return True
+
+    console.print(
+        Panel(
+            "[bold red]Trajectory Receipt Verification FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    for result in failures:
+        rh = result.receipt.receipt_hash if result.receipt is not None else "?"
+        task_idx = result.failing_task_index
+        loc = f" (task [{task_idx}])" if task_idx >= 0 else ""
+        console.print(f"  [red]![/red] {rh[:16]}…{loc}: {result.reason}")
+    return False
 
 
 def _verify_automation_receipt(receipt_path: str, payload_path: str | None) -> None:

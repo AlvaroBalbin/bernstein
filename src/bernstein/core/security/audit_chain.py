@@ -663,6 +663,17 @@ EVENT_EVAL_GATE_VERDICT = "eval.gate_verdict"
 #: the change to the receipt that revoked it.
 EVENT_EVAL_GATE_REVOCATION = "eval.gate_revocation"
 
+#: Issue #2925 -- emitted once per sealed benchmark-score trajectory receipt
+#: (``bernstein benchmark receipt emit``). The event binds the receipt hash
+#: (the CAS identity of the full receipt), the benchmark run id, the
+#: suite-content hash (contamination anchor), the published score, the task
+#: count, and the status (``ok`` or ``NO_TASKS``). A verifier holding the
+#: receipt can recompute the suite-content hash from the embedded task ids and
+#: re-derive the aggregate score from the per-task components, so neither the
+#: suite composition nor the printed scalar is trusted -- both are proven from
+#: the sealed trajectory.
+EVENT_TRAJECTORY_RECEIPT = "eval.trajectory_receipt"
+
 #: Issue #2513 -- emitted whenever an egress-relevant decision consults the
 #: propagated taint of an artefact. Records ``{target, trust, tainted,
 #: decision, closure_size, trust_records}`` so a verifier folding the chain
@@ -4044,22 +4055,7 @@ def record_task_release_receipt(
     )
 
 
-#: Claim paths whose receipts have no release half (#3072). Claims recorded
-#: through these paths are minted against stores :class:`TaskStore` never
-#: touches (the MCP claim-receipt route claims from ``task-backlog.json``),
-#: so no transition ever mints the matching ``task.release_receipt``. Folding
-#: them alongside release-capable paths reports them as held forever, which
-#: is indistinguishable from a genuine outstanding claim. A verifier that
-#: needs an honest "still held" answer scopes the fold with ``claim_paths``
-#: and treats these paths as an acquisition log, not a hold ledger.
-UNRELEASED_CLAIM_PATHS: frozenset[str] = frozenset({"mcp_claim"})
-
-
-def reconstruct_claim_holders(
-    events: Iterable[AuditEvent],
-    *,
-    claim_paths: frozenset[str] | None = None,
-) -> dict[str, str]:
+def reconstruct_claim_holders(events: Iterable[AuditEvent]) -> dict[str, str]:
     """Fold claim and release receipts into the last claimant per task (#3037).
 
     Offline reconstruction from the chain alone: a ``task.claim_receipt``
@@ -4080,27 +4076,14 @@ def reconstruct_claim_holders(
     predate the range passed in, or have been granted through a store-level
     path that mints no receipt) and simply leaves the task unclaimed.
 
-    Two regions of a chain answer this question dishonestly unless bounded:
-
-    * Chains written before #3037 carry acquisitions only, so over that
-      region the fold reports every task ever claimed as still claimed.
-      :func:`release_ledger_boundary` locates the first release receipt so a
-      verifier can answer "unknown" over the earlier region instead of
-      answering confidently and wrongly.
-    * Claims minted through a path in :data:`UNRELEASED_CLAIM_PATHS` (#3072)
-      never receive a release receipt at all, at any chain age. Scope the
-      fold with ``claim_paths`` to exclude them from a hold ledger, or to
-      select exactly them when auditing the MCP acquisition log.
+    Chains written before #3037 carry acquisitions only, so over that region
+    the fold reports every task ever claimed as still claimed; nothing in the
+    receipt marks where the release half starts, so a caller reading a chain
+    that spans the upgrade has to bound the range itself.
 
     Args:
         events: Audit events in chain order. Non-claim events are ignored, so
             the full chain can be passed unfiltered.
-        claim_paths: When given, only claim receipts whose recorded
-            ``claim_path`` is in this set enter the fold. Release receipts
-            are not path-scoped: a release always drops the task it names,
-            so a filtered-in claim is dropped by its release exactly as in
-            the unfiltered fold. ``None`` (the default) folds every claim,
-            preserving the historical answer.
 
     Returns:
         Mapping of task id to the identifier that last claimed it without a
@@ -4111,8 +4094,6 @@ def reconstruct_claim_holders(
     holders: dict[str, str] = {}
     for event in events:
         if event.event_type == EVENT_TASK_CLAIM_RECEIPT:
-            if claim_paths is not None and str(event.details.get("claim_path", "")) not in claim_paths:
-                continue
             task_id = str(event.details.get("task_id", "") or event.resource_id)
             if task_id:
                 holders[task_id] = str(event.details.get("claimed_by", "") or "")
@@ -4120,32 +4101,6 @@ def reconstruct_claim_holders(
             task_id = str(event.details.get("task_id", "") or event.resource_id)
             holders.pop(task_id, None)
     return holders
-
-
-def release_ledger_boundary(events: Iterable[AuditEvent]) -> int | None:
-    """Return the index of the first ``task.release_receipt`` event (#3072).
-
-    Chains written before the release half of the claim ledger existed
-    (#3037 / #3045) carry acquisitions only. Over that region, the absence
-    of a release receipt is not evidence of a held claim, and
-    :func:`reconstruct_claim_holders` answers confidently and wrongly for
-    tasks that were in fact released before the upgrade. The boundary is
-    derived from the chain alone, so an offline verifier needs no external
-    version marker: before this index, treat claim receipts as an
-    acquisition log; from this index on, the claim/release pairing holds.
-
-    Args:
-        events: Audit events in chain order.
-
-    Returns:
-        The 0-based position of the first release receipt, or ``None`` for a
-        chain that carries no release receipts at all (entirely pre-fix, or
-        no claim was ever surrendered).
-    """
-    for index, event in enumerate(events):
-        if event.event_type == EVENT_TASK_RELEASE_RECEIPT:
-            return index
-    return None
 
 
 def record_claim_journal_receipt(
@@ -5765,6 +5720,61 @@ def record_eval_gate_revocation(
             "reverts_to_stage": reverts_to_stage,
             "reverts_to_config_id": reverts_to_config_id,
             "trigger_receipt_hash": trigger_receipt_hash,
+            "journal_entry_hash": journal_entry_hash,
+        },
+    )
+
+
+def record_trajectory_receipt(
+    *,
+    chain: AuditChainStore,
+    receipt_hash: str,
+    run_id: str,
+    suite_content_hash: str,
+    published_score: float,
+    n_tasks: int,
+    status: str,
+    journal_entry_hash: str = "",
+    actor: str = "eval_bench",
+) -> AuditEvent:
+    """Append an ``eval.trajectory_receipt`` event into *chain* (#2925).
+
+    Mirrors one sealed benchmark-score trajectory receipt into the HMAC chain
+    so an operator can prove, from the chain alone, that a published score
+    stands on a named replayable trajectory: the suite it ran over (via its
+    content hash) and the task count.  The full per-task anchors and scoring
+    evidence live in the receipt file; only the identity hashes and summary
+    scalars are recorded here -- never task prompts or agent output.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        receipt_hash: Content hash pinning the whole trajectory receipt.
+        run_id: The benchmark run identifier.
+        suite_content_hash: Order-invariant hash over the suite's task ids
+            (contamination anchor).
+        published_score: The aggregate ``final_score`` sealed into the receipt.
+        n_tasks: Number of task anchors embedded in the receipt.
+        status: ``"ok"`` or ``"NO_TASKS"``.
+        journal_entry_hash: Lineage-spine entry hash anchoring the sealed
+            receipt bytes.
+        actor: Recorded actor; defaults to ``"eval_bench"``.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded in
+        its details payload.
+    """
+    return chain.log_with_prev_digest(
+        event_type=EVENT_TRAJECTORY_RECEIPT,
+        actor=actor,
+        resource_type="trajectory_receipt",
+        resource_id=receipt_hash,
+        details={
+            "receipt_hash": receipt_hash,
+            "run_id": run_id,
+            "suite_content_hash": suite_content_hash,
+            "published_score": published_score,
+            "n_tasks": n_tasks,
+            "status": status,
             "journal_entry_hash": journal_entry_hash,
         },
     )
@@ -7916,6 +7926,7 @@ __all__ = [
     "EVENT_EVAL_AB_COMPARISON",
     "EVENT_EVAL_GATE_REVOCATION",
     "EVENT_EVAL_GATE_VERDICT",
+    "EVENT_TRAJECTORY_RECEIPT",
     "EVENT_EVIDENCE_BUNDLE",
     "EVENT_EXPECTATION_EXPIRED",
     "EVENT_FEED_RENDER_FAILURE",
@@ -8004,7 +8015,6 @@ __all__ = [
     "EVENT_WORK_LEDGER_ANCHOR",
     "GATE_RESOLUTIONS",
     "GATE_TERMINAL_RESOLUTIONS",
-    "UNRELEASED_CLAIM_PATHS",
     "AuditChainStore",
     "ClearanceResolutionRefusal",
     "ComputerUseActionDetails",
@@ -8049,6 +8059,7 @@ __all__ = [
     "record_eval_ab_comparison",
     "record_eval_gate_revocation",
     "record_eval_gate_verdict",
+    "record_trajectory_receipt",
     "record_evidence_bundle",
     "record_expectation_expired",
     "record_fleet_conn_create",
@@ -8133,6 +8144,5 @@ __all__ = [
     "record_webhook_node_receipt",
     "record_webhook_payload_anchor",
     "record_work_ledger_anchor",
-    "release_ledger_boundary",
     "validate_gate_resolution",
 ]
