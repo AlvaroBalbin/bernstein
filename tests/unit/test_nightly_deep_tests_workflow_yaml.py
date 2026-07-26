@@ -33,8 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "nightly-deep-tests.yml"
 
 
-def _load() -> dict[str, object]:
-    return cast("dict[str, object]", yaml.safe_load(WORKFLOW.read_text(encoding="utf-8")))
+def _load() -> dict[object, object]:
+    # Keys are typed as ``object`` on purpose: PyYAML follows YAML 1.1, so
+    # the bare ``on:`` trigger key loads as the boolean ``True`` rather
+    # than the string ``"on"``.
+    return cast("dict[object, object]", yaml.safe_load(WORKFLOW.read_text(encoding="utf-8")))
 
 
 def _jobs() -> dict[str, dict[str, object]]:
@@ -64,7 +67,8 @@ def test_workflow_does_not_gate_pull_requests() -> None:
     ``pull_request`` trigger. If someone adds one, the trade-off has to be
     re-decided rather than inherited.
     """
-    triggers = _load().get("on") or _load().get(True)
+    document = _load()
+    triggers = document.get("on", document.get(True))
     assert isinstance(triggers, dict), "expected a mapping of triggers"
     assert set(triggers) == {"schedule", "workflow_dispatch"}, (
         f"unexpected triggers {sorted(triggers)}: this workflow must stay off the PR path"
