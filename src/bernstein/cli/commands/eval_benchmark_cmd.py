@@ -621,8 +621,7 @@ def benchmark_receipt_group() -> None:
 @benchmark_receipt_group.command("emit")
 @click.argument("run_id")
 @click.option("--workdir", default=".", show_default=True, help="Project root.", type=click.Path(exists=True))
-@click.option("--tasks-dir", default="templates/benchmarks", show_default=True, help="Benchmark task YAML directory.")
-def benchmark_receipt_emit(run_id: str, workdir: str, tasks_dir: str) -> None:
+def benchmark_receipt_emit(run_id: str, workdir: str) -> None:
     """Seal a benchmark run into a signed trajectory receipt.
 
     RUN_ID is the benchmark run identifier recorded when the run was executed.
@@ -636,7 +635,7 @@ def benchmark_receipt_emit(run_id: str, workdir: str, tasks_dir: str) -> None:
     import json
     from pathlib import Path
 
-    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit import AuditKeyPermissionError, load_or_create_audit_key
     from bernstein.eval.metrics import EvalScoreComponents, TierScores
     from bernstein.eval.trajectory_receipt import (
         TaskTrajectoryAnchor,
@@ -647,7 +646,7 @@ def benchmark_receipt_emit(run_id: str, workdir: str, tasks_dir: str) -> None:
     _workdir = Path(workdir)
     try:
         key = load_or_create_audit_key()
-    except OSError as exc:
+    except (OSError, AuditKeyPermissionError) as exc:
         console.print(f"[red]Failed to load audit key: {exc}[/red]")
         raise SystemExit(1) from exc
 
@@ -676,14 +675,26 @@ def benchmark_receipt_emit(run_id: str, workdir: str, tasks_dir: str) -> None:
         raise SystemExit(1)
 
     # Build TaskTrajectoryAnchor list from the persisted run record.
+    # Reject any task that has no real journal head — placeholder zero-hashes
+    # would seal a receipt that verifies clean with no real trajectory behind
+    # it, which is exactly the fabrication mode the receipt is designed to
+    # detect.
+    _ZERO_HASH = "sha256:" + "0" * 64
     task_anchors: list[TaskTrajectoryAnchor] = []
     for task in run_record.get("tasks", []):
+        jh = task.get("journal_head_hash", "")
+        if not jh or jh == _ZERO_HASH:
+            console.print(
+                f"[red]Task {task.get('task_id', '?')!r} has no real journal head hash — "
+                f"cannot emit a verifiable receipt for a run without a sealed trajectory.[/red]"
+            )
+            raise SystemExit(1)
         c = task.get("components", {})
         task_anchors.append(
             TaskTrajectoryAnchor(
                 task_id=task["task_id"],
-                journal_head_hash=task.get("journal_head_hash", "sha256:" + "0" * 64),
-                events_content_hash=task.get("events_content_hash", "sha256:" + "0" * 64),
+                journal_head_hash=jh,
+                events_content_hash=task.get("events_content_hash", _ZERO_HASH),
                 model_id=task.get("model_id", "unknown"),
                 config_fingerprint=task.get("config_fingerprint", "unknown"),
                 components=EvalScoreComponents(
@@ -737,13 +748,13 @@ def benchmark_receipt_verify(receipt_hash: str, workdir: str) -> None:
     """
     from pathlib import Path
 
-    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit import AuditKeyPermissionError, load_or_create_audit_key
     from bernstein.eval.trajectory_receipt import verify_trajectory_receipt
 
     _workdir = Path(workdir)
     try:
         key = load_or_create_audit_key()
-    except OSError as exc:
+    except (OSError, AuditKeyPermissionError) as exc:
         console.print(f"[red]Failed to load audit key: {exc}[/red]")
         raise SystemExit(1) from exc
 

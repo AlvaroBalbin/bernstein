@@ -31,7 +31,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -348,9 +347,7 @@ def trajectory_receipt_path(workdir: Path, receipt_hash: str) -> Path:
         raise ValueError(msg)
     base = workdir.joinpath(*_BENCH_SUBPATH)
     candidate = base / f"{receipt_hash}.json"
-    base_real = os.path.realpath(base)
-    cand_real = os.path.realpath(candidate)
-    if os.path.commonpath([base_real, cand_real]) != base_real:
+    if not candidate.resolve().is_relative_to(base.resolve()):
         msg = f"receipt path escapes bench directory: {receipt_hash!r}"
         raise ValueError(msg)
     return candidate
@@ -470,13 +467,9 @@ def build_trajectory_receipt(
         journal_entry_hash=anchor,
     )
 
-    path = trajectory_receipt_path(workdir, receipt_hash)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(sealed.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True),
-        encoding="utf-8",
-    )
-
+    # Mirror into the audit chain BEFORE writing the receipt file so that if
+    # the chain write fails the receipt file does not yet exist — the two
+    # states remain reconcilable (no orphan file with no chain entry).
     if chain is not None:
         from bernstein.core.security.audit_chain import record_trajectory_receipt
 
@@ -486,10 +479,17 @@ def build_trajectory_receipt(
             run_id=run_id,
             suite_content_hash=s_hash,
             published_score=published_score,
-            n_tasks=len(task_anchors),
+            n_tasks=len(canonical_anchors),
             status=status,
             journal_entry_hash=anchor,
         )
+
+    path = trajectory_receipt_path(workdir, receipt_hash)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(sealed.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
 
     return sealed
 

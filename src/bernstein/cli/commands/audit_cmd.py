@@ -360,14 +360,17 @@ def _verify_trajectory_receipts() -> bool:
     entry (#2925). When no trajectory receipts exist the check is a silent
     no-op (returns True immediately).
     """
-    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit import AuditKeyPermissionError, load_or_create_audit_key
     from bernstein.eval.trajectory_receipt import verify_all_trajectory_receipts
 
-    workdir = AUDIT_DIR.parent.parent
+    # Derive workdir from cwd() for consistency with how the receipts were
+    # emitted (emit also starts from the project root), rather than from
+    # AUDIT_DIR which may be a relative path that resolves differently.
+    workdir = Path.cwd()
 
     try:
         key = load_or_create_audit_key()
-    except OSError as exc:  # pragma: no cover - filesystem race
+    except (OSError, AuditKeyPermissionError) as exc:  # pragma: no cover - filesystem race
         console.print(f"[red]Failed to load audit key for trajectory receipt verification: {exc}[/red]")
         return False
 
@@ -400,10 +403,18 @@ def _verify_trajectory_receipts() -> bool:
         )
     )
     for result in failures:
-        rh = result.receipt.receipt_hash if result.receipt is not None else "?"
+        # Always show the receipt hash (from the result or the receipt itself)
+        # so the operator can locate the file even when result.receipt is None.
+        rh = (
+            result.receipt.receipt_hash
+            if result.receipt is not None
+            else result.reason.split("'")[1]
+            if "'" in result.reason
+            else "unknown"
+        )
         task_idx = result.failing_task_index
         loc = f" (task [{task_idx}])" if task_idx >= 0 else ""
-        console.print(f"  [red]![/red] {rh[:16]}…{loc}: {result.reason}")
+        console.print(f"  [red]![/red] {rh[:32]}…{loc}: {result.reason}")
     return False
 
 
