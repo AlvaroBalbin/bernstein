@@ -1526,12 +1526,6 @@ class OrchestratorConfig:
     # Unified with AGENT.heartbeat_stale_s. Previously 900s; now defaults to 120s.
     # Deployments that explicitly relied on the 900s value must set this field explicitly.
     heartbeat_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_stale_s))
-    # Time-to-first-turn cap for agents still in the `starting` phase. Kept
-    # separate from (and larger than) ``heartbeat_timeout_s`` so a slow/free
-    # model that takes >120s to its first turn is not reaped mid-work while a
-    # non-heartbeat adapter has only its spawn-time heartbeat on disk (issue
-    # #3012). Overridable via ``tuning.agent.heartbeat_starting_timeout_s``.
-    heartbeat_starting_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_starting_timeout_s))
     heartbeat_enabled: bool = True
     # Derived from ORCHESTRATOR.max_agent_runtime_s (canonical) so
     # ``tuning.orchestrator.max_agent_runtime_s`` overrides the starting

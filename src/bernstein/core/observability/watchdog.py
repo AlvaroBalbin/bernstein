@@ -36,19 +36,6 @@ WatchdogSource = Literal["heartbeat", "log_growth", "progress_stall"]
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
 _CAST_DICT_STR_OBJ = "dict[str, object]"
 
-# Heartbeat phases that mean the agent is still producing its FIRST turn. A
-# non-heartbeat adapter (consumes_heartbeat_dir=False) has only its spawn-time
-# heartbeat on disk during this phase, so heartbeat age == wall-clock since
-# spawn; a slow/free model that deliberates past the normal stale threshold
-# must be judged on log/git liveness, not reaped on heartbeat age (issue #3012).
-_STARTING_PHASES: frozenset[str] = frozenset(
-    {"starting", "start", "init", "initializing", "spawning", "spawn", "boot", "booting"}
-)
-
-
-def _is_starting_phase(phase: str | None) -> bool:
-    return bool(phase) and phase.strip().lower() in _STARTING_PHASES
-
 
 def _log_signal_is_fresh(log_age_s: float | None) -> bool:
     """Whether a log mtime proves the agent is alive within the grace window.
@@ -110,7 +97,6 @@ def _check_session_findings(
     findings: dict[str, WatchdogFinding],
     *,
     log_age_s: float | None = None,
-    starting_timeout_s: float | None = None,
 ) -> None:
     """Check a single session for watchdog-worthy findings."""
     stall_count = int(stall_counts.get(task_id, 0))
@@ -149,7 +135,6 @@ def _check_session_findings(
         current_line,
         findings,
         log_age_s=log_age_s,
-        starting_timeout_s=starting_timeout_s,
     )
     _check_log_growth_findings(session_id, task_id, task, runtime_s, current_line, no_growth_ticks, findings)
 
@@ -165,31 +150,21 @@ def _check_heartbeat_findings(
     findings: dict[str, WatchdogFinding],
     *,
     log_age_s: float | None = None,
-    starting_timeout_s: float | None = None,
 ) -> None:
     """Check heartbeat-related findings for a session.
 
     A log/git mtime fresher than ``AGENT.liveness_grace_s`` is treated as a
     POSITIVE liveness signal that suppresses the heartbeat-staleness incident
     entirely -- not merely defers it: the agent is demonstrably alive even if
-    its heartbeat is stale (issue #3012). While the agent is still in the
-    ``starting`` phase the (larger, configurable) ``starting_timeout_s`` is
-    used so a slow/free model's first turn is not a hard 120s cap.
+    its heartbeat is stale (issue #3012).
     """
     # Fresh log/git write within the grace window -> the agent is alive; never
     # raise a heartbeat-staleness incident against a demonstrably-live agent.
     if _log_signal_is_fresh(log_age_s):
         return
 
-    # A `starting` agent (only its spawn-time heartbeat on disk for a
-    # non-heartbeat adapter) is judged against the larger starting-phase
-    # window, not the general stale threshold.
-    effective_timeout = timeout_s
-    if starting_timeout_s is not None and _is_starting_phase(getattr(hb_status, "phase", None)):
-        effective_timeout = max(timeout_s, starting_timeout_s)
-
     if hb_status.last_heartbeat is None:
-        if runtime_s >= max(effective_timeout / 2.0, 60.0) and current_line == 0:
+        if runtime_s >= max(timeout_s / 2.0, 60.0) and current_line == 0:
             title = task.title if task is not None else task_id
             findings[f"heartbeat:{session_id}:{task_id}"] = WatchdogFinding(
                 key=f"heartbeat:{session_id}:{task_id}",
@@ -206,8 +181,8 @@ def _check_heartbeat_findings(
             )
         return
 
-    if hb_status.age_seconds >= max(effective_timeout / 2.0, 60.0):
-        severity: WatchdogSeverity = "critical" if hb_status.age_seconds >= effective_timeout else "high"
+    if hb_status.age_seconds >= max(timeout_s / 2.0, 60.0):
+        severity: WatchdogSeverity = "critical" if hb_status.age_seconds >= timeout_s else "high"
         title = task.title if task is not None else task_id
         findings[f"heartbeat:{session_id}:{task_id}"] = WatchdogFinding(
             key=f"heartbeat:{session_id}:{task_id}",
@@ -218,7 +193,7 @@ def _check_heartbeat_findings(
             summary=f"Heartbeat stale for task {title}",
             detail=(
                 f"Tier-1 watchdog observed heartbeat age {hb_status.age_seconds:.0f}s "
-                f"for task {task_id} (timeout={effective_timeout:.0f}s, phase={hb_status.phase or 'unknown'})."
+                f"for task {task_id} (timeout={timeout_s:.0f}s, phase={hb_status.phase or 'unknown'})."
             ),
             task_title=str(title),
         )
@@ -266,7 +241,6 @@ def collect_watchdog_findings(orch: Any) -> list[WatchdogFinding]:
 
     config = getattr(orch, "_config", None)
     timeout_s = float(getattr(config, "heartbeat_timeout_s", 120))
-    starting_timeout_s = float(getattr(config, "heartbeat_starting_timeout_s", AGENT.heartbeat_starting_timeout_s))
     monitor = HeartbeatMonitor(workdir, timeout_s=timeout_s)
     logs = AgentLogAggregator(workdir)
     now = time.time()
@@ -325,7 +299,6 @@ def collect_watchdog_findings(orch: Any) -> list[WatchdogFinding]:
             stall_counts,
             findings,
             log_age_s=log_age_s,
-            starting_timeout_s=starting_timeout_s,
         )
 
     for session_id in list(log_state.keys()):

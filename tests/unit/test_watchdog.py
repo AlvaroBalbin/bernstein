@@ -57,14 +57,12 @@ def _orch(
     stall_count: int = 0,
     log_state: dict[str, tuple[int, int]] | None = None,
     heartbeat_timeout_s: int = 120,
-    heartbeat_starting_timeout_s: int = 300,
 ) -> SimpleNamespace:
     task = Task(id=session.task_ids[0], title="Fix API", description="desc", role="backend")
     return SimpleNamespace(
         _workdir=workdir,
         _config=SimpleNamespace(
             heartbeat_timeout_s=heartbeat_timeout_s,
-            heartbeat_starting_timeout_s=heartbeat_starting_timeout_s,
         ),
         _agents={session.id: session},
         _stall_counts={session.task_ids[0]: stall_count},
@@ -168,46 +166,19 @@ def test_stale_heartbeat_with_stale_log_still_raises_critical(tmp_path: Path) ->
     assert heartbeat[0].severity == "critical"
 
 
-def test_starting_phase_uses_configurable_larger_timeout(tmp_path: Path) -> None:
-    """A `starting` agent is judged against the larger, configurable
-    starting-phase timeout, so a heartbeat age past the normal 120s cap but
-    below the starting window raises no incident (issue #3012)."""
+def test_starting_phase_heartbeat_uses_the_ordinary_timeout(tmp_path: Path) -> None:
+    """No shipped heartbeat writer ever emits `phase: starting` (issue #3057),
+    so a heartbeat labeled `starting` is judged by the ordinary
+    `heartbeat_timeout_s` like any other phase, with no separate grace
+    window."""
     workdir = tmp_path
     now = time.time()
     session = _session("task-1", spawn_ts=now - 400)
-    orch = _orch(
-        workdir,
-        session=session,
-        heartbeat_timeout_s=120,
-        heartbeat_starting_timeout_s=300,
-    )
-    # Heartbeat 140s old with phase=starting: past the 120s cap (would be
-    # critical) but below the 300s starting window and its 150s high-water mark.
+    orch = _orch(workdir, session=session, heartbeat_timeout_s=120)
+    # Heartbeat 140s old with phase=starting: past the 120s timeout.
     _write_heartbeat_phase(workdir, session.id, now - 140, phase="starting")
     _write_log(workdir, session.id, 3)
-    _age_log(workdir, session.id, age_s=300)  # stale log: isolate the phase-timeout effect
-
-    findings = collect_watchdog_findings(orch)
-
-    assert [f for f in findings if f.source == "heartbeat"] == []
-
-
-def test_starting_phase_still_flags_once_past_starting_timeout(tmp_path: Path) -> None:
-    """Beyond the starting-phase window a frozen `starting` heartbeat with no
-    log activity is still flagged critical -- the larger timeout is a grace
-    window, not a permanent exemption."""
-    workdir = tmp_path
-    now = time.time()
-    session = _session("task-1", spawn_ts=now - 600)
-    orch = _orch(
-        workdir,
-        session=session,
-        heartbeat_timeout_s=120,
-        heartbeat_starting_timeout_s=300,
-    )
-    _write_heartbeat_phase(workdir, session.id, now - 360, phase="starting")  # past 300s
-    _write_log(workdir, session.id, 3)
-    _age_log(workdir, session.id, age_s=300)  # not fresh
+    _age_log(workdir, session.id, age_s=300)  # stale log: isolate the heartbeat-timeout effect
 
     findings = collect_watchdog_findings(orch)
 
