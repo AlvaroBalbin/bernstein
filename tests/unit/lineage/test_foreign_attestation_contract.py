@@ -64,7 +64,14 @@ def test_foreign_attestation_fixture_is_protocol_neutral_and_unlinked() -> None:
     assert set(attestation) == _ALLOWED_ATTESTATION_KEYS
     assert attestation["trust_class"] == "third_party"
     assert _SHA256_DIGEST.fullmatch(str(attestation["content_hash"])) is not None
-    assert attestation["claimed_subject"]
+
+    # The fields a verifier has to resolve before it can reach a verdict at
+    # all. Membership in the allowlist only proves the key is present, and an
+    # empty issuer would make this fixture a different case: "there was
+    # nothing here to check" rather than "this issuer cannot be checked".
+    for field in ("issuer", "issuer_key_id", "claimed_subject"):
+        value = attestation[field]
+        assert isinstance(value, str) and value, f"{field} must be a usable string"
 
     # Never HMAC-chain evidence: no field anywhere beneath the record may carry
     # our own chain material, however it is named or however deeply nested.
