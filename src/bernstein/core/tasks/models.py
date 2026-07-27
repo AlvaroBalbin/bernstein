@@ -1172,6 +1172,10 @@ class AgentSession:
     # profile without re-resolving config.
     response_profile: str = ""
     profile_content_sha256: str = ""
+    # Consecutive reap ticks where heartbeat_ts was refreshed only from the
+    # agent log's mtime, not a live PID or the heartbeat JSON (issue #3058).
+    # Reset whenever a stronger signal confirms real activity.
+    log_only_heartbeat_ticks: int = 0
 
 
 class IsolationMode(StrEnum):

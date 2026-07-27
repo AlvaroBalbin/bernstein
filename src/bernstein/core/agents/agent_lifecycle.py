@@ -2344,16 +2344,41 @@ def _is_process_alive(pid: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_MAX_LOG_ONLY_HEARTBEAT_TICKS = 3  # bound stderr-tainted-log suppression (issue #3058)
+
+
 def _refresh_heartbeat_from_signals(orch: Any, session: AgentSession, now: float) -> None:
-    """Refresh heartbeat_ts using multiple signals (PID, heartbeat file, log, worktree)."""
+    """Refresh heartbeat_ts using multiple signals (PID, heartbeat file, log, worktree).
+
+    A live PID and the heartbeat protocol JSON are real evidence of progress and
+    refresh the heartbeat unconditionally. The plain agent log is not: most
+    adapters merge stderr into it via ``stderr=subprocess.STDOUT``, so a
+    provider retry loop, a progress spinner, or a deprecation warning moves
+    its mtime with no task progress behind it. Left unbounded, that alone
+    can sustain the heartbeat indefinitely, defeating both the
+    heartbeat-timeout reap and the wall-clock timeout's own extension logic
+    in ``reap_dead_agents``. So a heartbeat refreshed from the log (or the
+    worktree ``.git`` pointer) alone is capped to a bounded number of
+    consecutive ticks before an unconfirmed session is left to age out.
+    """
     _hb_freshness_s = _IDLE_HEARTBEAT_THRESHOLD_S * 0.8
 
     if _is_process_alive(session.pid):
         session.heartbeat_ts = now
+        session.log_only_heartbeat_ticks = 0
+        return
+
+    heartbeat_json = orch._workdir / ".sdd" / "runtime" / "heartbeats" / f"{session.id}.json"
+    with contextlib.suppress(OSError):
+        if heartbeat_json.exists() and (now - heartbeat_json.stat().st_mtime) < _hb_freshness_s:
+            session.heartbeat_ts = now
+            session.log_only_heartbeat_ticks = 0
+            return
+
+    if session.log_only_heartbeat_ticks >= _MAX_LOG_ONLY_HEARTBEAT_TICKS:
         return
 
     paths_to_check = [
-        orch._workdir / ".sdd" / "runtime" / "heartbeats" / f"{session.id}.json",
         orch._workdir / ".sdd" / "worktrees" / session.id / ".sdd" / "runtime" / f"{session.id}.log",
         orch._workdir / ".sdd" / "worktrees" / session.id / ".git",
     ]
@@ -2361,6 +2386,7 @@ def _refresh_heartbeat_from_signals(orch: Any, session: AgentSession, now: float
         with contextlib.suppress(OSError):
             if path.exists() and (now - path.stat().st_mtime) < _hb_freshness_s:
                 session.heartbeat_ts = now
+                session.log_only_heartbeat_ticks += 1
                 return
 
 
