@@ -267,6 +267,7 @@ Bernstein is a deterministic orchestrator for CLI coding agents (Claude Code, Co
 | `significance.py`         | Exact statistics for eval gate verdicts (#2520) |
 | `taxonomy.py`             | Failure taxonomy - classify every eval failure into a closed set |
 | `telemetry.py`            | Telemetry contract - strict schema for agent output metadata |
+| `trajectory_receipt.py`   | Signed, independently-replayable trajectory receipts for benchmark scores (#2925) |
 | `vcr_fixture.py`          | VCR fixture pattern - dehydrate/hydrate deterministic test fixtures (T805) |
 | `yaml_runner.py`          | YAML eval harness - operator-runnable spec format with judge and golden diff |
 | `bench/`                  | bernstein-bench: runnable, reproducibility-gated evaluation harness |

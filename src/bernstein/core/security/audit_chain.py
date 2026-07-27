@@ -663,6 +663,17 @@ EVENT_EVAL_GATE_VERDICT = "eval.gate_verdict"
 #: the change to the receipt that revoked it.
 EVENT_EVAL_GATE_REVOCATION = "eval.gate_revocation"
 
+#: Issue #2925 -- emitted once per sealed benchmark-score trajectory receipt
+#: (``bernstein benchmark receipt emit``). The event binds the receipt hash
+#: (the CAS identity of the full receipt), the benchmark run id, the
+#: suite-content hash (contamination anchor), the published score, the task
+#: count, and the status (``ok`` or ``NO_TASKS``). A verifier holding the
+#: receipt can recompute the suite-content hash from the embedded task ids and
+#: re-derive the aggregate score from the per-task components, so neither the
+#: suite composition nor the printed scalar is trusted -- both are proven from
+#: the sealed trajectory.
+EVENT_TRAJECTORY_RECEIPT = "eval.trajectory_receipt"
+
 #: Issue #2513 -- emitted whenever an egress-relevant decision consults the
 #: propagated taint of an artefact. Records ``{target, trust, tainted,
 #: decision, closure_size, trust_records}`` so a verifier folding the chain
@@ -5770,6 +5781,61 @@ def record_eval_gate_revocation(
     )
 
 
+def record_trajectory_receipt(
+    *,
+    chain: AuditChainStore,
+    receipt_hash: str,
+    run_id: str,
+    suite_content_hash: str,
+    published_score: float,
+    n_tasks: int,
+    status: str,
+    journal_entry_hash: str = "",
+    actor: str = "eval_bench",
+) -> AuditEvent:
+    """Append an ``eval.trajectory_receipt`` event into *chain* (#2925).
+
+    Mirrors one sealed benchmark-score trajectory receipt into the HMAC chain
+    so an operator can prove, from the chain alone, that a published score
+    stands on a named replayable trajectory: the suite it ran over (via its
+    content hash) and the task count.  The full per-task anchors and scoring
+    evidence live in the receipt file; only the identity hashes and summary
+    scalars are recorded here -- never task prompts or agent output.
+
+    Args:
+        chain: The audit chain store accepting the entry.
+        receipt_hash: Content hash pinning the whole trajectory receipt.
+        run_id: The benchmark run identifier.
+        suite_content_hash: Order-invariant hash over the suite's task ids
+            (contamination anchor).
+        published_score: The aggregate ``final_score`` sealed into the receipt.
+        n_tasks: Number of task anchors embedded in the receipt.
+        status: ``"ok"`` or ``"NO_TASKS"``.
+        journal_entry_hash: Lineage-spine entry hash anchoring the sealed
+            receipt bytes.
+        actor: Recorded actor; defaults to ``"eval_bench"``.
+
+    Returns:
+        The recorded :class:`AuditEvent` with ``prev_chain_digest`` embedded in
+        its details payload.
+    """
+    return chain.log_with_prev_digest(
+        event_type=EVENT_TRAJECTORY_RECEIPT,
+        actor=actor,
+        resource_type="trajectory_receipt",
+        resource_id=receipt_hash,
+        details={
+            "receipt_hash": receipt_hash,
+            "run_id": run_id,
+            "suite_content_hash": suite_content_hash,
+            "published_score": published_score,
+            "n_tasks": n_tasks,
+            "status": status,
+            "journal_entry_hash": journal_entry_hash,
+        },
+    )
+
+
 def record_taint_decision(
     *,
     chain: AuditChainStore,
@@ -7998,6 +8064,7 @@ __all__ = [
     "EVENT_TEMPLATE_COMPRESSION_RESTORE",
     "EVENT_THREAD_APPROVAL",
     "EVENT_TOURNAMENT_SELECTION",
+    "EVENT_TRAJECTORY_RECEIPT",
     "EVENT_UPDATE_ADVISORY",
     "EVENT_WEBHOOK_NODE_RECEIPT",
     "EVENT_WEBHOOK_PAYLOAD_ANCHOR",
@@ -8129,6 +8196,7 @@ __all__ = [
     "record_task_suspension",
     "record_thread_approval",
     "record_tournament_selection",
+    "record_trajectory_receipt",
     "record_update_advisory",
     "record_webhook_node_receipt",
     "record_webhook_payload_anchor",

@@ -607,6 +607,179 @@ def benchmark_simulate(
 # ---------------------------------------------------------------------------
 
 
+@benchmark_group.group("receipt")
+def benchmark_receipt_group() -> None:
+    """Emit and verify signed benchmark-score trajectory receipts (#2925).
+
+    A trajectory receipt seals the exact replayable run that produced a
+    published benchmark score into a content-addressed, spine-anchored
+    envelope.  Third-party verifiers can re-derive the score from the embedded
+    per-task components without trusting the printed number.
+    """
+
+
+@benchmark_receipt_group.command("emit")
+@click.argument("run_id")
+@click.option("--workdir", default=".", show_default=True, help="Project root.", type=click.Path(exists=True))
+def benchmark_receipt_emit(run_id: str, workdir: str) -> None:
+    """Seal a benchmark run into a signed trajectory receipt.
+
+    RUN_ID is the benchmark run identifier recorded when the run was executed.
+    The receipt is written under .sdd/eval/bench/ and anchored in the
+    eval-bench lineage spine.
+
+    Example:
+
+        bernstein benchmark receipt emit run-2025-07-26-001
+    """
+    import json
+    from pathlib import Path
+
+    from bernstein.core.security.audit import AuditKeyPermissionError, load_or_create_audit_key
+    from bernstein.eval.metrics import EvalScoreComponents, TierScores
+    from bernstein.eval.trajectory_receipt import (
+        TaskTrajectoryAnchor,
+        build_trajectory_receipt,
+        trajectory_receipt_path,
+    )
+
+    _workdir = Path(workdir)
+    try:
+        key = load_or_create_audit_key()
+    except (OSError, AuditKeyPermissionError) as exc:
+        console.print(f"[red]Failed to load audit key: {exc}[/red]")
+        raise SystemExit(1) from exc
+
+    # Load persisted run record from .sdd/benchmarks/benchmark_runs.jsonl
+    runs_path = _workdir / ".sdd" / "benchmarks" / "benchmark_runs.jsonl"
+    if not runs_path.is_file():
+        console.print(f"[red]No benchmark runs found at {runs_path}[/red]")
+        raise SystemExit(1)
+
+    run_record: dict | None = None
+    with runs_path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("run_id") == run_id:
+                run_record = rec
+                break
+
+    if run_record is None:
+        console.print(f"[red]Run {run_id!r} not found in {runs_path}[/red]")
+        raise SystemExit(1)
+
+    # Build TaskTrajectoryAnchor list from the persisted run record.
+    # Reject any task that has no real journal head — placeholder zero-hashes
+    # would seal a receipt that verifies clean with no real trajectory behind
+    # it, which is exactly the fabrication mode the receipt is designed to
+    # detect.
+    _ZERO_HASH = "sha256:" + "0" * 64
+    task_anchors: list[TaskTrajectoryAnchor] = []
+    for task in run_record.get("tasks", []):
+        jh = task.get("journal_head_hash", "")
+        if not jh or jh == _ZERO_HASH:
+            console.print(
+                f"[red]Task {task.get('task_id', '?')!r} has no real journal head hash — "
+                f"cannot emit a verifiable receipt for a run without a sealed trajectory.[/red]"
+            )
+            raise SystemExit(1)
+        c = task.get("components", {})
+        task_anchors.append(
+            TaskTrajectoryAnchor(
+                task_id=task["task_id"],
+                journal_head_hash=jh,
+                events_content_hash=task.get("events_content_hash", _ZERO_HASH),
+                model_id=task.get("model_id", "unknown"),
+                config_fingerprint=task.get("config_fingerprint", "unknown"),
+                components=EvalScoreComponents(
+                    task_success=float(c.get("task_success", 0.0)),
+                    code_quality=float(c.get("code_quality", 0.0)),
+                    efficiency=float(c.get("efficiency", 0.0)),
+                    reliability=float(c.get("reliability", 1.0)),
+                    safety=float(c.get("safety", 1.0)),
+                ),
+            )
+        )
+
+    pt = run_record.get("per_tier", {})
+    per_tier = TierScores(
+        smoke=float(pt.get("smoke", 0.0)),
+        standard=float(pt.get("standard", 0.0)),
+        stretch=float(pt.get("stretch", 0.0)),
+        adversarial=float(pt.get("adversarial", 0.0)),
+    )
+
+    receipt = build_trajectory_receipt(
+        run_id=run_id,
+        task_anchors=task_anchors,
+        per_tier=per_tier,
+        workdir=_workdir,
+        lineage_root=_workdir / ".sdd" / "lineage",
+        hmac_key=key,
+    )
+
+    path = trajectory_receipt_path(_workdir, receipt.receipt_hash)
+    console.print(f"[green]Trajectory receipt emitted:[/green] {receipt.receipt_hash}")
+    console.print(f"  Tasks:  {len(receipt.task_anchors)}")
+    console.print(f"  Score:  {receipt.published_score:.4f}")
+    console.print(f"  Status: {receipt.status}")
+    console.print(f"  Path:   {path}")
+
+
+@benchmark_receipt_group.command("verify")
+@click.argument("receipt_hash")
+@click.option("--workdir", default=".", show_default=True, help="Project root.", type=click.Path(exists=True))
+def benchmark_receipt_verify(receipt_hash: str, workdir: str) -> None:
+    """Verify a trajectory receipt offline.
+
+    RECEIPT_HASH is the sha256: content hash printed by 'emit'.
+    Re-derives the benchmark score from the embedded per-task components;
+    exits non-zero if any step fails.
+
+    Example:
+
+        bernstein benchmark receipt verify sha256:abc123...
+    """
+    from pathlib import Path
+
+    from bernstein.core.security.audit import AuditKeyPermissionError, load_or_create_audit_key
+    from bernstein.eval.trajectory_receipt import verify_trajectory_receipt
+
+    _workdir = Path(workdir)
+    try:
+        key = load_or_create_audit_key()
+    except (OSError, AuditKeyPermissionError) as exc:
+        console.print(f"[red]Failed to load audit key: {exc}[/red]")
+        raise SystemExit(1) from exc
+
+    result = verify_trajectory_receipt(
+        workdir=_workdir,
+        lineage_root=_workdir / ".sdd" / "lineage",
+        hmac_key=key,
+        receipt_hash=receipt_hash,
+    )
+
+    if result.ok:
+        r = result.receipt
+        console.print(f"[green]✓ Trajectory receipt verified:[/green] {receipt_hash[:32]}…")
+        if r is not None:
+            console.print(f"  Run:    {r.run_id}")
+            console.print(f"  Tasks:  {len(r.task_anchors)}")
+            console.print(f"  Score:  {r.published_score:.4f}")
+            console.print(f"  Status: {r.status}")
+    else:
+        task_idx = result.failing_task_index
+        loc = f" (task [{task_idx}])" if task_idx >= 0 else ""
+        console.print(f"[red]✗ Trajectory receipt FAILED{loc}:[/red] {result.reason}")
+        raise SystemExit(1)
+
+
 @click.group("eval")
 def eval_group() -> None:
     """Evaluation harness with multiplicative scoring."""
