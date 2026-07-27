@@ -85,9 +85,26 @@ jobs:
         with:
           egress-policy: audit
 
+      # Check out the merge group's BASE ref, never the queued entry.
+      #
+      # `actions/checkout` with no `ref:` takes the ref that triggered the
+      # run. On a `merge_group` event that is the ephemeral
+      # `gh-readonly-queue/<base>/pr-<n>-<base sha>` branch, which carries
+      # the candidate pull request's tree. This job holds `checks: write`,
+      # and `checks: write` is enough to forge a required context: it can
+      # post a completed check-run named `CI gate` with conclusion
+      # `success` on any commit in the repository. Running
+      # `scripts/publish_required_check.py` out of a candidate tree would
+      # hand that capability to whoever authored the queued pull request.
+      #
+      # This is the same reasoning that pins the `pr-gate` job below to
+      # the pull request's base ref. The job needs nothing from any
+      # candidate tree: it resolves the pull request and its check-runs
+      # over the API, and the publisher is API-only too.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ github.event.merge_group.base_ref }}
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
