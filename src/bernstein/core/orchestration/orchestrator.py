@@ -1948,8 +1948,16 @@ class Orchestrator:
             except Exception as exc:  # tick-level safety net
                 logger.warning("Log-growth idle detection failed: %s", exc)
 
-        # 5. Reap dead/stale agents and fail their tasks
-        reap_dead_agents(self, result, tasks_by_status)
+        # 5. Reap dead/stale agents and fail their tasks.
+        #     reap_dead_agents already contains a per-session guard, so a single
+        #     malformed session cannot cost the others their reap. This outer net
+        #     covers what that guard cannot: a failure outside the per-session
+        #     body (e.g. `_agents` mutated by another thread while the pass
+        #     snapshots it) must not skip the tick steps sequenced below.
+        try:
+            reap_dead_agents(self, result, tasks_by_status)
+        except Exception:  # tick-level safety net
+            logger.exception("Agent reap pass failed - remaining tick steps continue")
 
         # 5b. Retry any pushes that failed in previous ticks (normal cadence)
         if _run_normal:

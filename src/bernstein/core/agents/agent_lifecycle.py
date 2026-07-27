@@ -2523,36 +2523,76 @@ def reap_dead_agents(
         if session.status == "dead":
             continue
 
-        timeout_s = session.timeout_s if session.timeout_s is not None else orch._config.max_agent_runtime_s
-        runtime = now - session.spawn_ts
-        _time_since_heartbeat = now - session.heartbeat_ts if session.heartbeat_ts > 0 else runtime
-        _hard_cap_s = 5400  # 90 minutes absolute maximum
-        if runtime > timeout_s and _time_since_heartbeat < 120 and timeout_s < _hard_cap_s:
-            session.timeout_s = min(timeout_s + 600, _hard_cap_s)
-            logger.info(
-                "Agent %s exceeded %.0fs timeout but heartbeated %.0fs ago - extending to %.0fs",
+        # Per-session blast radius. Without this guard an unexpected attribute
+        # or state shape on ONE session (e.g. a remote-runtime bridge session
+        # carrying ``pid=None``) propagates out of the whole tick: every
+        # remaining agent loses its reap for that tick, and so do the tick
+        # steps sequenced after the reap pass (pending-push retry, evolution
+        # cycle, knowledge refresh). Log loudly and move to the next session
+        # instead - a session that raises here is never reaped, so the
+        # traceback is the only signal an operator gets.
+        try:
+            _reap_session_if_due(orch, session, result, tasks_snapshot, now)
+        except Exception:
+            logger.exception(
+                "Reap pass failed for agent %s (role=%s status=%s tasks=%s) - "
+                "skipping this session; remaining agents are still reaped this tick",
                 session.id,
-                timeout_s,
-                _time_since_heartbeat,
-                session.timeout_s,
+                session.role,
+                session.status,
+                session.task_ids,
             )
-            continue
-        if runtime > timeout_s:
-            logger.warning(
-                "Reaping agent %s (exceeded timeout %.0fs, runtime %.0fs, last heartbeat %.0fs ago)",
-                session.id,
-                timeout_s,
-                runtime,
-                _time_since_heartbeat,
-            )
-            _reap_wall_clock_timeout(orch, session, result, tasks_snapshot, runtime)
-            continue
 
-        _refresh_heartbeat_from_signals(orch, session, now)
 
-        age = now - session.heartbeat_ts
-        if session.heartbeat_ts > 0 and age > orch._config.heartbeat_timeout_s:
-            _reap_heartbeat_timeout(orch, session, result, tasks_snapshot, now, age)
+def _reap_session_if_due(
+    orch: Any,
+    session: AgentSession,
+    result: Any,  # TickResult
+    tasks_snapshot: dict[str, list[Task]],
+    now: float,
+) -> None:
+    """Apply the wall-clock and heartbeat reap rules to a single session.
+
+    Split out of :func:`reap_dead_agents` so one session's failure can be
+    contained without abandoning the rest of the tick.
+
+    Args:
+        orch: Orchestrator instance.
+        session: The (non-dead) session to evaluate.
+        result: TickResult to record reaped agent IDs into.
+        tasks_snapshot: Pre-fetched tasks bucketed by status from this tick.
+        now: Tick timestamp, shared across all sessions in this pass.
+    """
+    timeout_s = session.timeout_s if session.timeout_s is not None else orch._config.max_agent_runtime_s
+    runtime = now - session.spawn_ts
+    _time_since_heartbeat = now - session.heartbeat_ts if session.heartbeat_ts > 0 else runtime
+    _hard_cap_s = 5400  # 90 minutes absolute maximum
+    if runtime > timeout_s and _time_since_heartbeat < 120 and timeout_s < _hard_cap_s:
+        session.timeout_s = min(timeout_s + 600, _hard_cap_s)
+        logger.info(
+            "Agent %s exceeded %.0fs timeout but heartbeated %.0fs ago - extending to %.0fs",
+            session.id,
+            timeout_s,
+            _time_since_heartbeat,
+            session.timeout_s,
+        )
+        return
+    if runtime > timeout_s:
+        logger.warning(
+            "Reaping agent %s (exceeded timeout %.0fs, runtime %.0fs, last heartbeat %.0fs ago)",
+            session.id,
+            timeout_s,
+            runtime,
+            _time_since_heartbeat,
+        )
+        _reap_wall_clock_timeout(orch, session, result, tasks_snapshot, runtime)
+        return
+
+    _refresh_heartbeat_from_signals(orch, session, now)
+
+    age = now - session.heartbeat_ts
+    if session.heartbeat_ts > 0 and age > orch._config.heartbeat_timeout_s:
+        _reap_heartbeat_timeout(orch, session, result, tasks_snapshot, now, age)
 
 
 # ---------------------------------------------------------------------------

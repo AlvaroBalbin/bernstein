@@ -1628,6 +1628,109 @@ class TestReaping:
         assert len(result.reaped) == 0
         assert session.status == "working"
 
+    @patch("bernstein.core.agents.agent_lifecycle._is_process_alive", return_value=False)
+    @patch("bernstein.core.agent_recycling._is_process_alive", return_value=False)
+    def test_one_raising_session_does_not_block_other_reaps(
+        self,
+        _mock_alive: MagicMock,
+        _mock_alive_lifecycle: MagicMock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A session that raises mid-reap is skipped; the rest are still reaped.
+
+        Regression guard: ``reap_dead_agents`` used to process every session in
+        one unguarded loop, so an unexpected state shape on ONE session (the
+        observed case: a remote-runtime bridge session with ``pid=None`` raising
+        ``TypeError`` out of ``_refresh_heartbeat_from_signals``) propagated out
+        of the whole tick - every later session lost its reap and the tick steps
+        after the reap pass were skipped entirely.
+        """
+        adapter = _mock_adapter()
+        config = OrchestratorConfig(
+            max_agents=6,
+            poll_interval_s=1,
+            heartbeat_timeout_s=60,
+            server_url="http://testserver",
+        )
+        orch = _build_orchestrator(
+            tmp_path,
+            _mock_transport({"GET /tasks": httpx.Response(200, json=[])}),
+            adapter=adapter,
+            config=config,
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if request.method == "GET":
+                if path == "/tasks":
+                    return httpx.Response(200, json=[])
+                if path.endswith("/snapshots"):
+                    return httpx.Response(200, json=[])
+                if path.startswith("/tasks/"):
+                    return httpx.Response(200, json=_task_as_dict(_make_task(id=path.rsplit("/", 1)[1])))
+                return httpx.Response(404)
+            if path == "/tasks":
+                return httpx.Response(201, json={"id": "T-retry"})
+            if path.endswith("/fail"):
+                task_id = path.rsplit("/", 2)[1]
+                return httpx.Response(200, json=_task_as_dict(_make_task(id=task_id, status="failed")))
+            return httpx.Response(200, json={})
+
+        orch._client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://testserver")
+
+        stale_ts = time.time() - 120  # threshold is 60s
+        # Insertion order matters: the raising session is processed FIRST, so a
+        # regression takes the second session's reap down with it.
+        for sid in ("sess-raises", "sess-healthy"):
+            orch._agents[sid] = AgentSession(
+                id=sid,
+                role="backend",
+                pid=999,
+                task_ids=[f"T-{sid}"],
+                heartbeat_ts=stale_ts,
+                status="working",
+            )
+
+        def _boom(_orch: Any, session: AgentSession, _now: float) -> None:
+            if session.id == "sess-raises":
+                raise TypeError("simulated bad session state")
+
+        with (
+            patch("bernstein.core.agents.agent_lifecycle._refresh_heartbeat_from_signals", _boom),
+            caplog.at_level(logging.ERROR, logger="bernstein.core.agents.agent_lifecycle"),
+        ):
+            result = orch.tick()
+
+        assert "sess-healthy" in result.reaped, "a sibling session's failure must not skip this reap"
+        assert "sess-raises" not in result.reaped
+
+        # The skip must be loud: ERROR + traceback naming the offending session,
+        # since a session that keeps raising here is otherwise never reaped.
+        failures = [r for r in caplog.records if r.levelno >= logging.ERROR and "sess-raises" in r.getMessage()]
+        assert failures, f"expected an ERROR naming the failing session, got: {caplog.text}"
+        assert failures[0].exc_info is not None, "guard must log the traceback, not just a warning line"
+
+    def test_reap_pass_failure_does_not_abort_the_tick(self, tmp_path: Path) -> None:
+        """A total ``reap_dead_agents`` failure still leaves the later tick steps running."""
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[])})
+        config = OrchestratorConfig(
+            max_agents=6,
+            poll_interval_s=1,
+            server_url="http://testserver",
+        )
+        orch = _build_orchestrator(tmp_path, transport, config=config)
+        # Step 7, sequenced after the reap pass and gated on no tick phase.
+        orch._check_evolve = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        with patch(
+            "bernstein.core.orchestration.orchestrator.reap_dead_agents",
+            side_effect=RuntimeError("dictionary changed size during iteration"),
+        ):
+            orch.tick()
+
+        orch._check_evolve.assert_called_once()
+
 
 # --- run / stop ---
 
