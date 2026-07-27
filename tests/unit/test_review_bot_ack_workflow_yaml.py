@@ -280,6 +280,50 @@ def test_no_job_checks_out_the_pull_request_head(
             )
 
 
+def test_every_checkout_pins_an_explicit_base_ref(
+    gate_doc: dict[str, object],
+) -> None:
+    """INV-2c. An omitted ``ref:`` is the same defect as an explicit head ref.
+
+    ``test_no_job_checks_out_the_pull_request_head`` only rejects a ref
+    that spells the head out. A checkout step with no ``ref:`` at all
+    passes it vacuously while doing exactly the thing the docstring
+    forbids: ``actions/checkout`` defaults to the ref that triggered the
+    run, which on a ``merge_group`` event is the queued entry's own
+    ``gh-readonly-queue/...`` branch. That branch carries the candidate
+    pull request's tree, so the job runs
+    ``scripts/publish_required_check.py`` out of code the pull request
+    author controls while holding ``checks: write``.
+
+    ``checks: write`` is enough to forge a required context: it can post
+    a completed check-run named ``CI gate`` with conclusion ``success``
+    on any commit in the repository. Every job in this workflow reaches
+    the pull request over the API and needs nothing from any candidate
+    tree, so every checkout here pins the base ref.
+    """
+    seen = 0
+    for key, job in _jobs(gate_doc).items():
+        for step in _steps(job):
+            if "checkout" not in str(step.get("uses", "")):
+                continue
+            seen += 1
+            ref = str((step.get("with") or {}).get("ref", "")).strip()
+            assert ref, (
+                f"job {key!r} checks out without an explicit `ref:`. actions/checkout then takes the triggering "
+                "ref, which on a merge_group run is the queued entry's own branch, so this job would execute the "
+                "candidate pull request's code under its `checks: write` token. Pin the base ref."
+            )
+            assert "head" not in ref, (
+                f"job {key!r} checks out a head ref ({ref!r}); use the base ref so the publisher always exists "
+                "and a candidate tree cannot run code under this job's write permissions."
+            )
+            assert "base" in ref, (
+                f"job {key!r} checks out {ref!r}, which is neither the pull request base ref nor the merge "
+                "group base ref. Only a base ref is guaranteed to be repository-controlled."
+            )
+    assert seen, "workflow must check out something; otherwise this guard is vacuous"
+
+
 def test_publish_is_skipped_while_a_job_is_being_cancelled(
     gate_doc: dict[str, object],
 ) -> None:
