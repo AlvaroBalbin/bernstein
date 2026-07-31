@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 from click.testing import CliRunner
@@ -15,10 +16,25 @@ from bernstein.core.observability.run_export import (
     _ExportReport,
     _fmt_duration,
     _fmt_duration_short,
+    _load_report_data,
     _sequential_estimate,
     _TaskRow,
     export_run_report,
 )
+
+
+class CostModelPayload(TypedDict):
+    model: str
+    total_cost_usd: float
+    invocation_count: int
+    total_tokens: int
+
+
+class CostReportPayload(TypedDict, total=False):
+    run_id: str
+    total_spent_usd: float
+    per_model: list[CostModelPayload]
+
 
 # ---------------------------------------------------------------------------
 # Helper: set up a minimal .sdd directory with test data
@@ -77,7 +93,7 @@ def _setup_sdd(tmp_path: Path, run_id: str = "run-001") -> Path:
         (metrics_dir / f"agent_{i}.json").write_text(json.dumps(agent_data))
 
     # Cost data
-    cost_report = {
+    cost_report: CostReportPayload = {
         "run_id": run_id,
         "total_spent_usd": 4.82,
         "per_model": [
@@ -273,6 +289,33 @@ def test_export_html_contains_cost_table(tmp_path: Path) -> None:
     assert "claude-opus" in content
     assert "claude-sonnet" in content
     assert "codex" in content
+
+
+def test_load_report_data_uses_runtime_cost_fallback(tmp_path: Path) -> None:
+    workdir = _setup_sdd(tmp_path)
+    run_id = "run-001"
+    (workdir / ".sdd" / "metrics" / f"costs_{run_id}.json").unlink()
+
+    fallback_dir = workdir / ".sdd" / "runtime" / "costs"
+    fallback_dir.mkdir(parents=True)
+    fallback_cost_report: CostReportPayload = {
+        "total_spent_usd": 7.25,
+        "per_model": [
+            {
+                "model": "fallback-model",
+                "total_cost_usd": 7.25,
+                "invocation_count": 2,
+                "total_tokens": 1234,
+            }
+        ],
+    }
+    (fallback_dir / f"{run_id}.json").write_text(json.dumps(fallback_cost_report))
+
+    report = _load_report_data(workdir, run_id)
+
+    assert report.total_cost_usd == pytest.approx(7.25)
+    assert len(report.model_costs) == 1
+    assert report.model_costs[0].model == "fallback-model"
 
 
 def test_export_html_contains_agent_stats(tmp_path: Path) -> None:
