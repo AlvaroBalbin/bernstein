@@ -30,15 +30,53 @@ Human output prints one line per hop (`issuer -> audience (act)`) followed by
 a pass/fail summary. `--json` emits:
 
 ```json
-{"run": "...", "valid": true, "hops": 3, "errors": [], "receipts": [
+{"run": "...", "valid": true, "hops": 2, "errors": [], "receipts": [
   {"hop_index": 0, "issuer": "...", "subject": "...", "audience": "...", "act": "..."}
-]}
+], "verdict": {"verdict": "pass", "ok": true, "unproven_hops": 0, "reasons": [],
+  "hops": [{"hop_index": 0, "verdict": "pass", "is_root": true,
+    "reasons": ["root_structural_only"], "axes": [], "diagnostics": [],
+    "parent_hop_index": null, "ancestor_hop_index": null, "principal": "..."}]}}
 ```
 
-Exit codes: `0` when the chain is intact (at least one hop, every hop
-verifies from genesis to tail); `1` when there are zero receipts for the run,
-or any hop fails (HMAC mismatch from a tampered field, a deleted hop, or the
-wrong key).
+Exit codes: `0` when the chain is intact and narrowing was checked and held;
+`1` when there are zero receipts for the run, or any hop fails (HMAC mismatch
+from a tampered field, a deleted hop, the wrong key, or a hop that widened its
+parent's grant); `3` when the chain verifies but the receipts carry too little
+to decide whether authority narrowed. `2` is left to click for usage errors.
+
+**Compatibility note (issue #2554).** A chain that records no effective scope
+at any hop used to exit `0`, which read the same as a chain whose narrowing was
+checked and held. It now exits `3`, unproven. Nothing that exited `1` before
+exits `0` now; the only changed outcome is `0` to `3`. Automation that treated
+every valid legacy chain as success needs to decide whether unproven is
+acceptable for its purpose, which is the question the old exit code hid.
+A caller that wants each status handled explicitly:
+
+```sh
+run="$1"
+ledger_root="${2:-.sdd/audit}"
+status=0
+bernstein delegation verify "$run" --root "$ledger_root" || status=$?
+case "$status" in
+  0) echo "narrowing checked and held" ;;
+  1) echo "chain invalid or a hop widened" >&2; exit 1 ;;
+  2) echo "usage error" >&2; exit 2 ;;
+  3) echo "unproven: no narrowing was established, decide by policy" >&2; exit 3 ;;
+  *) echo "unexpected exit status $status" >&2; exit "$status" ;;
+esac
+```
+
+`--json` carries the same reading under `verdict`: a `verdict` of `pass`,
+`fail`, or `unproven`, an `unproven_hops` count, and one row per hop with its
+own verdict, reasons, and named scope axes. The reason strings are a closed
+set, so a consumer can fail closed on exact matches.
+
+What a pass does not establish: that runtime enforcement matched the recorded
+scope, including consumption state such as remaining uses; that any grant was
+appropriate policy; that the supplied receipt set is complete, or that no
+alternate delegation path exists; that an unresolved reference would have
+matched; anything about execution outcomes. unproven is not a pass, and pass is
+the only positive claim.
 
 Receipts are written by calling `DelegationLedger.record_hop` (or its
 convenience wrapper `record_delegation_hop`) for each
