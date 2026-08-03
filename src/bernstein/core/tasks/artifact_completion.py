@@ -61,7 +61,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from bernstein.core.tasks.artifacts import ArtifactKind, CanonicalisationError
+from bernstein.core.tasks.artifacts import (
+    ArtifactKind,
+    ArtifactSpecError,
+    CanonicalisationError,
+    validate_artifact_output_path,
+)
 
 if TYPE_CHECKING:
     from bernstein.core.lineage.artifact_record import ArtifactReceipt
@@ -168,12 +173,33 @@ def artifact_output_path(task: Task) -> str:
     declared = (task.artifact_spec.output_path or "").strip()
     if not declared:
         return f"{DEFAULT_OUTBOX_RELPATH}/{task.id}/artifact"
-    normalised = declared.replace("\\", "/")
-    if normalised.startswith("/") or (len(normalised) > 2 and normalised[1:3] == ":/"):
-        raise ArtifactCompletionError(f"artifact output_path must be workdir-relative, got {declared!r}")
-    if any(seg == ".." for seg in normalised.split("/")):
-        raise ArtifactCompletionError(f"artifact output_path must not traverse out of the workdir: {declared!r}")
-    return normalised
+    # One set of path rules, shared with the declaration parser (#3110):
+    # a declaration that loads is a path this completion check will accept.
+    try:
+        return validate_artifact_output_path(declared)
+    except ArtifactSpecError as exc:
+        raise ArtifactCompletionError(f"artifact output_path {exc.reason}") from exc
+
+
+def _resolve_contained_artifact_path(workdir: Path, relpath: str) -> Path:
+    """Resolve ``relpath`` under ``workdir`` and refuse any escape.
+
+    :func:`validate_artifact_output_path` rejects lexical escapes (absolute
+    paths, ``..``) at declaration time, but a symlink planted inside the
+    workdir can still point outside it, and the produced artifact's bytes are
+    about to become the subject of a signed receipt. Containment is therefore
+    enforced on the *resolved* path, after every symlink is followed. The
+    resolved path, not the declared one, is what gets opened afterwards: a
+    component swapped between this check and the read changes which contained
+    bytes are read, never whether the read stays inside the workdir.
+    """
+    base = workdir.resolve()
+    resolved = (base / relpath).resolve()
+    if not resolved.is_relative_to(base):
+        raise ArtifactCompletionError(
+            f"artifact output path {relpath!r} resolves outside the task workdir; refusing to read it"
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -213,12 +239,13 @@ def load_artifact(task: Task, workdir: Path) -> Any:
             the declared kind.
     """
     relpath = artifact_output_path(task)
-    path = Path(workdir) / relpath
-    if not path.is_file():
+    path = _resolve_contained_artifact_path(Path(workdir), relpath)
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         raise ArtifactCompletionError(
             f"task declares artifact kind {task.artifact_spec.kind.value!r} but wrote no output at {relpath}"
-        )
-    raw = path.read_bytes()
+        ) from None
     kind = task.artifact_spec.kind
 
     if kind is ArtifactKind.CODE_DIFF:  # pragma: no cover - guarded by is_artifact_mode
