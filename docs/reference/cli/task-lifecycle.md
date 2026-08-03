@@ -139,7 +139,7 @@ bernstein reject  TASK_ID [--workdir .]
 
 Both commands are file-only: they write `.sdd/runtime/approvals/<id>.approved` or `.rejected`. The orchestrator's next tick picks the file up, transitions the task (merge on approve, cleanup on reject), and removes the file. **Approval and rejection are both idempotent** - the orchestrator scrubs duplicates.
 
-> **Not the same as `bernstein approve-tool` / `bernstein reject-tool`.** Those resolve **tool-call** approvals (a single tool invocation by a running agent). The lifecycle approve/reject above resolves a **whole task's verification** review. See `cli/commands/approval_cmd.py` for the tool-call variants.
+> **Not the same as `bernstein approve-tool` / `bernstein reject-tool`.** Those resolve **tool-call** approvals (a single tool invocation by a running agent) and are also reachable as `bernstein approve --tool <id>` / `bernstein reject --tool <id>`. The lifecycle approve/reject above resolves a **whole task's verification** review. See `cli/commands/approval_cmd.py` for the tool-call variants.
 
 ---
 

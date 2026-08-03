@@ -15,7 +15,7 @@ For session monitoring commands (`live`, `dashboard`, `status`, `ps`, `cost`, `d
 | `bernstein hooks` | Lifecycle hooks for `pre_task`, `post_task`, `pre_merge`, `post_merge`, `pre_spawn`, `post_spawn`; shell scripts or pluggy `@hookimpl`s. `hooks list`, `hooks run <event>`, `hooks check`. |
 | `bernstein chat serve --platform=telegram\|discord\|slack` | Drive runs from chat with `/run`, `/status`, `/approve`, `/reject`, `/switch`, `/stop`. |
 | `bernstein workflow run <name>` | Run a YAML workflow manifest. Also `workflow list`, `workflow init`, `workflow validate`. |
-| `bernstein approve-tool` / `bernstein reject-tool` | Interactive mid-run tool-call approval. `--latest`, `--id`, `--always`. |
+| `bernstein approve-tool` / `bernstein reject-tool` | Interactive mid-run tool-call approval. `--latest`, `--id`, `--always`. Flag form: `approve --tool <id>` / `reject --tool <id>`. |
 | `bernstein autofix` | Daemon that monitors open Bernstein PRs; spawns a fixer agent when CI fails and pushes the repair automatically. |
 | `bernstein preview start` | Sandboxed dev server for the current branch with a shareable public tunnel URL. |
 | `bernstein remote` | SSH sandbox backend. `remote test <host>`, `remote run <host> <path>`, `remote forget <host>`. ControlMaster socket reuse for fast repeat calls. |

@@ -78,7 +78,7 @@ def approve_tool_cmd(
     always: bool,
     workdir: str,
 ) -> None:
-    """Approve a pending tool-call approval (op-002).
+    """Approve a pending tool-call approval.
 
     Pops the oldest pending approval from ``.sdd/runtime/approvals/`` and
     records an ``allow`` decision. Pass ``--latest`` to resolve the most
@@ -91,6 +91,21 @@ def approve_tool_cmd(
       bernstein approve-tool
       bernstein approve-tool --always
       bernstein approve-tool --id ap-1a2b3c4d5e6f
+    """
+    approve_tool(latest=latest, approval_id=approval_id, always=always, workdir=workdir)
+
+
+def approve_tool(
+    *,
+    latest: bool,
+    approval_id: str | None,
+    always: bool,
+    workdir: str,
+) -> None:
+    """Resolve a pending tool-call approval.
+
+    Shared implementation behind the ``approve-tool`` command and the
+    ``bernstein approve --tool <id>`` flag form.
     """
     queue = _queue_for(workdir)
     approval = _select_approval(queue, latest=latest, approval_id=approval_id)
@@ -131,7 +146,7 @@ def reject_tool_cmd(
     approval_id: str | None,
     workdir: str,
 ) -> None:
-    """Reject a pending tool-call approval (op-002).
+    """Reject a pending tool-call approval.
 
     Records a ``reject`` decision so the blocked agent surfaces a
     permission error. With no flags the oldest pending approval is
@@ -141,6 +156,20 @@ def reject_tool_cmd(
     Examples:
       bernstein reject-tool
       bernstein reject-tool --id ap-1a2b3c4d5e6f
+    """
+    reject_tool(latest=latest, approval_id=approval_id, workdir=workdir)
+
+
+def reject_tool(
+    *,
+    latest: bool,
+    approval_id: str | None,
+    workdir: str,
+) -> None:
+    """Resolve a pending tool-call approval as rejected.
+
+    Shared implementation behind the ``reject-tool`` command and the
+    ``bernstein reject --tool <id>`` flag form.
     """
     queue = _queue_for(workdir)
     approval = _select_approval(queue, latest=latest, approval_id=approval_id)
@@ -156,4 +185,4 @@ def reject_tool_cmd(
     console.print(f"[red]Rejected {approval.id}[/]")
 
 
-__all__ = ["approve_tool_cmd", "reject_tool_cmd"]
+__all__ = ["approve_tool", "approve_tool_cmd", "reject_tool", "reject_tool_cmd"]

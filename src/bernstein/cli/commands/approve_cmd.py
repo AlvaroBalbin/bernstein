@@ -78,7 +78,7 @@ def _foreground_confirm(prompt: str) -> bool:
 
 
 @click.command("approve")
-@click.argument("task_id")
+@click.argument("task_id", required=False)
 @click.option(
     "--workdir",
     default=".",
@@ -91,7 +91,13 @@ def _foreground_confirm(prompt: str) -> bool:
     show_default=True,
     help="Foreground TTY prompts confirm before writing the sentinel.",
 )
-def approve(task_id: str, workdir: str, prompt: bool) -> None:
+@click.option(
+    "--tool",
+    "tool_id",
+    default=None,
+    help="Resolve a pending tool-call approval by id instead of a task (flag form of ``approve-tool``).",
+)
+def approve(task_id: str | None, workdir: str, prompt: bool, tool_id: str | None) -> None:
     """Approve a pending task (review gate or pre-spawn approval gate).
 
     Writes a ``<task_id>.approved`` decision file under
@@ -102,10 +108,26 @@ def approve(task_id: str, workdir: str, prompt: bool) -> None:
     creates the file, subsequent invocations report ``already resolved``
     and exit without rewriting state.
 
+    Pass ``--tool <id>`` instead to resolve a pending tool-call approval
+    from the interactive approval queue; ``approve-tool`` remains as an
+    alias for this flag form.
+
     \b
-    Example:
+    Examples:
       bernstein approve T-abc123
+      bernstein approve --tool ap-1a2b3c4d5e6f
     """
+    if tool_id is not None:
+        from bernstein.cli.commands.approval_cmd import approve_tool
+
+        approve_tool(latest=False, approval_id=tool_id, always=False, workdir=workdir)
+        return
+
+    if task_id is None:
+        raise click.UsageError(
+            "Missing argument 'TASK_ID'; pass a task id, or --tool <id> to resolve a pending tool-call approval."
+        )
+
     from bernstein.core.orchestration.approval_gate import UnsafeApprovalIdError, approval_path
 
     # The decision file name is derived from task_id, so the id goes through the

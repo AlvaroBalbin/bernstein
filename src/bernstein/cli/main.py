@@ -1174,7 +1174,8 @@ cli.add_command(aliases_cmd, "aliases")
 cli.add_command(debug_cmd, "debug-bundle")
 
 # op-002: interactive tool-call approval (approve-tool / reject-tool).
-# These are the tool-call resolvers; task-level ``approve``/``reject`` live in task_cmd.
+# These are the tool-call resolvers; task-level ``approve``/``reject`` live in
+# approve_cmd/reject_cmd and also accept ``--tool <id>`` for this queue.
 cli.add_command(approve_tool_cmd, "approve-tool")
 cli.add_command(reject_tool_cmd, "reject-tool")
 # ``bernstein debug`` is the structured diagnostics group; ``debug bundle``

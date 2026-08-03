@@ -709,13 +709,13 @@ The group also accepts `--web [host:]port` to run the web view instead of the TU
 | `bernstein mandate` | Verifiable spending mandates as journal-anchored consent receipts (group): `emit` / `verify` / `revoke`. | `cli/commands/mandate_cmd.py` |
 | `bernstein compaction` | Compaction receipt-chain ops (group). | `cli/commands/compaction_cmd.py:32` |
 | `bernstein quarantine` | Quarantined-task ops (group). | `cli/commands/advanced_cmd.py:1120` |
-| `bernstein approve-tool` | Approve a tool-call request. | `cli/commands/approval_cmd.py:approve_tool_cmd` |
-| `bernstein reject-tool` | Reject a tool-call request. | `cli/commands/approval_cmd.py:reject_tool_cmd` |
+| `bernstein approve-tool` | Approve a tool-call request (alias; flag form `approve --tool <id>`). | `cli/commands/approval_cmd.py:approve_tool_cmd` |
+| `bernstein reject-tool` | Reject a tool-call request (alias; flag form `reject --tool <id>`). | `cli/commands/approval_cmd.py:reject_tool_cmd` |
 | `bernstein review-receipt` | Attested PR review receipts binding issue / plan / tool calls / diff (group): `emit` / `verify`. | `cli/commands/review_receipt_cmd.py` |
 | `bernstein gate verify <run>` | Verify a maker-checker / judge-panel gate's signed adjudication record: recompute `inputs_hash` from `--inputs` and confirm the panel saw exactly those inputs, then confirm the spine anchor still verifies. Exit 1 when no record, 2 on mismatch. | `cli/commands/gate_cmd.py` |
 | `bernstein governance verify <run>` | Recompute every RBAC access and per-subject budget decision recorded for a run from the signed spine and confirm the recorded verdicts: re-resolve roles from the signed `--bindings`, re-project spend from the `--ledger`, and match. Exit 1 when no records, 2 on mismatch. | `cli/commands/governance_cmd.py` |
 
-> Task-level `approve` / `reject` are different commands - see [Plan & tasks](#plan-tasks).
+> Task-level `approve` / `reject` are different commands - see [Plan & tasks](#plan-tasks). Both also accept `--tool <id>` to resolve tool-call approvals (the flag form of `approve-tool` / `reject-tool`).
 
 #### `bernstein identity`
 
@@ -884,9 +884,15 @@ advisory-only, `1` on any critical/high finding, `2` when there is no diff.
 Tool-call approval gate. When an agent requests a sensitive tool call (network egress, file write outside its worktree, exec outside its sandbox), the orchestrator pauses and writes a request to `.sdd/runtime/tool_approvals/`. Resolve with these commands.
 
 ```bash
-bernstein approve-tool <request_id>
-bernstein reject-tool  <request_id>
+bernstein approve-tool --id <request_id>
+bernstein reject-tool  --id <request_id>
+# Flag form (the aliases above stay registered through the 3.10 line,
+# unregistered in 4.0.0):
+bernstein approve --tool <request_id>
+bernstein reject --tool <request_id>
 ```
+
+With no identifier, the oldest pending approval is resolved.
 
 ---
 
