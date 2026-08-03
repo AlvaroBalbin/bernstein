@@ -149,6 +149,84 @@ one root.
 > entry timestamp. This section covers the `journal.jsonl` chain, the one
 > surfaced in run metadata and the `bernstein replay` header.
 
+## Signed run receipt (one file, offline verification)
+
+The journal, the lineage spine, and the audit chain each verify their own
+slice, and two of the three need the operator's key material or a live
+`.sdd/`. The **run receipt** (`core/replay/run_receipt.py`, issue #2924) binds
+them into one signed artefact: the file alone proves integrity, the file plus
+the operator's out-of-band public key proves provenance (see the trust-model
+note below):
+
+```bash
+# Build: signs .sdd/runs/<run_id>/run-receipt.json
+bernstein verify run <run_id> --signing-key-path /path/to/ed25519.pem
+
+# Verify: reads ONLY the receipt file - no HMAC key, no .sdd/
+bernstein verify receipt /path/to/run-receipt.json [--public-key trusted.pub.pem]
+```
+
+The receipt embeds:
+
+- **`journal`** - the timing-excluded projection of every journal row (the
+  exact bytes `compute_event_hash` covers; `ts`/`elapsed_s` never enter the
+  receipt) plus the head hash.
+- **`spine`** - every spine entry body **without** the keyed `hmac` tag. Spine
+  `entry_hash` values are plain SHA-256 over caller-visible fields, so the
+  whole chain recomputes without the operator's HMAC key.
+- **`audit_range`** (opt-in via `--include-audit-range --audit-since
+  --audit-until`) - a re-chained audit slice whose `head_sha256` recomputes
+  from the embedded events. The operator HMAC key is needed at *build* time to
+  re-chain the slice, never at verify time.
+- **`signing`** - a detached Ed25519 signature (RFC 8032, deterministic) over
+  the DSSE pre-authentication encoding of the canonical subject binding - the
+  block carrying the run id and every head - plus the public key embedded as
+  an RFC 7517 / RFC 8037 OKP JWK.
+
+The signed subject is *derived from* the embedded ranges: the verifier
+recomputes every head from the receipt bytes, rebuilds the binding, and only
+then checks the signature. Mutate one embedded row and verification names the
+exact divergent step; strip a range and the signed subject becomes
+unreachable - the receipt stops verifying, it does not merely lose a line.
+Receipt bytes are byte-identical across independent builds of the same run.
+The build side is strict too: an unparseable journal or spine row refuses the
+whole build with the physical line named - a receipt is never signed over the
+parseable subset of a corrupted store.
+
+Exit codes for `bernstein verify receipt` (mirrors `bernstein lineage
+verify`): `0` OK, `1` empty/malformed input, `2` tamper detected (first
+divergent journal step index named).
+
+**Trust model - what a pass proves depends on where the key came from.** By
+default the verifier checks the signature against the Ed25519 key embedded in
+the receipt (trust-on-first-use). That makes a pass **integrity-only**: the
+file is internally consistent - every head recomputes from the embedded
+ranges and any post-signing mutation is caught and localized to a precise
+step - but an attacker who controls the whole file could have swapped in
+their own key and re-signed it, so the embedded key cannot establish *who*
+produced the receipt. For **provenance** - confirming the receipt was signed
+by a specific operator's key - pass `--public-key` with an out-of-band copy
+of that key; the embedded key must then match it or verification fails with
+exit `2`. The CLI verdict is labelled accordingly (`OK (integrity-only:
+embedded key)` vs `OK (provenance: pinned key)`), so a trust-on-first-use
+pass cannot be misread as an authenticated one. Provenance-sensitive review
+(incident triage, compliance handover) should always pin.
+
+**Automatic receipts at finalization.** When a signing key is configured via
+`BERNSTEIN_RUN_RECEIPT_SIGNING_KEY_PATH` (key file) or
+`BERNSTEIN_RUN_RECEIPT_SIGNING_ENV_VAR` (name of an env var carrying a PEM
+key; optional `BERNSTEIN_RUN_RECEIPT_SIGNING_KID` sets the JWK `kid`), the
+orchestrator writes `run-receipt.json` next to `journal.jsonl` when the run
+finalizes. With no key configured this is a documented no-op - a receipt is
+only ever emitted signed, matching the audit-receipt posture.
+
+The legacy `bernstein verify` flag modes (`--wal-integrity`, `--determinism`,
+`--memory-audit`, `--formal`, and the positional wheelhouse path) are
+unchanged: they route to the default `legacy` subcommand of the promoted
+group with identical behaviour and exit codes. One routing edge: a wheelhouse
+directory literally named `run`, `receipt`, or `legacy` shadows the
+positional mode - spell it `./run` or use `bernstein verify legacy <path>`.
+
 ## Provider-side context mutations
 
 Deterministic replay assumes context-as-sent equals context-as-consumed. The
