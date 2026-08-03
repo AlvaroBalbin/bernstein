@@ -106,3 +106,46 @@ def test_local_bootstrap_action_pins_setup_uv_version() -> None:
 
     pinned_versions = {cast(str, cast(dict[str, object], step["with"])["version"]) for step in setup_uv_steps}
     assert len(pinned_versions) == 1, "bootstrap setup-uv steps must install the same uv version"
+
+
+def test_local_bootstrap_action_retries_transient_setup_uv_failure() -> None:
+    """A single transient astral-sh/setup-uv fetch failure must not redden the
+    job outright (issue #3360): the primary attempt tolerates one failure via
+    `continue-on-error`, and a retry step re-runs setup-uv once, gated on the
+    primary step's recorded outcome. The retry step itself must not be
+    continue-on-error, so a second consecutive failure genuinely fails the job.
+    """
+    parsed = _load_workflow(BOOTSTRAP_ACTION)
+    runs = parsed.get("runs")
+    assert isinstance(runs, dict)
+    raw_steps = cast(dict[str, object], runs).get("steps")
+    assert isinstance(raw_steps, list)
+    step_list = [cast(dict[str, object], step) for step in cast(list[object], raw_steps) if isinstance(step, dict)]
+
+    primary_steps = [
+        step for step in step_list if str(step.get("uses", "")).startswith("astral-sh/setup-uv@") and step.get("id")
+    ]
+    assert primary_steps, "bootstrap action must have an identifiable (id-tagged) primary setup-uv step"
+
+    for primary in primary_steps:
+        step_id = primary["id"]
+        assert primary.get("continue-on-error") is True, (
+            f"primary setup-uv step {step_id!r} must be continue-on-error so a transient "
+            "fetch failure does not redden the job before a retry gets a chance"
+        )
+
+        failure_guard = f"steps.{step_id}.outcome == 'failure'"
+        retry_steps = [
+            step
+            for step in step_list
+            if step is not primary
+            and str(step.get("uses", "")).startswith("astral-sh/setup-uv@")
+            and failure_guard in str(step.get("if", ""))
+        ]
+        assert retry_steps, f"no retry step gated on `{failure_guard}` found for primary step {step_id!r}"
+
+        for retry in retry_steps:
+            assert retry.get("continue-on-error") is not True, (
+                f"retry step for {step_id!r} must not itself be continue-on-error, "
+                "so a second consecutive setup-uv failure genuinely fails the job"
+            )
