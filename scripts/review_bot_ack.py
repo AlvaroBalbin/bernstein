@@ -2,11 +2,14 @@
 """Review-bot acknowledgement gate.
 
 Parses comments the configured review bots (``REVIEW_BOT_LOGINS``) left on a
-PR, classifies each as must-address
-(bug/security/potential-issue/refactor-with-correctness) or informational
-(nit/style/note), and verifies every must-address finding is either
-acknowledged in the PR body via a `<!-- bot-ack: <id> ... -->` marker
-or addressed in a subsequent commit.
+PR, classifies each as must-address or informational, and verifies every
+must-address finding is either acknowledged in the PR body via a
+`<!-- bot-ack: <id> ... -->` marker or addressed in a subsequent commit.
+
+Grading reads a reviewer's structured `_Finding type:_` marker when the body
+carries one (see ``MUST_ADDRESS_FINDING_TYPES``), and otherwise falls back to
+the prose severity headings other bots embed - `**Potential issue**`,
+`**bug:**`, `nit:`.
 
 It also tracks, per configured review bot, whether that bot actually produced
 a review for the current head commit. Zero findings from a bot that was rate
@@ -33,11 +36,13 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
@@ -75,6 +80,104 @@ INFORMATIONAL_PATTERNS = (
     r"refactor suggestion",
     r"\*\*note\*\*",
 )
+
+# --- structured finding markers ---------------------------------------------
+#
+# The patterns above read severity out of prose headings. A reviewer that
+# instead states its category in a machine-readable marker matches none of
+# them, so every finding it files lands in the informational bucket and the
+# gate never blocks. The marker is authoritative when present:
+#
+#     <!--
+#     _Finding type:_ `Logical Bugs`
+#     -->
+#
+# and plural when one finding spans several categories:
+#
+#     <!--
+#     _Finding types:_ `Logical Bugs` `AI Coding Guidelines`
+#     -->
+#
+# Reading the marker rather than the surrounding prose also keeps the grading
+# stable: a finding body ends with a verbatim "Prompt for AI Agents" block that
+# restates the problem in whatever words the reviewer chose, and that text is
+# dense with the terms the prose heuristics match on.
+FINDING_TYPE_RE = re.compile(r"_finding types?:_((?:\s*`[^`]+`)+)", re.IGNORECASE)
+_BACKTICKED_RE = re.compile(r"`([^`]+)`")
+
+# The severity the reviewer itself assigned, read from the badge it renders
+# next to the marker, and scoped to `type=reviewer` so a badge of another kind
+# on the same comment cannot supply the value.
+#
+# Read by parsing the badge URL's query rather than by matching one fixed
+# parameter order. The order is the reviewer's rendering detail, not a
+# contract: a reordered or re-encoded badge made the severity unreadable, and
+# at the call site an unreadable severity was indistinguishable from a
+# genuinely low one. That silently demoted exactly the case the escalation
+# rule exists for - a `high` finding filed under an informational category -
+# so the gap sat in the escalation path itself. Parsing the query makes the
+# order irrelevant, and an unreadable grade on a badge that IS present now
+# fails closed instead of reading as absent.
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+# Categories that block the gate, and why. Each names a defect that ships
+# broken behaviour if it is merged unexamined, which is exactly the class the
+# acknowledgement contract exists for:
+#
+#   Logical Bugs   - a correctness defect in the change under review.
+#   Breaking Changes - a compatibility or contract break for existing callers.
+#   Verifiable Architecture & Design Review - design-level correctness, e.g. a
+#     poll loop that runs past its configured deadline and eats the budget of
+#     later steps. Filed as design, but the payload is a defect.
+#
+# Blocking is not a veto: an open finding is cleared either by a fixup commit
+# naming it or by a `<!-- bot-ack: <id> reason=... -->` marker in the PR body,
+# so the effect is that a human states a position on each one.
+MUST_ADDRESS_FINDING_TYPES = frozenset(
+    {
+        "logical bugs",
+        "breaking changes",
+        "verifiable architecture & design review",
+    }
+)
+
+# Categories that stay informational: real feedback, but merging without acting
+# on it does not ship a defect. Keeping these non-blocking is deliberate - if a
+# missing relative pronoun required an ack marker, the marker would be routine
+# on every PR and would stop carrying the signal that a human consciously
+# accepted a real defect.
+#
+#   AI Coding Guidelines       - convention and guideline adherence.
+#   Naming and Typos           - wording, spelling, identifier names.
+#   Code Dedup and Conventions - repetition a refactor would fold together.
+#
+# `Code Dedup and Conventions` is here because the fail-closed rule below
+# worked: it is a category nobody had triaged, it surfaced on the first pull
+# request that drew one, and triaging it is the response that rule is asking
+# for. It reads as conventions, the finding that surfaced it was a
+# factor-out-the-duplicate suggestion graded `low`, and a `high` one is still
+# caught by the severity escalation, so it belongs in the same drawer as the
+# two above. Leaving it unmapped would have blocked a pull request on a
+# duplication nit and taught the operator to apply the ack marker routinely,
+# which is the habit this split exists to avoid.
+INFORMATIONAL_FINDING_TYPES = frozenset(
+    {
+        "ai coding guidelines",
+        "naming and typos",
+        "code dedup and conventions",
+    }
+)
+
+# Severities that block regardless of category. The category alone under-reads:
+# a user-controlled path reaching `unlink()` with no containment check was
+# filed under `AI Coding Guidelines` and graded `high`. Whatever drawer the
+# reviewer files a finding in, its own top severity grade blocks.
+ESCALATING_FINDING_SEVERITIES = frozenset({"high"})
+
+# Substrings that make a category blocking even when it is not enumerated
+# above, so a renamed or newly introduced security category cannot arrive as
+# informational.
+SECURITY_FINDING_TYPE_HINTS = ("security", "vulnerab", "injection")
 
 # Per-bot review coverage for the current head commit. Only BOT_REVIEWED is a
 # clean result: the other three each mean the finding count for that bot is
@@ -211,7 +314,102 @@ def paginate(url: str, token: str) -> list[Any]:
     return out
 
 
+def finding_types(body: str) -> list[str]:
+    """Return every category named by a structured finding marker, lowercased.
+
+    Empty when the body carries no marker - the reviewer's own "addressed by
+    commit X" follow-ups are shaped that way, as is any bot that states
+    severity in prose instead.
+    """
+    out: list[str] = []
+    for match in FINDING_TYPE_RE.finditer(body):
+        for name in _BACKTICKED_RE.findall(match.group(1)):
+            name = name.strip().lower()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+def reviewer_badge_severities(body: str) -> list[str]:
+    """Return the severity of every reviewer badge in ``body``, in order.
+
+    An entry is ``""`` when that badge carries no readable ``severity``. The
+    caller needs to tell "no reviewer badge at all" (no entries) apart from "a
+    badge whose grade could not be read" (an empty entry): the first is a bot
+    that states no severity, the second is a grade lost in transit, and only
+    the second is a reason to fail closed.
+    """
+    out: list[str] = []
+    for raw_url in _URL_RE.findall(body):
+        # `&amp;` survives into some rendered bodies; without unescaping it the
+        # parameters after the first parse as `amp;content` and `amp;severity`.
+        query = urllib.parse.urlsplit(html.unescape(raw_url)).query
+        params = urllib.parse.parse_qs(query, keep_blank_values=True)
+        if not any(value.strip().lower() == "reviewer" for value in params.get("type", [])):
+            continue
+        graded = [value.strip().lower() for value in params.get("severity", []) if value.strip()]
+        out.append(graded[0] if graded else "")
+    return out
+
+
+def finding_severity(body: str) -> str:
+    """Return the severity the reviewer assigned, or "" when it states none."""
+    for severity in reviewer_badge_severities(body):
+        if severity:
+            return severity
+    return ""
+
+
+def has_unreadable_reviewer_severity(body: str) -> bool:
+    """True when a reviewer badge is present but states no readable severity."""
+    severities = reviewer_badge_severities(body)
+    return bool(severities) and not any(severities)
+
+
+def classify_finding_marker(body: str) -> str | None:
+    """Grade a finding from its structured marker, or ``None`` if unmarked.
+
+    Precedence, strictest first:
+
+    1. Any category in :data:`MUST_ADDRESS_FINDING_TYPES`, or one that reads as
+       security, blocks - a finding filed under several categories takes the
+       strictest of them.
+    2. The reviewer's own severity blocks at :data:`ESCALATING_FINDING_SEVERITIES`
+       whatever the category.
+    3. A reviewer badge whose severity cannot be read blocks. The reviewer
+       graded that finding and the grade did not survive the round trip;
+       reading the absence as "not high" is the same silent demotion rule 2
+       exists to stop, so an unreadable grade fails closed like an unmapped
+       category does.
+    4. Categories in :data:`INFORMATIONAL_FINDING_TYPES` are advisory.
+    5. Anything else blocks. An unmapped category is one nobody has triaged,
+       and defaulting those to informational is what let a whole reviewer's
+       output pass silently; failing closed makes the next new category
+       announce itself on a pull request instead of being waved through.
+    """
+    types = finding_types(body)
+    if not types:
+        return None
+    if any(name in MUST_ADDRESS_FINDING_TYPES for name in types):
+        return "must-address"
+    if any(hint in name for name in types for hint in SECURITY_FINDING_TYPE_HINTS):
+        return "must-address"
+    if finding_severity(body) in ESCALATING_FINDING_SEVERITIES:
+        return "must-address"
+    if has_unreadable_reviewer_severity(body):
+        return "must-address"
+    if all(name in INFORMATIONAL_FINDING_TYPES for name in types):
+        return "informational"
+    return "must-address"
+
+
 def classify(body: str) -> str:
+    # A structured marker is the reviewer stating its own category, so it wins
+    # over the prose heuristics below, which would otherwise read the verbatim
+    # agent-prompt block appended to every finding.
+    marked = classify_finding_marker(body)
+    if marked is not None:
+        return marked
     low = body.lower()
     is_must = any(re.search(p, low) for p in MUST_ADDRESS_PATTERNS)
     is_info = any(re.search(p, low) for p in INFORMATIONAL_PATTERNS)

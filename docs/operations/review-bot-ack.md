@@ -21,14 +21,10 @@ every review submission. It calls `scripts/review_bot_ack.py`, which:
 1. Fetches inline review-comment threads (`pulls/<n>/comments`) and
    top-level issue comments (`issues/<n>/comments`) authored by the
    configured review-bot accounts (`REVIEW_BOT_LOGINS`).
-2. Classifies each comment into one of two buckets based on the
-   severity tag the bot embeds in the body
-   (`**Potential issue**`, `**issue:**`, `**security:**`,
-   `**suggestion (security):**`, etc.):
-   - `must-address`: bug, security, potential issue,
-     refactor-with-correctness-implication.
-   - `informational`: note, nit, style, refactor suggestion, testing
-     suggestion.
+2. Classifies each comment into `must-address` or `informational`.
+   A structured finding marker, when the body carries one, is
+   authoritative; prose severity headings are the fallback. See
+   [Finding taxonomy](#finding-taxonomy).
 3. Confirms every `must-address` finding is either:
    - Fixed in a commit on the PR branch whose message contains
      `bot-ack: <comment-id>` or `addresses: <comment-id>`, OR
@@ -38,6 +34,49 @@ every review submission. It calls `scripts/review_bot_ack.py`, which:
    `<!-- review-bot-ack-summary: managed -->`) listing open findings.
 5. Exits non-zero if any `must-address` finding is unresolved; that
    non-zero exit fails the `review-bot-ack` check and blocks merge.
+
+### Finding taxonomy
+
+A reviewer that states its category in a machine-readable marker is
+graded from that marker, not from the surrounding prose:
+
+```
+<!--
+_Finding type:_ `Logical Bugs`
+-->
+```
+
+The marker is plural (`_Finding types:_`) when one finding spans
+several categories, and the strictest category wins.
+
+| Finding type | Bucket | Why |
+|---|---|---|
+| `Logical Bugs` | `must-address` | Correctness defect in the change under review. |
+| `Breaking Changes` | `must-address` | Compatibility or contract break for existing callers. |
+| `Verifiable Architecture & Design Review` | `must-address` | Design-level correctness, e.g. a poll loop that runs past its configured deadline. |
+| anything reading as security | `must-address` | Matched on the category name so a renamed or new security category cannot arrive as informational. |
+| `AI Coding Guidelines` | `informational` | Convention and guideline adherence. |
+| `Naming and Typos` | `informational` | Wording, spelling, identifier names. |
+| unmapped category | `must-address` | Fails closed: an untriaged category blocks rather than passing silently. |
+
+Two rules cut across the table:
+
+- **Severity escalates.** A finding the reviewer grades `high` is
+  `must-address` whatever its category. Category alone under-reads - a
+  user-controlled path reaching `unlink()` with no containment check
+  was filed under `AI Coding Guidelines` and graded `high`.
+- **Blocking is not a veto.** A `must-address` finding is cleared by a
+  fixup commit naming it or by a `bot-ack` marker in the PR body, so
+  the effect is that a human states a position on each one.
+
+Bodies with no marker fall back to the prose severity headings other
+bots embed (`**Potential issue**`, `**bug:**`, `**security:**`,
+`nit:`, `**note**`), classified the same two ways.
+
+When the reviewer introduces a category not in the table, the gate
+blocks on it until `MUST_ADDRESS_FINDING_TYPES` /
+`INFORMATIONAL_FINDING_TYPES` in `scripts/review_bot_ack.py` are
+updated to place it.
 
 ### Skipping nit/style findings
 
@@ -79,3 +118,7 @@ Shepherds:
 - `scripts/review_bot_sweep.py` - sweep + manifest renderer.
 - `tests/unit/test_review_bot_ack_workflow_yaml.py` - structural and
   classifier assertions.
+- `tests/unit/scripts/test_review_bot_ack_finding_taxonomy.py` - the
+  finding-type taxonomy, pinned against captured finding bodies.
+- `tests/unit/scripts/test_review_bot_ack_run_detection.py` - per-bot
+  review coverage for the head commit.
