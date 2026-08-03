@@ -169,7 +169,9 @@ class TestMultiCycleHandoff:
         # bernstein consensus export cycle-000 --format json
         r = runner.invoke(consensus_group, ["--path", str(root), "export", "cycle-000", "--format", "json"])
         assert r.exit_code == 0, r.output
-        payload = json.loads(r.output)
+        # Parse stdout, not the combined output: the deprecation notice on
+        # stderr (#3144) must not break machine consumers of the export.
+        payload = json.loads(r.stdout)
         assert payload["cycle_id"] == "cycle-000"
 
         # bernstein consensus next

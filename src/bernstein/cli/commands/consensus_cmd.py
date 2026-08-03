@@ -40,7 +40,14 @@ def _store(path: str | None) -> RelayStore:
 )
 @click.pass_context
 def consensus_group(ctx: click.Context, path_str: str | None) -> None:
-    """Inspect the cross-cycle consensus relay.
+    """Inspect the cross-cycle consensus relay. [Deprecated, removed in 4.0.0]
+
+    The relay store is never written by the shipped runtime: nothing in
+    ``src/`` calls ``RelayStore.append`` outside ``consensus_relay.py``
+    itself, so on any real project every subcommand reports an empty
+    result. This group stays registered through the 3.10 line with a
+    deprecation warning on invocation and is unregistered in 4.0.0
+    (#3144). The core module stays importable and unchanged.
 
     \b
     Examples:
@@ -50,6 +57,12 @@ def consensus_group(ctx: click.Context, path_str: str | None) -> None:
       bernstein consensus export cycle-42 --format md
       bernstein consensus verify
     """
+    click.echo(
+        "WARNING: 'bernstein consensus' is deprecated and will be removed in "
+        "v4.0.0 (#3144): it inspects a relay store no shipped runtime writes. "
+        "The core module bernstein.core.orchestration.consensus_relay stays importable.",
+        err=True,
+    )
     ctx.ensure_object(dict)
     ctx.obj["path"] = path_str
 

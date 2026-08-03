@@ -23,7 +23,22 @@ from bernstein.core.orchestration.issue_to_pr import (
 
 @click.group("issue-to-pr")
 def issue_to_pr_group() -> None:
-    """Inspect the issue -> plan-comment -> PR pipeline."""
+    """Inspect the issue -> plan-comment -> PR pipeline. [Deprecated, removed in 4.0.0]
+
+    No shipped runtime drives this pipeline: the only importers of
+    ``bernstein.core.orchestration.issue_to_pr`` are ``main.py`` and this
+    CLI module itself, and no daemon calls the ticker the docstring
+    mentions, so ``trace`` reports on a pipeline that cannot progress.
+    This group stays registered through the 3.10 line with a deprecation
+    warning on invocation and is unregistered in 4.0.0 (#3144). The core
+    module stays importable and unchanged.
+    """
+    click.echo(
+        "WARNING: 'bernstein issue-to-pr' is deprecated and will be removed in "
+        "v4.0.0 (#3144): it inspects a pipeline no shipped runtime advances. "
+        "The core module bernstein.core.orchestration.issue_to_pr stays importable.",
+        err=True,
+    )
 
 
 @issue_to_pr_group.command("trace")

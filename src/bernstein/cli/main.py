@@ -964,6 +964,9 @@ cli.add_command(backlog_group, "backlog")
 cli.add_command(bench_group)
 cli.add_command(logs_group, "logs")
 cli.add_command(decisions_group, "decisions")
+# #3144: consensus is deprecated (relay store has no producer in the shipped
+# runtime). Stays registered through the 3.10 line with a deprecation warning
+# on invocation; unregistered in 4.0.0. Core module stays importable.
 cli.add_command(consensus_group, "consensus")
 cli.add_command(list_tasks, "list-tasks")
 
@@ -1045,6 +1048,9 @@ cli.add_command(connect_cmd, "connect")
 cli.add_command(creds_group, "creds")
 cli.add_command(criterion_profile_group, "criterion-profile")
 cli.add_command(review_responder_group, "review-responder")
+# #3144: issue-to-pr is deprecated (no shipped runtime advances the pipeline).
+# Stays registered through the 3.10 line with a deprecation warning on
+# invocation; unregistered in 4.0.0. Core module stays importable.
 cli.add_command(issue_to_pr_group, "issue-to-pr")
 
 # Already registered elsewhere
