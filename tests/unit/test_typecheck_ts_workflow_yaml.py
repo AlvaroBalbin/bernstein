@@ -46,12 +46,16 @@ WORKFLOW = Path(".github/workflows/typecheck-ts.yml")
 # for ``tsc`` to compile. Each is held to that claim by
 # ``test_exempt_packages_still_have_nothing_to_compile`` - the exemption
 # lapses the moment the package grows a source tree.
-NO_SOURCES_TO_COMPILE = {
-    "packages/vscode/webview-ui": (
-        "scaffold: the only TypeScript file is vite.config.ts, there is no src/, and .vscodeignore keeps the "
-        "directory out of the packaged extension"
-    ),
-}
+#
+# Empty, and an entry is meant to be hard to justify. The one this map
+# was written for described a package whose build script could not run:
+# no ``src/``, no ``tsconfig.json``, no caller, and excluded from the
+# packaged extension. Nothing was compiling it because there was nothing
+# to compile and nothing shipping it, which is an argument for deleting
+# the package rather than for exempting it, and it was deleted. A
+# manifest that genuinely pulls the compiler in for tooling alone can go
+# here with the reason it is not a matrix cell.
+NO_SOURCES_TO_COMPILE: dict[str, str] = {}
 
 
 def _tracked(*patterns: str) -> list[str]:

@@ -7,8 +7,8 @@ name: TypeScript typecheck
 # Before this workflow existed, no CI job ran ``tsc --noEmit`` on the
 # TypeScript packages outside ``packages/vscode`` (publish-extension.yml
 # already covers that one). PRs that broke types in ``sdk/typescript``,
-# ``web``, ``packages/vscode/webview-ui``, or
-# ``templates/cloudflare-mcp-server`` were merged green because:
+# ``web``, or ``templates/cloudflare-mcp-server`` were merged green
+# because:
 #
 #  1. ``ci.yml`` paths-ignores ``sdk/typescript/**`` and
 #     ``packages/vscode/**`` -- it never sees those diffs.

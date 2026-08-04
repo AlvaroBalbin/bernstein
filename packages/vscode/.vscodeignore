@@ -14,4 +14,3 @@
 **/.vscodeignore
 **/PUBLISH.md
 **/package-lock.json
-**/webview-ui/**
