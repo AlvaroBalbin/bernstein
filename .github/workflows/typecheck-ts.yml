@@ -19,6 +19,14 @@ name: TypeScript typecheck
 # v5 -> v6`` PR slipped through with 45 typecheck errors no required
 # check would catch.
 #
+# The same gap reappeared one level down. The Workers template named in
+# this comment was listed in neither the trigger nor the matrix, so an
+# ``agents ^0.19 -> ^0.20`` bump to its manifest merged with no
+# TypeScript job having run at all. Declared coverage and actual
+# coverage are now asserted against the tree by
+# ``tests/unit/test_typecheck_ts_workflow_yaml.py`` rather than kept in
+# agreement by hand.
+#
 # Fix
 # ---
 # This workflow runs ``tsc --noEmit`` (or ``tsc -b`` for composite
@@ -29,6 +37,16 @@ name: TypeScript typecheck
 # (ci.yml + ci-gate-stub.yml) and rejects a third. Branch protection
 # should add this workflow's per-package job names as additional
 # required contexts.
+#
+# Each matrix cell carries its own install command because ``npm ci``
+# aborts rather than resolving a manifest when the package has no
+# lockfile. The template is scaffolding that consumers copy and install
+# themselves, so it stays lock-free and its cell resolves the declared
+# ranges -- which is the tree a dependency bump to that manifest
+# actually produces. Resolving ranges also means the packages whose
+# lifecycle scripts would run are not visible in the pull request diff
+# the way a lockfile change is, so that cell installs with
+# ``--ignore-scripts``; type declarations land on disk either way.
 
 on:
   pull_request:
@@ -36,6 +54,7 @@ on:
       - "sdk/typescript/**"
       - "packages/vscode/**"
       - "web/**"
+      - "templates/cloudflare-mcp-server/**"
       - ".github/workflows/typecheck-ts.yml"
   push:
     branches: [main]
@@ -43,6 +62,7 @@ on:
       - "sdk/typescript/**"
       - "packages/vscode/**"
       - "web/**"
+      - "templates/cloudflare-mcp-server/**"
       - ".github/workflows/typecheck-ts.yml"
 
 concurrency:
@@ -64,11 +84,17 @@ jobs:
       matrix:
         include:
           - package: sdk/typescript
+            install: npm ci
             command: npx tsc --noEmit
           - package: packages/vscode
+            install: npm ci
             command: npx tsc --noEmit
           - package: web
+            install: npm ci
             command: npx tsc -b
+          - package: templates/cloudflare-mcp-server
+            install: npm install --no-audit --no-fund --ignore-scripts
+            command: npx tsc --noEmit
     steps:
       - name: Harden runner (audit mode)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -85,7 +111,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ matrix.package }}
-        run: npm ci
+        run: ${{ matrix.install }}
 
       - name: Type check
         working-directory: ${{ matrix.package }}
