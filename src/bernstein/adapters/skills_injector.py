@@ -35,6 +35,11 @@ from bernstein.core.skills.activation_log import (
 )
 from bernstein.core.skills.routing import auto_route_enabled, select_auto_route_templates
 from bernstein.core.skills.sanitizer import sanitize_skill_body
+from bernstein.core.skills.selection_rules import (
+    SELECTION_RULES_FILENAME,
+    load_selection_rules,
+    resolve_rule_templates,
+)
 
 if TYPE_CHECKING:
     from bernstein.core.skills.routing import RoutableTask
@@ -261,6 +266,20 @@ def inject_skills(
 
     templates_to_inject = list(dict.fromkeys(_ALWAYS_INJECT + ROLE_SKILL_MAP.get(role, [])))
     trigger_by_template = {template_name: "role-binding" for template_name in templates_to_inject}
+
+    # Declarative selection rules (issue #3383): a corpus-immune rule layer
+    # between role binding and the opt-in TF-IDF auto-route. Existence is a
+    # single cheap stat - when the table is absent the loader is never
+    # invoked and behaviour is byte-identical to a rule-less install.
+    if (skills_source_dir / SELECTION_RULES_FILENAME).is_file():
+        rules = load_selection_rules(skills_source_dir)
+        for rule_template in resolve_rule_templates(rules, tasks):
+            if rule_template in trigger_by_template:
+                # Role binding wins for templates selected by both layers.
+                continue
+            templates_to_inject.append(rule_template)
+            trigger_by_template[rule_template] = "rule"
+
     if auto_route_enabled():
         for candidate in select_auto_route_templates(
             skills_source_dir,
