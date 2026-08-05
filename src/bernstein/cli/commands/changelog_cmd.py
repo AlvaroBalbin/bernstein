@@ -395,7 +395,8 @@ def _changelog_conventional_inner(
 # v4.0.0 swap: the orchestration-specific command (``run-changelog``) now owns
 # the bare name ``bernstein changelog``, and the conventional-commit command is
 # a subcommand ``bernstein changelog conventional``. The old ``run-changelog``
-# name stays as a deprecated alias through the 3.10 line so existing scripts
+# name stays as a deprecated alias — removed in a release after the 4.0 line
+# that introduced it — so existing scripts
 # emit a notice rather than silently changing meaning (#3142, #3147). Both
 # commands had zero tests before this issue; coverage is added in
 # ``tests/unit/cli/test_changelog_swap.py``.
@@ -666,14 +667,15 @@ def changelog_run_alias(
     server_url: str | None,
     workdir: str,
 ) -> None:
-    """Generate a changelog from what Bernstein agents actually changed. [Deprecated, removed in 4.0.0]
+    """Generate a changelog from what Bernstein agents actually changed. [Deprecated, removed in a later release]
 
     The command name changed in v4.0.0 to free up ``bernstein changelog`` for
     the orchestration-specific changelog (#3142): it now lives at
     ``bernstein changelog`` (same behaviour, same flags including ``--hours``).
-    The ``run-changelog`` name stays registered through the 3.10 line with
+    The ``run-changelog`` name stays registered as a deprecated alias with
     this deprecation notice so existing scripts print a warning rather than
-    silently changing meaning.
+    silently changing meaning; it is removed in a release after the 4.0 line
+    that introduced it.
 
     \b
     Examples:
@@ -684,8 +686,8 @@ def changelog_run_alias(
     """
     click.echo(
         "WARNING: 'bernstein run-changelog' is deprecated and will be removed "
-        "in v4.0.0 (#3142): it now lives at 'bernstein changelog' (same flags, "
-        "including --hours).",
+        "in a later release (#3142): it now lives at 'bernstein changelog' "
+        "(same flags, including --hours).",
         err=True,
     )
     from bernstein.cli.commands.run_changelog_cmd import run_changelog_default
