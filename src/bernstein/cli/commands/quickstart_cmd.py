@@ -17,6 +17,7 @@ from bernstein.cli.helpers import (
     is_alive,
     print_banner,
 )
+from bernstein.cli.run_confirm import _lineage_progress, _status_task_rows
 
 _QUICKSTART_PORT = 8056
 _QUICKSTART_GOAL = "Add input validation, error handling, and tests to the TODO API"
@@ -158,8 +159,15 @@ def _log_task_transitions(
             progress.console.print(f"  [red]\u2717[/red] [{role}] {title}")
 
 
-def _poll_until_done(server_url: str, deadline: float) -> None:
-    """Poll the task server until all tasks finish or the deadline passes."""
+def _poll_until_done(server_url: str, deadline: float, *, expected_total: int = 0) -> None:
+    """Poll the task server until all tasks finish or the deadline passes.
+
+    ``expected_total`` is the seeded task count. The exit must compare
+    done lineages against it - not against the current snapshot's own
+    lineage set, which can be incomplete while rows are still being
+    registered and would let a partial snapshot tear the run down with
+    work remaining.
+    """
     from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
     seen_done: set[str] = set()
@@ -176,23 +184,34 @@ def _poll_until_done(server_url: str, deadline: float) -> None:
         poll_task = progress.add_task("Agents working\u2026", total=None)
 
         while time.monotonic() < deadline:
-            with suppress(Exception):
+            # Suppress only the fetch; row processing runs OUTSIDE it. The
+            # broad suppress ate the shape crash below on every tick and
+            # made the early exit unreachable - the same defect fixed in
+            # the demo poll (issue #3433).
+            payload: Any = None
+            with suppress(httpx.HTTPError, ValueError):
                 resp = httpx.get(f"{server_url}/status", timeout=3.0, headers=auth_headers())
                 if resp.status_code == 200:
                     payload = resp.json()
-                    tasks_list: list[dict[str, Any]] = payload.get("tasks", [])
-                    done_count = sum(1 for t in tasks_list if t.get("status") == "done")
-                    failed_count = sum(1 for t in tasks_list if t.get("status") == "failed")
-                    total_tasks = len(tasks_list)
+            if payload is not None:
+                tasks_list = _status_task_rows(payload)
+                _log_task_transitions(tasks_list, seen_done, seen_failed, progress)
+                done_lineages, failed_lineages, all_lineages = _lineage_progress(tasks_list)
+                target = expected_total if expected_total > 0 else len(all_lineages)
 
-                    _log_task_transitions(tasks_list, seen_done, seen_failed, progress)
-
-                    desc = f"Agents working\u2026 [green]{done_count}[/green]/{total_tasks} tasks done"
-                    if failed_count:
-                        desc += f"  [red]{failed_count} failed[/red]"
-                    progress.update(poll_task, description=desc)
-                    if total_tasks > 0 and done_count + failed_count >= total_tasks:
-                        break
+                desc = f"Agents working\u2026 [green]{len(done_lineages)}[/green]/{target} tasks done"
+                if failed_lineages:
+                    desc += f"  [red]{len(failed_lineages)} failed[/red]"
+                progress.update(poll_task, description=desc)
+                # Exit early only when the seeded count of lineages is
+                # done. A failed row is not terminal - its retry spawns as
+                # a new row with a fresh id - so exiting on done+failed
+                # would tear the run down while a fixing retry is still
+                # pending; and the snapshot's own lineage set is not a
+                # valid target either, since an incomplete snapshot would
+                # satisfy it with work remaining.
+                if target > 0 and len(done_lineages) >= target:
+                    break
             time.sleep(2)
 
 
@@ -354,7 +373,11 @@ def quickstart_cmd(keep: bool, timeout: int, adapter: str | None) -> None:
             cli=detected,
         )
 
-        _poll_until_done(server_url, deadline=orchestration_start + timeout)
+        _poll_until_done(
+            server_url,
+            deadline=orchestration_start + timeout,
+            expected_total=len(_QUICKSTART_TASKS),
+        )
         console.print("[green]✓[/green] Orchestration finished")
 
     except KeyboardInterrupt:
