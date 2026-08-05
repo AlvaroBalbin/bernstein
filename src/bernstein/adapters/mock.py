@@ -207,97 +207,149 @@ def write_log(path: Path, message: str) -> None:
         f.write(f"{time.time()} {message}\n")
 
 
-def fix_off_by_one(workdir: Path, log_path: Path) -> None:
+def record_modified(log_path: Path, rel_path: str) -> None:
+    """Write the completion-evidence line the orchestrator parses.
+
+    The log aggregator's ``file_modified`` pattern is ^-anchored
+    (``^(?:Modified|Created|Wrote|Updated): <path>``), so this line must
+    start the log line - the usual timestamp prefix would defeat it.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as f:
+        f.write(f"Modified: {rel_path}\n")
+
+
+def commit_fix(workdir: Path, log_path: Path, message: str, rel_path: str) -> None:
+    """Commit exactly the fixed file on the worktree branch.
+
+    Real agents land their work as commits; the reaper's completion
+    evidence and the merge path both key off them. Staging and the
+    commit are both restricted to ``rel_path`` so a resumed worktree's
+    unrelated edits are never swept into this task's output. Degrades
+    to log-evidence only when git is unavailable, the workdir is not a
+    repository, or nothing changed.
+    """
+    import subprocess
+
+    git = [
+        "git",
+        "-c",
+        "user.name=bernstein-mock-agent",
+        "-c",
+        "user.email=mock-agent@bernstein.invalid",
+    ]
+    try:
+        subprocess.run([*git, "add", "--", rel_path], cwd=workdir, check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            [*git, "commit", "-m", message, "--", rel_path],
+            cwd=workdir,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        write_log(log_path, f"Committed fix: {message}")
+    except Exception as exc:
+        write_log(log_path, f"⚠ commit skipped: {exc}")
+
+
+def fix_off_by_one(workdir: Path, log_path: Path) -> str | None:
     """Fix ITEMS[n] -> ITEMS[n - 1] off-by-one in app.py."""
     app_file = workdir / "app.py"
     if not app_file.exists():
         write_log(log_path, "⚠ app.py not found")
-        return
+        return None
     content = app_file.read_text()
-    if "ITEMS[n]" in content:
-        content = content.replace(
-            "return jsonify({\"id\": n, \"item\": ITEMS[n]})  # off-by-one",
-            (
-                "if n < 1 or n > len(ITEMS):\n"
-                "        from flask import abort\n"
-                "        abort(404)\n"
-                "    return jsonify({\"id\": n, \"item\": ITEMS[n - 1]})"
-            ),
-        )
-        app_file.write_text(content)
+    # Mutation ground truth is content inequality, not substring presence:
+    # the fixture's docstring also mentions ITEMS[n], so a rerun in an
+    # already-fixed worktree would otherwise claim work it never did.
+    fixed = content.replace(
+        "return jsonify({\"id\": n, \"item\": ITEMS[n]})  # off-by-one",
+        (
+            "if n < 1 or n > len(ITEMS):\n"
+            "        from flask import abort\n"
+            "        abort(404)\n"
+            "    return jsonify({\"id\": n, \"item\": ITEMS[n - 1]})"
+        ),
+    )
+    if fixed != content:
+        app_file.write_text(fixed)
         write_log(log_path, "✓ Fixed off-by-one: ITEMS[n] → ITEMS[n - 1] + bounds check")
-    else:
-        write_log(log_path, "⚠ off-by-one pattern not found (already fixed?)")
+        return "app.py"
+    write_log(log_path, "⚠ off-by-one pattern not found (already fixed?)")
+    return None
 
 
-def fix_missing_import(workdir: Path, log_path: Path) -> None:
+def fix_missing_import(workdir: Path, log_path: Path) -> str | None:
     """Add 'request' to the flask import line in app.py."""
     app_file = workdir / "app.py"
     if not app_file.exists():
         write_log(log_path, "⚠ app.py not found")
-        return
+        return None
     content = app_file.read_text()
     old_import = "from flask import Flask, jsonify  # BUG 2: 'request' is missing from this import"
     new_import = "from flask import Flask, jsonify, request"
+    fixed = content
     if old_import in content:
-        content = content.replace(old_import, new_import)
+        fixed = fixed.replace(old_import, new_import)
         # Also remove the noqa/type-ignore comment from the echo route
-        content = content.replace(
+        fixed = fixed.replace(
             "    msg = request.args.get(\"msg\", \"\")  # type: ignore[name-defined]  # noqa: F821",
             "    msg = request.args.get(\"msg\", \"\")",
         )
-        app_file.write_text(content)
-        write_log(log_path, "✓ Fixed missing import: added 'request' to flask imports")
     elif "from flask import Flask, jsonify" in content and "request" not in content.split("\n")[1]:
-        content = content.replace(
+        fixed = fixed.replace(
             "from flask import Flask, jsonify",
             "from flask import Flask, jsonify, request",
             1,
         )
-        app_file.write_text(content)
+    if fixed != content:
+        app_file.write_text(fixed)
         write_log(log_path, "✓ Fixed missing import: added 'request' to flask imports")
-    else:
-        write_log(log_path, "⚠ missing import pattern not found (already fixed?)")
+        return "app.py"
+    write_log(log_path, "⚠ missing import pattern not found (already fixed?)")
+    return None
 
 
-def fix_health_status(workdir: Path, log_path: Path) -> None:
+def fix_health_status(workdir: Path, log_path: Path) -> str | None:
     """Remove incorrect HTTP 201 status from health endpoint in app.py."""
     app_file = workdir / "app.py"
     if not app_file.exists():
         write_log(log_path, "⚠ app.py not found")
-        return
+        return None
     content = app_file.read_text()
     old_line = '    return jsonify({"status": "healthy", "version": "1.0.0"}), 201  # type: ignore[return-value]'
     new_line = '    return jsonify({"status": "healthy", "version": "1.0.0"})'
-    if old_line in content:
-        content = content.replace(old_line, new_line)
-        app_file.write_text(content)
+    fixed = content.replace(old_line, new_line)
+    if fixed != content:
+        app_file.write_text(fixed)
         write_log(log_path, "✓ Fixed health status code: 201 → 200")
-    else:
-        write_log(log_path, "⚠ health status code pattern not found (already fixed?)")
+        return "app.py"
+    write_log(log_path, "⚠ health status code pattern not found (already fixed?)")
+    return None
 
 
-def fix_broken_test(workdir: Path, log_path: Path) -> None:
+def fix_broken_test(workdir: Path, log_path: Path) -> str | None:
     """Fix the wrong status_code assertion in tests/test_app.py."""
     test_file = workdir / "tests" / "test_app.py"
     if not test_file.exists():
         write_log(log_path, "⚠ tests/test_app.py not found")
-        return
+        return None
     content = test_file.read_text()
-    if "assert resp.status_code == 404  # wrong - should be 200" in content:
-        content = content.replace(
-            "assert resp.status_code == 404  # wrong - should be 200",
-            "assert resp.status_code == 200",
-        )
-        # Also remove the BUG 4 docstring annotation
-        content = content.replace(
-            '\n    BUG 4: asserts 404 instead of 200.\n    ',
-            '\n    ',
-        )
-        test_file.write_text(content)
+    fixed = content.replace(
+        "assert resp.status_code == 404  # wrong - should be 200",
+        "assert resp.status_code == 200",
+    )
+    # Also remove the BUG 4 docstring annotation
+    fixed = fixed.replace(
+        '\n    BUG 4: asserts 404 instead of 200.\n    ',
+        '\n    ',
+    )
+    if fixed != content:
+        test_file.write_text(fixed)
         write_log(log_path, "✓ Fixed broken test: status_code 404 → 200")
-    else:
-        write_log(log_path, "⚠ broken test pattern not found (already fixed?)")
+        return "tests/test_app.py"
+    write_log(log_path, "⚠ broken test pattern not found (already fixed?)")
+    return None
 
 
 def _idle_mode(log_path: Path) -> None:
@@ -380,16 +432,25 @@ def main():
     # Simulate realistic agent work time
     time.sleep(1.5)
 
+    modified = None
     if task_name == "off_by_one":
-        fix_off_by_one(workdir, log_path)
+        modified = fix_off_by_one(workdir, log_path)
     elif task_name == "missing_import":
-        fix_missing_import(workdir, log_path)
+        modified = fix_missing_import(workdir, log_path)
     elif task_name == "health_status":
-        fix_health_status(workdir, log_path)
+        modified = fix_health_status(workdir, log_path)
     elif task_name == "broken_test":
-        fix_broken_test(workdir, log_path)
+        modified = fix_broken_test(workdir, log_path)
     else:
         write_log(log_path, f"Unknown task type: {task_name} - no-op")
+
+    # Commit first, evidence second: only a task that actually mutated a
+    # file commits, only the mutated path is staged, and the ``Modified:``
+    # completion-evidence line is emitted once the work is finalized (the
+    # commit landed, or the commit degraded to log-only without git).
+    if modified is not None:
+        commit_fix(workdir, log_path, f"demo: {task_name.replace('_', ' ')}", modified)
+        record_modified(log_path, modified)
 
     time.sleep(0.5)
     write_log(log_path, "Mock agent completed successfully")
