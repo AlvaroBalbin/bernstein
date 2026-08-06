@@ -833,6 +833,12 @@ module = [
 ]
 ignore_missing_imports = true
 
+[tool.bernstein.readme-l10n]
+# Translated README variants gated by `bernstein readme-l10n verify`
+# (issue #3425). Adding a language is a data change: append its IETF tag
+# here and add README.<tag>.md carrying l10n bindings.
+languages = ["zh-Hans", "zh-TW"]
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]

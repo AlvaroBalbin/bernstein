@@ -55,6 +55,7 @@ Drift remediation paths used by the rows below:
 | `docs/index.md` | All docs subdirs (each linked entry must resolve) | Linked page renamed / deleted, getting-started / installation / operations / reference / architecture path moved | `manual-prose` |
 | `docs/adapter-deferred.md` | `src/bernstein/adapters/registry.py` (negative-space: agents NOT integrated) | A previously-deferred agent now has a stable CLI binary | `manual-prose` |
 | `docs/agents-md.md` | `src/bernstein/cli/commands/agents_md_cmd.py`, `src/bernstein/core/knowledge/agents_md_bridge.py`, `src/bernstein/core/knowledge/agents_md_generator.py` | New target format added to the canonical IR, sync command options change | `manual-prose` |
+| `docs/playbooks/readme-l10n.md` | `src/bernstein/core/knowledge/readme_l10n.py`, `src/bernstein/cli/commands/readme_l10n_cmd.py`, `pyproject.toml` (`[tool.bernstein.readme-l10n]`) | Binding format change, verify/sync surface change, language config change | `manual-prose` |
 | `docs/CHANGELOG.md` | Pointer document for mkdocs; release history lives in `docs/release-notes/` | The release-notes location moves | `manual-prose` |
 | `docs/CODE_REVIEW.md` | `src/bernstein/core/quality/`, `src/bernstein/core/review/`, `src/bernstein/core/review_responder/` | Review pipeline stage added, reviewer-role policy change | `manual-prose` |
 | `docs/ENTERPRISE.md` | `src/bernstein/core/compliance/`, `src/bernstein/core/security/`, audit / lineage / air-gap surface | New regulator mapping, new compliance pack target, audit export schema change | `manual-prose` |

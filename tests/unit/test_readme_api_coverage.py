@@ -213,6 +213,8 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "wheelhouse",
         # AAIF AGENTS.md generator (closes #1087)
         "agents-md",
+        # Translated README drift gate (closes #3425)
+        "readme-l10n",
         # Project bootstrapping from a single goal prompt
         "scaffold",
         # Local AST -> WIKI.md renderer

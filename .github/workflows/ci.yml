@@ -423,6 +423,11 @@ jobs:
         # .goosehints / .cursor/rules/*.mdc drift from `bernstein agents-md
         # generate`. Run `uv run bernstein agents-md sync` locally to fix.
         run: uv run bernstein agents-md verify --workdir .
+      - name: Translated README drift check (#3425)
+        # Fails if a translated README.<tag>.md binds a stale English section
+        # hash, translated a code block, or altered the verbatim header/footer.
+        # Run `uv run bernstein readme-l10n sync` after editing README.md.
+        run: uv run bernstein readme-l10n verify --workdir .
       - name: Distribution manifest drift check
         # Fails in under a minute if server.json / .plugin/plugin.json drift
         # from `scripts/gen_distribution_manifests.py`, instead of surfacing the

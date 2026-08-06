@@ -1305,6 +1305,11 @@ from bernstein.cli.commands.analyze_cmd import analyze_cmd  # noqa: E402
 
 cli.add_command(agents_md_cmd, "agents-md")
 
+# Translated README drift gate (issue #3425): verify / sync bindings.
+from bernstein.cli.commands.readme_l10n_cmd import readme_l10n_cmd  # noqa: E402
+
+cli.add_command(readme_l10n_cmd, "readme-l10n")
+
 # Air-gap distribution: build / verify wheel bundle.
 from bernstein.cli.commands.wheelhouse_cmd import wheelhouse_group  # noqa: E402
 
