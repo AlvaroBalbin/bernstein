@@ -63,7 +63,7 @@ BINDING_END = "-->"
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 _FENCE = re.compile(r"^\s*(```|~~~)")
-_LINK_TARGET = re.compile(r"(!?\[[^\]]*\])\([^)]*\)")
+_LINK_OPEN = re.compile(r"(!?\[[^\]]*\])\(")
 _INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -124,11 +124,44 @@ def split_sections(text: str) -> list[Section]:
     return sections
 
 
+def mask_link_targets(text: str) -> str:
+    """Replace every markdown link destination with a placeholder.
+
+    Written as a scan rather than a regex because a destination may contain
+    balanced parentheses - ``[x](https://en.example/Foo_(bar))`` is an ordinary
+    link, and a pattern that stops at the first ``)`` masks half of it, which
+    makes an untouched section hash differently depending on what is inside the
+    brackets. Link *text* is left alone: it is prose, and prose is the thing
+    being tracked.
+    """
+    out: list[str] = []
+    index = 0
+    while True:
+        match = _LINK_OPEN.search(text, index)
+        if match is None:
+            out.append(text[index:])
+            return "".join(out)
+        out.append(text[index : match.start()])
+        out.append(match.group(1))
+        depth, cursor = 1, match.end()
+        while cursor < len(text) and depth:
+            if text[cursor] == "(":
+                depth += 1
+            elif text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            # Unbalanced: not a link after all, so nothing is masked.
+            out.append(text[match.end() - 1 :])
+            return "".join(out)
+        out.append("(<link>)")
+        index = cursor
+
+
 def normalise(section: Section) -> str:
     """Reduce a section to what a translation actually has to track."""
     text = f"{section.level} {section.heading}\n{section.body}"
-    text = _LINK_TARGET.sub(r"\1(<link>)", text)
-    return _WHITESPACE.sub(" ", text).strip()
+    return _WHITESPACE.sub(" ", mask_link_targets(text)).strip()
 
 
 def section_hash(section: Section) -> str:
@@ -328,20 +361,25 @@ def verify() -> list[str]:
 
 def update() -> list[str]:
     """Rewrite every translation's binding block. Returns what was written."""
-    ENGLISH.write_text(replace_language_line(ENGLISH.read_text(encoding="utf-8"), "en"), encoding="utf-8")
+    # Everything is computed before anything is written: a missing marker in
+    # the third translation would otherwise leave the first two rewritten and
+    # the repository half-updated, which is a worse state than not having run
+    # the command at all.
+    english_text = replace_language_line(ENGLISH.read_text(encoding="utf-8"), "en")
+    block = render_binding(split_sections(english_text))
 
-    english = split_sections(ENGLISH.read_text(encoding="utf-8"))
-    block = render_binding(english)
-    written: list[str] = []
+    pending: list[tuple[Path, str]] = [(ENGLISH, english_text)]
     for entry in languages():
         tag = entry["tag"]
         path = translation_path(tag)
         if not path.exists():
             continue
         body = strip_binding(path.read_text(encoding="utf-8"))
-        path.write_text(f"{block}\n\n{replace_language_line(body.lstrip(), tag)}", encoding="utf-8")
-        written.append(path.name)
-    return written
+        pending.append((path, f"{block}\n\n{replace_language_line(body.lstrip(), tag)}"))
+
+    for path, content in pending:
+        path.write_text(content, encoding="utf-8")
+    return [path.name for path, _ in pending[1:]]
 
 
 def main(argv: list[str] | None = None) -> int:

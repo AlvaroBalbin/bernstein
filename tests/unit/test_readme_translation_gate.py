@@ -291,3 +291,45 @@ def test_the_language_links_block_is_not_read_as_the_project_overview(tmp_path: 
     )
 
     assert _first_paragraph(readme) == "Bernstein is a deterministic orchestrator for CLI coding agents."
+
+
+def test_a_link_target_with_parentheses_is_masked_whole(sandbox: Path, gate: Any) -> None:
+    """`[x](https://en.example/Foo_(bar))` is an ordinary link.
+
+    Masking only up to the first `)` leaves half the URL inside the hashed
+    text, so rewriting the rest of that URL - the exact case the masking exists
+    to tolerate - would mark every translation stale.
+    """
+    english = sandbox / "README.md"
+    english.write_text(
+        english.read_text(encoding="utf-8").replace(
+            "https://example.invalid/install.md", "https://example.invalid/Install_(guide).md"
+        ),
+        encoding="utf-8",
+    )
+    assert gate.verify() == [], "adding parentheses to a destination is still a link rewrite"
+
+    english.write_text(
+        english.read_text(encoding="utf-8").replace(
+            "https://example.invalid/Install_(guide).md", "https://other.invalid/Install_(handbook).md"
+        ),
+        encoding="utf-8",
+    )
+    assert gate.verify() == [], "and so is changing what is inside them"
+
+
+def test_update_writes_nothing_when_one_file_cannot_be_rewritten(sandbox: Path, gate: Any) -> None:
+    """A half-updated repository is worse than a command that refused.
+
+    The English file is written first, so a missing marker in a later
+    translation would otherwise leave the source rewritten and the translations
+    bound to the version before it.
+    """
+    spanish = sandbox / "README.es.md"
+    spanish.write_text(spanish.read_text(encoding="utf-8").replace(gate.LINKS_END, ""), encoding="utf-8")
+    english_before = (sandbox / "README.md").read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        gate.update()
+
+    assert (sandbox / "README.md").read_text(encoding="utf-8") == english_before
