@@ -916,6 +916,22 @@ _README_SKIP_PREFIXES = (
 )
 
 
+#: Delimiters of the generated language-links block in every README
+#: (``scripts/check_readme_translations.py``). The block is decoration, and its
+#: line is a link strip one link short of the nav heuristic when only two
+#: languages are configured - so it is skipped by name rather than by shape.
+_LANGUAGE_LINKS = ("<!-- language-links -->", "<!-- /language-links -->")
+
+
+def _without_language_links(text: str) -> str:
+    """Drop the generated language-links block, markers and all."""
+    start, end = _LANGUAGE_LINKS
+    if start not in text or end not in text:
+        return text
+    head, rest = text.split(start, 1)
+    return head + rest.split(end, 1)[1]
+
+
 def _first_paragraph(path: Path) -> str:
     """Return the first prose paragraph from ``path``.
 
@@ -930,7 +946,7 @@ def _first_paragraph(path: Path) -> str:
     except OSError:
         return ""
     paragraph: list[str] = []
-    for raw in text.splitlines():
+    for raw in _without_language_links(text).splitlines():
         line = raw.rstrip()
         if not line:
             if paragraph:

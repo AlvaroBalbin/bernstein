@@ -28,6 +28,10 @@
 
 [website](https://bernstein.run) &middot; [docs](https://bernstein.readthedocs.io/) &middot; [install](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/getting-started/install.md) &middot; [first run](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/getting-started/first-run.md) &middot; [glossary](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/GLOSSARY.md) &middot; [limitations](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/KNOWN_LIMITATIONS.md) &middot; [name policy](https://github.com/sipyourdrink-ltd/bernstein/blob/main/TRADEMARKS.md) &middot; [sponsor](https://github.com/sponsors/chernistry)
 
+<!-- language-links -->
+**English** &middot; [简体中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.zh-Hans.md) &middot; [Español](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.es.md)
+<!-- /language-links -->
+
 </div>
 
 ---

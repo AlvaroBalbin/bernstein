@@ -429,6 +429,14 @@ jobs:
         # drift much later inside a long test shard. Run
         # `uv run python scripts/gen_distribution_manifests.py` locally to fix.
         run: uv run python scripts/gen_distribution_manifests.py --check
+      - name: Translated README drift check (#3425)
+        # Fails when an English README section changes and its translation does
+        # not, naming the language and the heading. A stale install command in
+        # a translated file is a documented instruction that fails, in a file
+        # nobody re-reads. Fix with
+        # `uv run python scripts/check_readme_translations.py --update` after
+        # translating the sections it names.
+        run: uv run python scripts/check_readme_translations.py
 
   lint:
     name: Lint

@@ -1,0 +1,7 @@
+{
+  "$comment": "Languages the README is translated into. Adding one is a data change plus a new README.<tag>.md; the gate and the docs need no edit. Tags are IETF language tags, with the script subtag where it decides legibility (zh-Hans, not zh-CN).",
+  "languages": [
+    { "tag": "zh-Hans", "name": "简体中文" },
+    { "tag": "es", "name": "Español" }
+  ]
+}

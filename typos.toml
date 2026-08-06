@@ -65,8 +65,11 @@ extend-exclude = [
     # Generated benchmark results contain truncated task names
     "benchmarks/results/*.json",
     # Translated READMEs - typos has only an English dictionary, every
-    # non-English word would be a false positive.
+    # non-English word would be a false positive. The English README stays in
+    # scope; the gate in scripts/check_readme_translations.py is what keeps the
+    # translations honest.
     "docs/i18n/**",
+    "README.*.md",
     # README demo evidence (issue #3426) - machine-generated recording bytes
     # and cryptographic content (base64url JWK x / signature, hex hashes);
     # the scanner reads base64 slices like "izRV" as words. The
