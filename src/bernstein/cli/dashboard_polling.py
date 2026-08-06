@@ -6,6 +6,7 @@ that are used by the TUI widgets and application.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from rich.markup import escape
 from rich.text import Text
@@ -22,14 +24,49 @@ from bernstein.cli.visual_theme import PALETTE, role_color, sample_gradient
 
 logger = logging.getLogger(__name__)
 
+#: Fallback only, and kept because other modules import it. The server the TUI
+#: actually talks to is resolved per call by :func:`server_url` - a run whose
+#: port was taken writes the real one to ``.sdd/runtime/server.port``, and
+#: polling a constant instead renders an empty dashboard that looks like an
+#: idle one (issue #3444).
 SERVER_URL = "http://127.0.0.1:8052"
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def server_url() -> str:
+    """Resolve the task server the way the rest of the CLI resolves it.
+
+    ``BERNSTEIN_SERVER_URL`` first, then the port the running orchestrator
+    persisted for this workspace, then the default. Resolved per call rather
+    than at import so a dashboard started before the server, or restarted onto
+    a different port, follows it.
+    """
+    from bernstein.cli.helpers import resolve_server_url
+
+    return resolve_server_url()
+
 
 # -- Data fetching (sync -- called via run_worker in a thread) -----
 
 
-def _auth_headers() -> dict[str, str]:
-    """Return the Authorization header for dashboard polling.
+def is_loopback(url: str) -> bool:
+    """Whether *url* addresses this machine.
+
+    Hostname-based rather than DNS-resolving on purpose: a resolver answer can
+    change between the check and the request, and this decides what a
+    credential is attached to.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if host in {"localhost", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _auth_headers(url: str) -> dict[str, str]:
+    """Return the Authorization header for a poll against *url*.
 
     The TUI usually runs inside the main Bernstein process, so it inherits the
     token that ``_resolve_auth_token`` stashes into ``os.environ`` during
@@ -37,9 +74,17 @@ def _auth_headers() -> dict[str, str]:
     it falls back to the persisted run token file under ``.sdd/runtime``
     (issue #2794). Without this header the SSO middleware rejects every
     request with 401, leaving the Tasks panel empty.
+
+    The persisted token is only ever sent to a loopback address. It is a
+    credential this machine minted for its own run, and the destination is now
+    resolvable from ``BERNSTEIN_SERVER_URL``: attaching it to whatever that
+    points at would hand the run credential to any host an operator - or
+    anything that can set an environment variable - names. A token the
+    operator set in the environment themselves is theirs to aim, so it goes
+    where they point it.
     """
     token = os.environ.get("BERNSTEIN_AUTH_TOKEN")
-    if not token:
+    if not token and is_loopback(url):
         from bernstein.core.run_auth_token import read_run_auth_token
 
         token = read_run_auth_token(Path.cwd())
@@ -48,15 +93,23 @@ def _auth_headers() -> dict[str, str]:
     return {}
 
 
-def _get(path: str) -> Any:
+def _get(path: str, url: str | None = None) -> Any:
+    """GET *path*, from *url* when the caller has already resolved one.
+
+    A batch passes its resolved URL in so every read in one dashboard update
+    comes from the same server: re-resolving per request lets a run that
+    restarts onto another port mid-batch mix two servers into one frame.
+    """
     import httpx
 
+    url = url or server_url()
     try:
-        return httpx.get(
-            f"{SERVER_URL}{path}",
-            timeout=10.0,
-            headers=_auth_headers(),
-        ).json()
+        response = httpx.get(f"{url}{path}", timeout=10.0, headers=_auth_headers(url))
+        # A 4xx/5xx with a JSON body would otherwise be handed to the widgets
+        # as data, and would count as a successful read when deciding whether
+        # the server is reachable at all.
+        response.raise_for_status()
+        return response.json()
     except Exception as exc:
         logger.warning("Dashboard GET %s failed: %s", path, exc)
         return None
@@ -65,13 +118,11 @@ def _get(path: str) -> Any:
 def _post(path: str, body: dict[str, Any] | None = None) -> Any:
     import httpx
 
+    url = server_url()
     try:
-        return httpx.post(
-            f"{SERVER_URL}{path}",
-            json=body or {},
-            timeout=2.0,
-            headers=_auth_headers(),
-        ).json()
+        response = httpx.post(f"{url}{path}", json=body or {}, timeout=2.0, headers=_auth_headers(url))
+        response.raise_for_status()
+        return response.json()
     except Exception as exc:
         logger.warning("Dashboard POST %s failed: %s", path, exc)
         return None
@@ -86,6 +137,9 @@ def _fetch_all() -> dict[str, Any]:
     """
     from typing import cast
 
+    # One resolution for the whole batch: see _get.
+    url = server_url()
+
     # Fast path: local files (instant, no HTTP)
     agents = _load_agents()
     quarantine = _load_quarantine()
@@ -94,12 +148,12 @@ def _fetch_all() -> dict[str, Any]:
     activity_summaries = _load_activity_summaries()
 
     # Slow path: HTTP to task server (may take 1-3s with many tasks)
-    status = _get("/status")
-    costs = _get("/costs")
-    quality = _get("/quality")
-    bandit = _get("/routing/bandit")
+    status = _get("/status", url)
+    costs = _get("/costs", url)
+    quality = _get("/quality", url)
+    bandit = _get("/routing/bandit", url)
     # Use /status for task counts instead of fetching all 400+ task objects
-    tasks = _get("/tasks")
+    tasks = _get("/tasks", url)
     pending_approval = 0
     if isinstance(tasks, list):
         task_dicts = cast("list[dict[str, Any]]", tasks)
@@ -109,7 +163,15 @@ def _fetch_all() -> dict[str, Any]:
     if isinstance(status, dict):
         verification_nudge = status.get("verification_nudge", {}) or {}
 
+    # An unreachable server and an idle one produce the same empty panels, so
+    # the difference is carried explicitly rather than left to the log. Every
+    # HTTP read has to have failed before the whole server is called
+    # unreachable: one route erroring is a broken route, and blanking a
+    # working dashboard over it would hide the data that did arrive.
+    server_unreachable = all(result is None for result in (status, costs, quality, bandit, tasks))
+
     return {
+        "server_unreachable": server_unreachable,
         "tasks": tasks,
         "status": status,
         "agents": agents,
@@ -331,8 +393,19 @@ def _build_runtime_subtitle(
     total: int,
     worktrees: int,
     restart_count: int,
+    unreachable_url: str = "",
 ) -> str:
-    """Build the compact runtime subtitle shown in the TUI header."""
+    """Build the compact runtime subtitle shown in the TUI header.
+
+    Args:
+        unreachable_url: Server the last poll failed against, if it failed. An
+            unreachable server empties every panel, which is indistinguishable
+            on screen from an orchestrator with nothing to do - so when the
+            poll fails the subtitle says so instead of describing a run that
+            may not exist (issue #3444).
+    """
+    if unreachable_url:
+        return f"No connection to {unreachable_url} - showing no data, not an idle run"
     progress_pct = int(done / total * 100) if total > 0 else 0
     parts = [f"Running for {_format_elapsed_label(elapsed_s)}"]
     if git_branch:
