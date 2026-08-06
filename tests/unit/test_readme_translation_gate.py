@@ -325,9 +325,17 @@ def test_update_writes_nothing_when_one_file_cannot_be_rewritten(sandbox: Path, 
     translation would otherwise leave the source rewritten and the translations
     bound to the version before it.
     """
+    # A new language, so a successful run would visibly rewrite the English
+    # file's links line - without that the before/after texts are identical and
+    # the assertion cannot tell a refusal from a rewrite.
+    (sandbox / "docs" / "i18n" / "languages.json").write_text(
+        json.dumps({"languages": [{"tag": "es", "name": "Español"}, {"tag": "ja", "name": "日本語"}]}),
+        encoding="utf-8",
+    )
     spanish = sandbox / "README.es.md"
     spanish.write_text(spanish.read_text(encoding="utf-8").replace(gate.LINKS_END, ""), encoding="utf-8")
     english_before = (sandbox / "README.md").read_text(encoding="utf-8")
+    assert "日本語" not in english_before
 
     with pytest.raises(ValueError):
         gate.update()
