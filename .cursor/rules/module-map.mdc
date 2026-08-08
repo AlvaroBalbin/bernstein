@@ -269,6 +269,7 @@ alwaysApply: false
 | `taxonomy.py`             | Failure taxonomy - classify every eval failure into a closed set |
 | `telemetry.py`            | Telemetry contract - strict schema for agent output metadata |
 | `trajectory_receipt.py`   | Signed, independently-replayable trajectory receipts for benchmark scores (#2925) |
+| `trajectory_receipt_projection.py` | COSE/in-toto/RFC 6962 offline third-party projection for trajectory receipts (#2925 PR 2) |
 | `vcr_fixture.py`          | VCR fixture pattern - dehydrate/hydrate deterministic test fixtures (T805) |
 | `yaml_runner.py`          | YAML eval harness - operator-runnable spec format with judge and golden diff |
 | `bench/`                  | bernstein-bench: runnable, reproducibility-gated evaluation harness |
