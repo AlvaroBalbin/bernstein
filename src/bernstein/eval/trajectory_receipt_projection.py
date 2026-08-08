@@ -140,8 +140,7 @@ class TrajectoryReceiptProjection:
 
 def _canonical_json_bytes(obj: Any) -> bytes:
     """Deterministic JSON bytes (sorted keys, compact separators, no NaN)."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                      allow_nan=False).encode("utf-8")
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def _public_key_to_jwk(public_key: Ed25519PublicKey, *, kid: str = "trajectory-receipt-key") -> dict[str, str]:
@@ -179,7 +178,7 @@ def _subject_bytes(receipt_hash: str) -> bytes:
     """Return the canonical bytes signed by all three envelope formats.
 
     The subject is the UTF-8 encoding of the ``sha256:``-prefixed receipt
-    hash.  This is the minimal, determistic commitment: any party who knows
+    hash.  This is the minimal, deterministic commitment: any party who knows
     the receipt hash can verify the envelope, and any party who has the
     envelope can locate the receipt by its hash.
     """
@@ -445,10 +444,7 @@ def _verify_transparency(
     proof = transparency_dict.get("inclusion_proof") or {}
     expected_leaf = _leaf_digest(_subject_bytes(receipt_hash))
     if proof.get("leaf_hash") != expected_leaf:
-        msg = (
-            f"inclusion proof leaf_hash {proof.get('leaf_hash', '')[:16]}… "
-            f"!= recomputed {expected_leaf[:16]}…"
-        )
+        msg = f"inclusion proof leaf_hash {proof.get('leaf_hash', '')[:16]}… != recomputed {expected_leaf[:16]}…"
         raise TrajectoryProjectionError(msg)
 
     # Single-leaf tree: root_hash must equal leaf_hash
@@ -556,10 +552,7 @@ def verify_trajectory_receipt_projection(
         raise TrajectoryProjectionError(msg)
 
     if cose_hash != projection.receipt_hash:
-        msg = (
-            f"verified subject {cose_hash[:20]!r} != "
-            f"projection.receipt_hash {projection.receipt_hash[:20]!r}"
-        )
+        msg = f"verified subject {cose_hash[:20]!r} != projection.receipt_hash {projection.receipt_hash[:20]!r}"
         raise TrajectoryProjectionError(msg)
 
     return cose_hash

@@ -241,9 +241,7 @@ def test_all_three_formats_commit_same_receipt_hash(tmp_path: Path) -> None:
     # Verify all three individually and collect the subjects
     cose_hash = verify_cose_projection_bytes(proj.cose_bytes, public_key=sk.public_key())
 
-    intoto_payload = json.loads(
-        __import__("base64").b64decode(proj.intoto_dict["payload"]).decode("utf-8")
-    )
+    intoto_payload = json.loads(__import__("base64").b64decode(proj.intoto_dict["payload"]).decode("utf-8"))
     intoto_hash = intoto_payload["predicate"]["receipt_hash"]
 
     transparency_hash = proj.transparency_dict["signed_tree_head"]["subject_receipt_hash"]
@@ -425,7 +423,6 @@ def test_no_tasks_receipt_projects_and_verifies(tmp_path: Path) -> None:
 
 def test_public_key_jwk_embedded_and_correct(tmp_path: Path) -> None:
     """The embedded JWK in the projection is the public half of the signing key."""
-    from cryptography.hazmat.primitives import serialization
 
     sk = _fresh_key()
     receipt = _build_receipt(tmp_path)
@@ -438,10 +435,12 @@ def test_public_key_jwk_embedded_and_correct(tmp_path: Path) -> None:
 
     # Reconstruct public key from JWK and confirm it matches
     import base64
+
     x = jwk["x"]
     padding = "=" * (-len(x) % 4)
     raw = base64.urlsafe_b64decode(x + padding)
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
     reconstructed = Ed25519PublicKey.from_public_bytes(raw)
 
     # Verify that we can verify the COSE with the reconstructed key
