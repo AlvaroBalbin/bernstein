@@ -247,34 +247,35 @@
 
 ### `src/bernstein/eval/` - evaluation harness
 
-| File                      | Purpose |
-|---------------------------|---------|
-| `ab_comparison.py`        | Three-arm profile A/B comparison artifact (issue #2247) |
-| `ab_runner.py`            | A/B runner primitive - deterministic prompt-vs-prompt comparison |
-| `baseline.py`             | Baseline tracking for eval-gated evolution |
-| `calibration.py`          | Calibration log + Brier score for router and judge decisions |
-| `clean_run.py`            | Clean-run attestation: prove task ground-truth was never fetched (#2930) |
-| `gate_receipt.py`         | Signed verdict receipts for statistical eval gating (#2520) |
-| `golden.py`               | Golden benchmark suite - curated tasks for eval |
-| `harness.py`              | Eval harness - multiplicative scoring, LLM judge, failure taxonomy |
-| `incident_synthesizer.py` | Convert dead-letter and post-mortem incidents into regression eval cases |
-| `judge.py`                | LLM judge - evaluate code quality of agent-produced changes |
-| `metrics.py`              | Custom eval metrics - each metric is a dataclass with a compute method |
-| `pentest_consensus.py`    | Consensus aggregation for the multi-adapter pentest fan-out |
-| `pentest_runner.py`       | Driver that runs the ``security-pentest`` scenario end-to-end |
-| `pentest_scorer.py`       | Precision and recall scorer for security pentest eval scenario |
-| `promotion.py`            | Deterministic stage promotion and revocation for eval gating (#2520) |
-| `scenario_generator.py`   | Forward-looking synthetic scenario generator |
-| `scenario_runner.py`      | Scenario runner - execute YAML-defined eval scenarios against the live codebase |
-| `significance.py`         | Exact statistics for eval gate verdicts (#2520) |
-| `taxonomy.py`             | Failure taxonomy - classify every eval failure into a closed set |
-| `telemetry.py`            | Telemetry contract - strict schema for agent output metadata |
-| `trajectory_receipt.py`   | Signed, independently-replayable trajectory receipts for benchmark scores (#2925) |
-| `vcr_fixture.py`          | VCR fixture pattern - dehydrate/hydrate deterministic test fixtures (T805) |
-| `yaml_runner.py`          | YAML eval harness - operator-runnable spec format with judge and golden diff |
-| `bench/`                  | bernstein-bench: runnable, reproducibility-gated evaluation harness |
-| `cases/`                  | cases/ sub-package |
-| `golden_data/`            | Packaged golden benchmark fixtures (ships in wheel via package-data) |
+| File                               | Purpose |
+|------------------------------------|---------|
+| `ab_comparison.py`                 | Three-arm profile A/B comparison artifact (issue #2247) |
+| `ab_runner.py`                     | A/B runner primitive - deterministic prompt-vs-prompt comparison |
+| `baseline.py`                      | Baseline tracking for eval-gated evolution |
+| `calibration.py`                   | Calibration log + Brier score for router and judge decisions |
+| `clean_run.py`                     | Clean-run attestation: prove task ground-truth was never fetched (#2930) |
+| `gate_receipt.py`                  | Signed verdict receipts for statistical eval gating (#2520) |
+| `golden.py`                        | Golden benchmark suite - curated tasks for eval |
+| `harness.py`                       | Eval harness - multiplicative scoring, LLM judge, failure taxonomy |
+| `incident_synthesizer.py`          | Convert dead-letter and post-mortem incidents into regression eval cases |
+| `judge.py`                         | LLM judge - evaluate code quality of agent-produced changes |
+| `metrics.py`                       | Custom eval metrics - each metric is a dataclass with a compute method |
+| `pentest_consensus.py`             | Consensus aggregation for the multi-adapter pentest fan-out |
+| `pentest_runner.py`                | Driver that runs the ``security-pentest`` scenario end-to-end |
+| `pentest_scorer.py`                | Precision and recall scorer for security pentest eval scenario |
+| `promotion.py`                     | Deterministic stage promotion and revocation for eval gating (#2520) |
+| `scenario_generator.py`            | Forward-looking synthetic scenario generator |
+| `scenario_runner.py`               | Scenario runner - execute YAML-defined eval scenarios against the live codebase |
+| `significance.py`                  | Exact statistics for eval gate verdicts (#2520) |
+| `taxonomy.py`                      | Failure taxonomy - classify every eval failure into a closed set |
+| `telemetry.py`                     | Telemetry contract - strict schema for agent output metadata |
+| `trajectory_receipt.py`            | Signed, independently-replayable trajectory receipts for benchmark scores (#2925) |
+| `trajectory_receipt_projection.py` | COSE / in-toto DSSE / RFC 6962 transparency projection for trajectory receipts |
+| `vcr_fixture.py`                   | VCR fixture pattern - dehydrate/hydrate deterministic test fixtures (T805) |
+| `yaml_runner.py`                   | YAML eval harness - operator-runnable spec format with judge and golden diff |
+| `bench/`                           | bernstein-bench: runnable, reproducibility-gated evaluation harness |
+| `cases/`                           | cases/ sub-package |
+| `golden_data/`                     | Packaged golden benchmark fixtures (ships in wheel via package-data) |
 
 ### `src/bernstein/plugins/` - plugin system (pluggy)
 
