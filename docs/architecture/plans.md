@@ -122,13 +122,14 @@ Source: `plan_schema.py:49-77`, `plan_loader.py:70-97`.
 
 ---
 
-## Plan validation: `bernstein validate`
+## Plan validation: `bernstein plan validate`
 
-`bernstein validate path/to/plan.yaml` runs four checks before the plan is
-ever scheduled:
+`bernstein plan validate path/to/plan.yaml` runs four checks before the plan is
+ever scheduled. `bernstein validate` remains registered as a deprecated alias
+for the whole 3.x line and is unregistered in 4.0.0.
 
 1. **Schema check** - required fields, enum values, integer ranges
-   (`plan_schema.validate_plan()` at `plan_schema.py:428-451`).
+   (`plan_schema.validate_plan()`, run by `plan_validate_cmd._check_schema`).
 2. **Duplicate titles** - every step title must be unique within the plan
    (`plan_validate_cmd._check_duplicate_titles`).
 3. **Dependency references** - every `depends_on` entry must point at a
@@ -139,7 +140,13 @@ ever scheduled:
 Plus warnings:
 
 - **Unknown roles** - any role not in the registry-known list is flagged
-  (`_check_unknown_roles`).
+  (`_check_unknown_roles`). Roles come from `templates/roles/`, which a project
+  extends, so an unrecognised role is a warning and never an error.
+
+**Exit code.** `0` when the plan is clean or carries warnings only, `1` when any
+check reports an error - both spellings. A CI gate should branch on that rather
+than grep the output. The schema check runs first and, when it finds anything,
+the command reports those errors and stops without building the task graph.
 
 Common errors:
 
@@ -413,7 +420,7 @@ stages:
 Validation:
 
 ```bash
-bernstein validate plans/rate-limit-api.yaml
+bernstein plan validate plans/rate-limit-api.yaml
 # ✓ 6 tasks, 3 stages, max parallel = 3
 ```
 

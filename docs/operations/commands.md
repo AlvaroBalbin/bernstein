@@ -79,7 +79,7 @@ bernstein dry-run    # preview tasks without executing
 bernstein dep-impact # API breakage + downstream caller impact
 bernstein aliases    # show command shortcuts
 bernstein config-path    # show config file locations
-bernstein init-wizard    # interactive project setup
+bernstein init --wizard  # interactive project setup
 bernstein debug bundle   # collect logs, config, and state for bug reports
 bernstein skills list    # discoverable skill packs (progressive disclosure)
 bernstein skills show <name>  # print a skill body with its references
@@ -109,6 +109,18 @@ v4.0.0. Flags and arguments are unchanged unless noted.
 from the audit chain; `bernstein limits pool` governs admission slot pools in
 the work ledger. The two address different stores, so folding one into the
 other would change results rather than just the name.
+
+Four more top-level names were folded into the domain group that already
+owned the surface (#3140). Same rule: the fold spelling is canonical, the old
+spelling still resolves with a stderr warning, and it is unregistered in
+v4.0.0.
+
+| Deprecated | Use instead | Notes |
+|---|---|---|
+| `bernstein quickstart` | `bernstein demo --flask-todo` | Same demo. The retained alias keeps its own adapter auto-detection; `demo --flask-todo` runs on the mock adapter unless `--real` is passed. |
+| `bernstein init-wizard` | `bernstein init --wizard` | Same wizard. `bernstein i` is the shortcut. |
+| `bernstein validate` | `bernstein plan validate` | Same argument and flags. |
+| `bernstein routine <sub>` | `bernstein schedule routine <sub>` | Same subcommands (`export`, `provision`, `register`, `bindings`) and flags. |
 
 The warning goes to stderr only, so `bernstein cost-envelopes show --json | jq`
 and friends keep working while a script is migrated.
