@@ -314,6 +314,11 @@ DOCUMENTED_COMMANDS: frozenset[str] = frozenset(
         "datasource",
         # Provenance-verified update lifecycle: check, update, pin, rollback (#2942)
         "self",
+        # Change-impact analysis group: api / deps / blast (#3139). Documented
+        # in docs/reference/cli-reference.md, with a flag table per subcommand
+        # that tests/unit/test_cli_command_registration.py checks against the
+        # real parser.
+        "impact",
     }
 )
 
