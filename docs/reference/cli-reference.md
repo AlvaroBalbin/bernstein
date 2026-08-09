@@ -380,7 +380,7 @@ set. (`cli/commands/advanced_cmd.py`, `core/observability/otel_projection.py`.)
 | `bernstein ci` | CI integration commands (group). | `cli/commands/ci_cmd.py:49` |
 | `bernstein chaos` | Chaos engineering (group). | `cli/commands/chaos_cmd.py:33` |
 | `bernstein eval` | Evaluation pipelines (group). | `cli/commands/eval_benchmark_cmd.py:426` |
-| `bernstein benchmark` | Benchmark pipelines (group). | `cli/commands/eval_benchmark_cmd.py:29` |
+| `bernstein benchmark` | Benchmark pipelines (group). Deprecated alias until v4.0.0: use `bernstein eval`. | `cli/commands/eval_benchmark_cmd.py:29` |
 | `bernstein impact` | Change-impact analysis (group): API compatibility, caller sites, blast radius. | `cli/commands/impact_cmd.py:23` |
 | `bernstein api-check` | Detect breaking-API changes. Second spelling of `bernstein impact api`. | `cli/commands/api_check_cmd.py:22` |
 | `bernstein dep-impact` | Deprecated alias of `bernstein impact deps`; removed in v4.0.0. | `cli/commands/impact_cmd.py:39` |
@@ -434,6 +434,21 @@ Common flags: `--token` (env: `GITHUB_TOKEN`), `--server`, `--interval`. (`cli/c
 
 #### `bernstein eval` / `bernstein benchmark`
 
+`bernstein benchmark` is a deprecated alias for `bernstein eval` and prints a warning on stderr before running; it keeps every subcommand it carried and is removed in v4.0.0. Every subcommand name is reachable under `eval` before the removal:
+
+| Deprecated | Canonical | Notes |
+| --- | --- | --- |
+| `benchmark run` | `eval run` | **Different command.** `eval run` drives the golden harness or a YAML eval spec (`--spec`, `--output`, `--compare`, tiers `smoke/standard/stretch/adversarial`); `benchmark run` drives the evolution benchmark tree (`--benchmarks-dir`, tiers `smoke/capability/stretch`). `--benchmarks-dir` has **no `eval` equivalent**. |
+| `benchmark swe-bench` | `eval swe-bench` | Same runner and same options; `benchmark swe-bench --lite` is itself a deprecated alias, so migrate it to `eval swe-bench --subset lite`. |
+| `benchmark programbench` | `eval programbench` | Same command object. |
+| `benchmark compare` | `eval compare` | Same command object. |
+| `benchmark simulate` | `eval simulate` | Same command object. |
+| `benchmark receipt emit/verify` | `eval receipt emit/verify` | Same command object. |
+
+One capability does not survive the rename: `bernstein benchmark run --benchmarks-dir DIR` runs the evolution benchmark tree and `eval run` cannot. Until that option is ported onto an `eval` command, `bernstein benchmark run` is the only spelling for it, and v4.0.0 should not unregister the alias without porting it first. `tests/unit/test_fold_benchmark_subcommands.py` declares the list of alias-only options and fails if it widens or if a declared replacement stops being accepted, so this note cannot silently go stale.
+
+`eval simulate` is **not** the top-level `bernstein simulate`. The top-level command is a digital-twin simulation of a plan against historical traces (`--plan`, `--from-traces`, `--traces-dir`); `eval simulate` replays the standard benchmark task set for throughput, cost and quality (`--tasks-dir`, `--task-id`, `--baseline`). They share a verb and no options, and the top-level command is unaffected by this change. `bernstein bench` is a separate command and is not folded in.
+
 The two groups share most flags:
 
 | Flag | Default | Meaning |
@@ -446,7 +461,7 @@ The two groups share most flags:
 | `--save / --no-save` | save | Persist results to disk. |
 | `--compare` | off | Compare against the previous run. |
 
-`bernstein eval run` is the typical command for SWE-bench-style evaluations; `bernstein benchmark run` for Bernstein-internal performance benchmarks. See `cli/commands/eval_benchmark_cmd.py:127+` and `:426+`.
+`bernstein eval run` is the typical command for SWE-bench-style evaluations; `bernstein eval swe-bench` and `bernstein eval golden` cover the harness and the curated golden suite. See `cli/commands/eval_benchmark_cmd.py:127+` and `:426+`.
 
 `bernstein eval` additionally accepts group-level reliability options — a pass^k alias for `bench run --reliability` that cannot be combined with an eval subcommand:
 
