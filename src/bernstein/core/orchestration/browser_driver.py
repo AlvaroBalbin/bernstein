@@ -33,16 +33,16 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from uuid import uuid4
 
-from bernstein.core.agents.computer_use import ActionKind
+from bernstein.core.agents.computer_use import Action, ActionKind
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
-
-    from bernstein.core.agents.computer_use import Action
 
 __all__ = [
     "BrowserDriver",
@@ -51,10 +51,15 @@ __all__ = [
     "BrowserProfile",
     "BrowserStepTimeout",
     "BrowserUseDriver",
+    "ConformanceFailure",
     "PageState",
     "RecordedBrowserDriver",
     "browser_use_driver",
+    "get_driver_factory",
+    "list_drivers",
     "observe",
+    "register_driver",
+    "verify_driver_conformance",
 ]
 
 #: The bernstein extra namespace the live browser driver belongs to. Declared
@@ -410,3 +415,367 @@ def browser_use_driver(*, profile_dir: Path) -> BrowserUseDriver:
     if factory is None:
         raise BrowserDriverUnavailable(driver_name="browser_use", extra=BROWSER_EXTRA)
     return BrowserUseDriver(factory(user_data_dir=str(profile_dir)), profile_dir=profile_dir)
+
+
+# ---------------------------------------------------------------------------
+# Driver Registry
+# ---------------------------------------------------------------------------
+
+#: A registered driver factory. Every entry is called with exactly one keyword
+#: argument, ``profile_dir`` -- the shape :func:`browser_use_driver` already has
+#: -- so the activity boundary can build any registered driver the same way and
+#: a new backend is a registry entry rather than a branch in the CLI.
+type DriverFactory = Callable[..., BrowserDriver]
+
+_DRIVER_REGISTRY: dict[str, DriverFactory] = {}
+
+
+def register_driver(name: str, factory: DriverFactory) -> None:
+    """Register a browser driver factory under *name*.
+
+    Registration is last-write-wins and silent: a later call under an existing
+    name replaces the earlier factory, including the built-ins. The registry is
+    module-global and populated at import time, so whichever module imports last
+    decides. There is no unregister verb.
+
+    Args:
+        name: The name ``--driver`` selects the backend by.
+        factory: Builds a driver bound to an isolated profile. It is called as
+            ``factory(profile_dir=...)`` and nothing else, so every registered
+            entry is interchangeable at the activity boundary. A factory that
+            needs more than a profile directory must refuse with a
+            :class:`BrowserDriverError` rather than expose a constructor that
+            raises :class:`TypeError` when the boundary calls it.
+    """
+    _DRIVER_REGISTRY[name] = factory
+
+
+def list_drivers() -> list[str]:
+    """Return a sorted list of registered driver names."""
+    return sorted(_DRIVER_REGISTRY.keys())
+
+
+def get_driver_factory(name: str) -> DriverFactory:
+    """Return the driver factory for *name*.
+
+    Args:
+        name: The registered driver name.
+
+    Returns:
+        The factory, callable as ``factory(profile_dir=...)``.
+
+    Raises:
+        BrowserDriverError: When *name* is not registered. The message lists the
+            registered names, so the refusal happens before a browser is started
+            and tells the operator what they could have asked for.
+    """
+    if name not in _DRIVER_REGISTRY:
+        avail = ", ".join(repr(n) for n in list_drivers())
+        raise BrowserDriverError(f"Unknown browser driver {name!r}. Registered drivers: {avail}.")
+    return _DRIVER_REGISTRY[name]
+
+
+#: The registered name of the recorded-tape driver.
+RECORDED_DRIVER_NAME = "recorded"
+
+#: Why the recorded driver cannot be built from its name alone. Shared so the
+#: activity boundary refuses the selection up front with the same wording the
+#: factory raises with if something builds it anyway -- a refusal that arrives as
+#: a ``driver_error`` terminal state tells the operator nothing about the tape.
+RECORDED_DRIVER_REFUSAL = (
+    "Browser driver 'recorded' replays a recorded observation tape and cannot be selected "
+    "by name alone. Pass the tape instead: --recording <path>."
+)
+
+
+def _recorded_driver_needs_a_tape(*, profile_dir: Path) -> BrowserDriver:
+    """Refuse to build :class:`RecordedBrowserDriver` from a name alone.
+
+    The recorded driver replays a fixed observation tape, so unlike a live
+    backend it cannot be constructed from a profile directory alone -- it is
+    selected by handing the tape in, not by naming it. Registered anyway so the
+    name stays discoverable in :func:`list_drivers` and selecting it is a typed
+    refusal instead of a :class:`TypeError` escaping a partially applied
+    constructor.
+
+    Args:
+        profile_dir: Accepted to match the registry calling contract; unused.
+
+    Raises:
+        BrowserDriverError: Always.
+    """
+    raise BrowserDriverError(RECORDED_DRIVER_REFUSAL)
+
+
+# Register built-in drivers by default
+register_driver("browser_use", browser_use_driver)
+register_driver(RECORDED_DRIVER_NAME, _recorded_driver_needs_a_tape)
+
+
+# ---------------------------------------------------------------------------
+# Driver Conformance Kit
+# ---------------------------------------------------------------------------
+
+
+#: The six protocol members a conforming driver exposes.
+CONFORMANCE_VERBS: tuple[str, ...] = ("navigate", "act", "screenshot", "dom_snapshot", "current_url", "close")
+
+#: The fixed observation tape :func:`verify_driver_conformance` drives by
+#: default: the start state, the state after ``navigate``, and the state after
+#: ``act``. Three *distinct* frames, deliberately -- every read verb is compared
+#: byte-exact against the frame the driver is supposed to be sitting on, so a
+#: driver whose snapshot lags or leads the action (a DOM frozen at the start, or
+#: the post-action DOM returned before the action) diverges from a frame it does
+#: not match and fails at the verb that read it. A tape whose frames repeat would
+#: let an ordering violation pass unnoticed.
+CONFORMANCE_TAPE: tuple[PageState, ...] = (
+    PageState(url="https://example.com/start", screenshot=b"PNG-start", dom=b"<html>start</html>"),
+    PageState(url="https://example.com/next", screenshot=b"PNG-next", dom=b"<html>next</html>"),
+    PageState(url="https://example.com/final", screenshot=b"PNG-final", dom=b"<html>final</html>"),
+)
+
+
+class ConformanceFailure(AssertionError):
+    """Raised when a driver fails the conformance kit.
+
+    Attributes:
+        verb: The protocol member that failed, or ``"profile"`` for a profile
+            isolation violation. Named so a failure points at the surface to fix
+            rather than at the kit.
+    """
+
+    def __init__(self, verb: str, message: str) -> None:
+        self.verb = verb
+        super().__init__(f"Conformance failure in verb {verb!r}: {message}")
+
+
+def _expect_frame(driver: BrowserDriver, expected: PageState, *, phase: str) -> None:
+    """Assert the driver's three read verbs all describe *expected*.
+
+    Args:
+        driver: The driver under test.
+        expected: The frame the driver is supposed to be sitting on.
+        phase: Where in the flow this read happens, for the failure message.
+
+    Raises:
+        ConformanceFailure: Naming the read verb that disagreed.
+    """
+    url = driver.current_url()
+    if url != expected.url:
+        raise ConformanceFailure("current_url", f"{phase}: expected {expected.url!r}, got {url!r}")
+
+    dom = driver.dom_snapshot()
+    if not isinstance(dom, bytes) or not dom:
+        raise ConformanceFailure("dom_snapshot", f"{phase}: returned an empty or non-bytes snapshot")
+    if dom != expected.dom:
+        raise ConformanceFailure("dom_snapshot", f"{phase}: expected {expected.dom!r}, got {dom!r}")
+
+    shot = driver.screenshot()
+    if not isinstance(shot, bytes) or not shot:
+        raise ConformanceFailure("screenshot", f"{phase}: returned an empty or non-bytes screenshot")
+    if shot != expected.screenshot:
+        raise ConformanceFailure("screenshot", f"{phase}: expected {expected.screenshot!r}, got {shot!r}")
+
+
+def _drive_tape(driver: BrowserDriver, expected_tape: Sequence[PageState], *, which: str) -> None:
+    """Drive one driver through the fixed flow, checking every observation point.
+
+    Args:
+        driver: The driver to drive.
+        expected_tape: The three frames it is expected to reproduce.
+        which: Which of the kit's two drivers this is, for the failure message.
+
+    Raises:
+        ConformanceFailure: Naming the verb that disagreed.
+    """
+    _expect_frame(driver, expected_tape[0], phase=f"{which} driver, initial state")
+    driver.navigate(expected_tape[1].url)
+    _expect_frame(driver, expected_tape[1], phase=f"{which} driver, after navigate")
+    driver.act(Action(kind=ActionKind.CLICK, target="#conformance"))
+    _expect_frame(driver, expected_tape[2], phase=f"{which} driver, after act")
+
+
+def _close_idempotently(driver: BrowserDriver) -> Exception | None:
+    """Close *driver* twice, returning the failure instead of raising it.
+
+    Returned rather than raised so one driver's non-idempotent ``close`` cannot
+    leave a sibling session open or mask a conformance failure already in flight.
+    """
+    try:
+        driver.close()
+        driver.close()
+    except Exception as exc:
+        return exc
+    return None
+
+
+def _profile_fingerprint(path: Path) -> dict[str, str]:
+    """Fingerprint every entry under *path* by name *and* content.
+
+    A set of names is not enough to say a directory is unchanged: a profile that
+    already holds a cookie jar can have it rewritten in place, which leaves the
+    listing identical and the session hijacked. Files are hashed, so "unchanged"
+    means unchanged bytes. Empty when *path* is absent.
+    """
+    if not path.exists():
+        return {}
+    fingerprint: dict[str, str] = {}
+    for child in path.rglob("*"):
+        key = str(child.relative_to(path))
+        if child.is_dir():
+            fingerprint[key] = "dir"
+        else:
+            try:
+                fingerprint[key] = f"file:{hashlib.sha256(child.read_bytes()).hexdigest()}"
+            except OSError:
+                fingerprint[key] = "unreadable"
+    return fingerprint
+
+
+def verify_driver_conformance(
+    driver_factory: DriverFactory,
+    *,
+    root_dir: Path,
+    expected_tape: Sequence[PageState] = CONFORMANCE_TAPE,
+) -> None:
+    """Run the driver conformance suite against *driver_factory*.
+
+    Drives a fixed flow -- observe, ``navigate``, observe, ``act``, observe --
+    over a fixed three-frame tape and compares every read verb byte-exact against
+    the frame the driver should be sitting on at that point. That is what makes
+    the kit able to fail an ordering violation: a driver whose ``dom_snapshot``
+    lags or leads the action returns bytes belonging to a different frame.
+
+    What is asserted:
+
+    * all six members of :data:`CONFORMANCE_VERBS` are present and callable;
+    * ``current_url``, ``dom_snapshot`` and ``screenshot`` match the expected
+      frame at each of the three observation points;
+    * ``navigate`` and ``act`` each advance the driver by exactly one frame;
+    * ``close`` is idempotent, as the protocol requires, and each driver is
+      closed even when a sibling's ``close`` raises; and
+    * profile isolation, to the extent the six-verb protocol makes it
+      observable -- see below.
+
+    Two drivers are built and *both* are driven through the whole flow. A factory
+    that hands out a shared or stateful instance fails, because the second driver
+    is then already past the start frame; a backend whose second session is
+    broken can no longer hide behind a first session that works.
+
+    What the profile checks do and do not prove. The kit asserts that two tasks
+    are allocated disjoint directories, that both exist while both drivers are
+    live, that driving one task leaves the other's directory byte-for-byte
+    unchanged, and that tearing one down does not remove the other. It cannot
+    prove a backend *uses* the directory it was handed: nothing in the six-verb
+    protocol exposes where a driver puts its state, so a backend that ignores
+    ``profile_dir`` and writes to a fixed location outside ``root_dir`` passes.
+    Non-interference inside the profile root is the strongest claim available
+    here; anything more has to be asserted by the backend's own tests.
+
+    What the action check does not prove either. ``act`` returns nothing, and the
+    only readback is the next frame -- which a legitimate replay driver advances
+    by cursor, not by payload. A driver that discards the ``kind`` and ``target``
+    it is handed and simply advances therefore passes, and requiring otherwise
+    would fail :class:`RecordedBrowserDriver`, which exists to replay a tape.
+    Payload handling has to be asserted by the backend's own tests; what is
+    pinned here is that ``act`` is exercised with a non-navigation action, the
+    route ``BrowserWorker`` sends everything but ``NAVIGATE`` down.
+
+    *driver_factory* is called as ``factory(profile_dir=...)``, the registry
+    calling contract, so a registered backend can be handed to the kit directly.
+    Being callable is not the same as passing: the kit compares against a fixed
+    tape, so a live backend has to be pointed at a fixture that reproduces one.
+
+    Args:
+        driver_factory: Builds a driver bound to a profile directory.
+        root_dir: Where the kit allocates its throwaway profiles.
+        expected_tape: The three frames the driver is expected to reproduce.
+
+    Raises:
+        ConformanceFailure: When the driver violates the protocol.
+        ValueError: When *expected_tape* does not hold exactly three frames --
+            a caller error in the kit's own arguments, not a driver fault.
+    """
+    if len(expected_tape) != 3:
+        raise ValueError(f"conformance tape must hold exactly 3 frames, got {len(expected_tape)}")
+
+    # Per-invocation task ids. BrowserProfile.allocate is deterministic in the
+    # task id -- which is what the worker wants, so a supervisor can find a
+    # crashed task's profile -- but it means two verifier invocations sharing a
+    # root_dir would resolve to the same two directories and tear down each
+    # other's live profiles mid-run. The nonce keeps the two ids distinct within
+    # an invocation and unique across invocations; nothing here is anchored, so
+    # the profile paths carry no determinism requirement.
+    nonce = uuid4().hex
+    profile_a = BrowserProfile.allocate(root=root_dir, task_id=f"conformance-{nonce}-task-a")
+    profile_b = BrowserProfile.allocate(root=root_dir, task_id=f"conformance-{nonce}-task-b")
+    close_error: Exception | None = None
+    # Every driver the factory hands back, recorded as it is built. A session
+    # opened before a failure -- a conformance failure mid-flow, or a factory
+    # that refuses the second build -- still has to be closed on the way out.
+    built: list[BrowserDriver] = []
+    try:
+        driver = driver_factory(profile_dir=profile_a.profile_dir)
+        built.append(driver)
+        other = driver_factory(profile_dir=profile_b.profile_dir)
+        built.append(other)
+
+        for name, subject in (("first", driver), ("second", other)):
+            for verb in CONFORMANCE_VERBS:
+                if not callable(getattr(subject, verb, None)):
+                    raise ConformanceFailure(verb, f"the {name} driver does not expose the verb as a callable")
+
+        # Two live tasks off one factory must not share a profile directory.
+        if profile_a.profile_dir == profile_b.profile_dir:
+            raise ConformanceFailure("profile", "two tasks were handed the same profile directory")
+        if not profile_a.profile_dir.exists() or not profile_b.profile_dir.exists():
+            raise ConformanceFailure("profile", "an allocated profile directory does not exist")
+
+        # Both drivers are driven, not just the first. A factory that hands out a
+        # shared or stateful instance shows up as a second driver that is already
+        # past the start frame, and a backend whose second session is broken can
+        # no longer hide behind a first session that works.
+        sibling_before = _profile_fingerprint(profile_b.profile_dir)
+        _drive_tape(driver, expected_tape, which="first")
+        if _profile_fingerprint(profile_b.profile_dir) != sibling_before:
+            raise ConformanceFailure("profile", "driving one task changed another task's profile directory")
+
+        sibling_before = _profile_fingerprint(profile_a.profile_dir)
+        _drive_tape(other, expected_tape, which="second")
+        if _profile_fingerprint(profile_a.profile_dir) != sibling_before:
+            raise ConformanceFailure("profile", "driving one task changed another task's profile directory")
+
+        # close must be idempotent. Each driver is closed independently: a
+        # session that leaks because a sibling's close raised is exactly the
+        # failure this check exists to catch. The first error is reported after
+        # teardown so it cannot mask a live conformance failure.
+        for subject in (driver, other):
+            error = _close_idempotently(subject)
+            if error is not None and close_error is None:
+                close_error = error
+
+        # Terminal state for task A: its profile goes, task B's stays.
+        profile_a.teardown()
+        if profile_a.profile_dir.exists():
+            raise ConformanceFailure("profile", "the profile directory survived its task's teardown")
+        if not profile_b.profile_dir.exists():
+            raise ConformanceFailure("profile", "tearing down one task's profile removed another task's")
+        profile_b.teardown()
+        if profile_b.profile_dir.exists():
+            raise ConformanceFailure("profile", "the profile directory survived its task's teardown")
+    finally:
+        # Close every session on every exit path. On the success path each was
+        # already closed twice above, and close is required to be idempotent, so
+        # this is a no-op there; on a failure path it is the only close that
+        # runs. Errors are suppressed because a non-conforming close must not
+        # replace the failure that is already being reported.
+        for subject in built:
+            with suppress(Exception):
+                subject.close()
+        # Teardown is idempotent, so this is a safety net for the early-exit
+        # paths above and a no-op once the isolation assertions have run.
+        profile_a.teardown()
+        profile_b.teardown()
+
+    if close_error is not None:
+        raise ConformanceFailure("close", f"close is not idempotent: {type(close_error).__name__}") from close_error
