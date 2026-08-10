@@ -8,7 +8,7 @@ tags:
 
 # Screens
 
-Seven routes. Source: `web/src/routes/`. Design tokens: `web/src/index.css`.
+Eight routes. Source: `web/src/routes/`. Design tokens: `web/src/index.css`.
 
 ## Screenshots
 
@@ -84,3 +84,12 @@ Seven routes. Source: `web/src/routes/`. Design tokens: `web/src/index.css`.
 - **Top 10 tasks:** index column (mono `01`–`10`) · title + agent meta · cost (mono bold right).
 - **Endpoints:** `GET /api/v1/costs/current`, `/costs/history`, `/costs/by-tag`, `/costs/forecast`. Live ticks: `GET /api/v1/events/cost`.
 - **Replaces TUI widget:** `cost_sparkline.py`.
+
+## Missions (`/ui/missions`)
+
+- **Source:** `web/src/routes/Missions.tsx`.
+- **What it shows:** the outcome-level timeline over a multi-day run - phase lanes with per-phase state, gate receipt, and envelope burn.
+- **Provenance:** every element links to the receipt / evidence bundle it was derived from; the `mission_status_hash` is shown so two operators can confirm they are looking at the same state.
+- **Unverified state:** when work-ledger chain verification fails (`ledger_verified === false`) the screen switches to an explicit unverified banner instead of best-effort rendering.
+- **Endpoints:** `GET /api/v1/missions/*` (`src/bernstein/core/routes/missions.py`) - a deterministic projection folded from the mission's work-ledger chain; the server holds no mission-side state.
+- **Replaces TUI widget:** none - mission timelines had no TUI surface.
