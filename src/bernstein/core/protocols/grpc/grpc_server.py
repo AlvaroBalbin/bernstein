@@ -230,21 +230,32 @@ class ClusterServiceImpl:
 
     async def RegisterNode(self, request: Any, context: Any) -> Any:  # NOSONAR - gRPC method name
         from bernstein.core.grpc_gen import cluster_pb2
-        from bernstein.core.models import NodeCapacity
+        from bernstein.core.models import NodeCapacity, NodeInfo
 
-        cap = NodeCapacity(
-            max_agents=request.capacity.max_agents or 6,
-            available_slots=request.capacity.available_slots or 6,
-            active_agents=request.capacity.active_agents,
-            gpu_available=request.capacity.gpu_available,
-            supported_models=list(request.capacity.supported_models),
-        )
+        if request.HasField("capacity"):
+            # proto3 scalars carry no presence, so a supplied capacity is
+            # taken verbatim: available_slots=0 means a saturated node, not
+            # "use the default" (same shape Heartbeat uses below). An empty
+            # supported_models falls back to the NodeCapacity default, the
+            # same default the REST registration schema applies.
+            cap = NodeCapacity(
+                max_agents=request.capacity.max_agents,
+                available_slots=request.capacity.available_slots,
+                active_agents=request.capacity.active_agents,
+                gpu_available=request.capacity.gpu_available,
+            )
+            if request.capacity.supported_models:
+                cap.supported_models = list(request.capacity.supported_models)
+        else:
+            cap = NodeCapacity()
         node = self._registry.register(
-            name=request.name,
-            url=request.url,
-            capacity=cap,
-            labels=dict(request.labels) if request.labels else {},
-            cell_ids=list(request.cell_ids) if request.cell_ids else [],
+            NodeInfo(
+                name=request.name,
+                url=request.url,
+                capacity=cap,
+                labels=dict(request.labels) if request.labels else {},
+                cell_ids=list(request.cell_ids) if request.cell_ids else [],
+            )
         )
         resp = cluster_pb2.RegisterNodeResponse()
         self._fill_node_proto(resp.node, node)
