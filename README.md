@@ -12,7 +12,7 @@
 
 <br>
 
-> *"To achieve great things, two things are needed: a plan and not quite enough time."* - Leonard Bernstein
+> *"To achieve great things, two things are needed: a plan and not quite enough time."* - [Sometimes](https://quoteinvestigator.com/2020/08/19/plan-time/) attributed to Leonard Bernstein
 
 ### deterministic multi-agent CLI orchestration
 
