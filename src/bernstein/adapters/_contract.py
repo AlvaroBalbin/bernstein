@@ -705,6 +705,16 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "kiro": AdapterStrategy(),
     "mistral": AdapterStrategy(),
     "mock": AdapterStrategy(),
+    # Muse Code is driven through its headless mode with --disable-approval
+    # on every spawn (approval prompts would hang an unattended worker); the
+    # vendor sandbox stays on. A --session-id resume flag exists upstream but
+    # no spawn path supplies one, so resume stays declared unsupported.
+    # Completion rides the shared GIT_DIFF path every text-signal coding
+    # adapter uses, including its documented fail-open auto-commit behavior
+    # (core/routes/task_crud.py); this row adds no completion logic of its
+    # own, and tightening that shared path is its own change, not an
+    # adapter addition.
+    "muse": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "ollama": AdapterStrategy(),
     "open_interpreter": AdapterStrategy(),
     "opencode": AdapterStrategy(),
