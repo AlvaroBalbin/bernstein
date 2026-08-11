@@ -3,7 +3,8 @@
 
 The MCP registry manifest (``server.json``), the plugin manifest
 (``.plugin/plugin.json``), and the Agent Plugins 1.0.0 root manifests
-(``plugin.json``, ``mcp.json``, #3540) are release artifacts: their version
+(``plugin.json``, ``mcp.json``, #3540) and the citation metadata
+(``CITATION.cff``, #3571) are release artifacts: their version
 fields must track the package version, and the release workflow - not hand
 edits - is their single source. This script is a deterministic projection: given the
 same ``pyproject.toml`` and manifest inputs it produces byte-identical
@@ -23,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import tomllib
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -34,7 +37,14 @@ PLUGIN_JSON = REPO / ".plugin" / "plugin.json"
 MCP_JSON = REPO / ".mcp.json"
 ROOT_PLUGIN_JSON = REPO / "plugin.json"
 ROOT_MCP_JSON = REPO / "mcp.json"
+CITATION_CFF = REPO / "CITATION.cff"
 SKILLS_DIR = REPO / "skills"
+
+#: Top-level ``CITATION.cff`` keys this script owns. Anchored to the start of a
+#: line so they match only at the document root: ``cff-version`` is a different
+#: key, and ``preferred-citation`` has its own indented block.
+_CFF_VERSION = re.compile(r"^version:.*$", re.MULTILINE)
+_CFF_DATE_RELEASED = re.compile(r"^date-released:.*$", re.MULTILINE)
 
 #: Canonical schema identifiers for the Agent Plugins 1.0.0 manifests.
 #: Validation runs against the copies vendored under
@@ -282,6 +292,107 @@ def render_root_mcp_json() -> str:
     return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
+def release_date() -> str:
+    """Return the date to stamp when the recorded version changes (UTC, ISO 8601).
+
+    ``SOURCE_DATE_EPOCH`` wins when it is set, so a reproducible-build
+    environment can pin what this returns. Otherwise the current UTC date, which
+    is the release date: this value is only ever read on a run that is changing
+    the recorded version, and that is the release commit.
+    """
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch:
+        return datetime.fromtimestamp(int(epoch), tz=UTC).date().isoformat()
+    return datetime.now(tz=UTC).date().isoformat()
+
+
+def render_citation_cff(version: str, current: str, *, today: str) -> str:
+    """Return ``CITATION.cff`` with ``version`` and ``date-released`` stamped.
+
+    Citation metadata drifted from the released package once already: the file
+    carried 3.10.0 while 3.14.159 was on PyPI (#3571). It is a release artifact
+    like the manifests above, so it is stamped by the release job rather than by
+    hand.
+
+    ``date-released`` is the one field here that ``pyproject.toml`` cannot
+    supply, and a projection that reads the clock unconditionally would report
+    drift every day after a release instead of on the release. So the date is
+    rewritten only when the recorded version actually changes, and preserved
+    verbatim otherwise. That keeps this a deterministic projection of
+    ``(pyproject version, current file)``: it is idempotent, and ``--check``
+    stays a drift test rather than a clock test.
+
+    The rewrite is textual on purpose. Round-tripping this file through a YAML
+    library would reflow the folded ``abstract`` block and reorder keys, turning
+    a two-line release stamp into a whole-file diff.
+    """
+    # Substituting the first match only stamps the first match. A file with two
+    # top-level ``version:`` keys would keep the stale one, and the projection
+    # would then agree with itself while the artifact stayed wrong -- so a
+    # document this rewrite cannot fully own is rejected rather than half-stamped.
+    for label, pattern in (("version", _CFF_VERSION), ("date-released", _CFF_DATE_RELEASED)):
+        occurrences = len(pattern.findall(current))
+        if occurrences != 1:
+            raise ManifestValidationError(
+                f"CITATION.cff: expected exactly one top-level '{label}:' key, found {occurrences}"
+            )
+        # A key that opens a block (``version:`` followed by list items) leaves an
+        # empty value on its own line. Stamping that line would produce a scalar
+        # and orphan the block underneath it -- a file that is no longer valid
+        # YAML but that this projection would then consider in sync.
+        if not _cff_value(pattern, current):
+            raise ManifestValidationError(
+                f"CITATION.cff: '{label}' is not a scalar; stamping it would leave its block behind"
+            )
+
+    recorded = _cff_value(_CFF_VERSION, current)
+    rendered = _CFF_VERSION.sub(f'version: "{version}"', current, count=1)
+    if recorded != version:
+        rendered = _CFF_DATE_RELEASED.sub(f'date-released: "{today}"', rendered, count=1)
+
+    # Validate what was produced, not what was intended. A non-scalar key
+    # (``version:`` followed by an indented block) leaves an empty value behind,
+    # and a hand-edited ``date-released`` can be a date only by appearance.
+    if _cff_value(_CFF_VERSION, rendered) != version:
+        raise ManifestValidationError(
+            f"CITATION.cff: 'version' did not stamp to {version!r}; the key is probably not a scalar"
+        )
+    stamped_date = _cff_value(_CFF_DATE_RELEASED, rendered)
+    try:
+        date.fromisoformat(stamped_date)
+    except ValueError as exc:
+        raise ManifestValidationError(
+            f"CITATION.cff: 'date-released' is not an ISO 8601 date: {stamped_date!r}"
+        ) from exc
+    return rendered
+
+
+def _cff_value(pattern: re.Pattern[str], text: str) -> str:
+    """Return the scalar value of the ``CITATION.cff`` key *pattern* matches."""
+    match = pattern.search(text)
+    if match is None:  # pragma: no cover - callers check first
+        return ""
+    return match.group(0).split(":", 1)[1].strip().strip("\"'")
+
+
+def _restore_replaced(replaced: dict[Path, str | None]) -> None:
+    """Put back the bytes a failed run replaced.
+
+    ``None`` means the file did not exist before this run, so restoring it means
+    removing it again rather than writing an empty file.
+    """
+    for path, previous in replaced.items():
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(previous, encoding="utf-8")
+        # Reporting must not be able to raise here: this runs while recovering
+        # from a failure, and an exception mid-restore leaves exactly the
+        # half-rewritten tree the restore exists to prevent.
+        label = path.relative_to(REPO) if path.is_relative_to(REPO) else path
+        print(f"restored {label}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -298,6 +409,11 @@ def main(argv: list[str] | None = None) -> int:
             PLUGIN_JSON: render_plugin_json(version),
             ROOT_PLUGIN_JSON: render_root_plugin_json(version),
             ROOT_MCP_JSON: render_root_mcp_json(),
+            CITATION_CFF: render_citation_cff(
+                version,
+                CITATION_CFF.read_text(encoding="utf-8") if CITATION_CFF.is_file() else "",
+                today=release_date(),
+            ),
         }
     except ManifestValidationError as exc:
         # Schema-invalid projections must fail generation and --check alike,
@@ -306,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     drift: list[str] = []
+    replaced: dict[Path, str | None] = {}
     for path, rendered in targets.items():
         current = path.read_text(encoding="utf-8") if path.is_file() else ""
         if current == rendered:
@@ -313,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.check:
             drift.append(str(path.relative_to(REPO)))
         else:
+            replaced[path] = current if path.is_file() else None
             path.write_text(rendered, encoding="utf-8")
             print(f"regenerated {path.relative_to(REPO)} (version {version})")
 
@@ -333,6 +451,13 @@ def main(argv: list[str] | None = None) -> int:
     # server.json (already regenerated above in write mode).
     provenance = _load_image_provenance().verify_signed_image_provenance(repo_root=REPO, version=version)
     if not provenance.ok:
+        # Provenance reads the regenerated server.json, so the write has to
+        # happen before the check can run. When the check then fails, a
+        # half-rewritten tree is worse than either clean outcome: the manifests
+        # would disagree about which version is being released, and the next
+        # run would find no drift and report itself in sync. Put back what this
+        # run replaced, so the failure leaves the tree where it found it.
+        _restore_replaced(replaced)
         print(f"signed-image provenance mismatch: {provenance.reason}", file=sys.stderr)
         return 1
 

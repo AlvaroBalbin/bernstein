@@ -23,6 +23,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[2]
 
 
@@ -102,6 +104,139 @@ def test_render_server_json_retags_oci_identifier_on_version_bump() -> None:
     assert packages["oci"]["identifier"] == "ghcr.io/sipyourdrink-ltd/bernstein:9.9.9"
     assert "version" not in packages["oci"]
     assert packages["pypi"]["version"] == "9.9.9"
+
+
+def _gen_module() -> object:
+    spec = importlib.util.spec_from_file_location(
+        "gen_distribution_manifests",
+        _REPO / "scripts" / "gen_distribution_manifests.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CITATION_SAMPLE = """cff-version: 1.2.0
+title: "Bernstein"
+abstract: >-
+  A folded block that a YAML round-trip would reflow.
+version: "3.10.0"
+date-released: "2026-07-26"
+preferred-citation:
+  type: software
+  year: 2026
+"""
+
+
+def test_citation_cff_is_stamped_from_the_package_version() -> None:
+    """A CITATION.cff behind the released version is drift, not a style nit.
+
+    It shipped 3.10.0 while 3.14.159 was on PyPI (#3571), so anyone citing the
+    project from the repository cited a version that was four releases old.
+    """
+    module = _gen_module()
+
+    stamped = module.render_citation_cff("3.14.159", _CITATION_SAMPLE, today="2026-08-10")
+
+    assert 'version: "3.14.159"' in stamped
+    assert 'date-released: "2026-08-10"' in stamped
+    assert "cff-version: 1.2.0" in stamped, "cff-version is a different key and must survive"
+    assert "abstract: >-" in stamped, "the folded block must not be reflowed by the stamp"
+    assert "  year: 2026" in stamped, "indented keys under preferred-citation are not top level"
+
+
+def test_citation_cff_stamp_preserves_the_date_when_the_version_is_current() -> None:
+    """Re-running on a matching version must not move date-released to today.
+
+    ``--check`` compares the rendered projection against the file on disk. If
+    the date tracked the clock, every day after a release would report drift and
+    the gate would be noise within a week.
+    """
+    module = _gen_module()
+
+    stamped = module.render_citation_cff("3.10.0", _CITATION_SAMPLE, today="2099-01-01")
+
+    assert stamped == _CITATION_SAMPLE, "a matching version must render byte-identically"
+
+
+def test_citation_cff_stamp_rejects_a_file_it_cannot_stamp() -> None:
+    module = _gen_module()
+
+    with pytest.raises(module.ManifestValidationError, match="date-released"):
+        module.render_citation_cff("3.14.159", 'cff-version: 1.2.0\nversion: "3.10.0"\n', today="2026-08-10")
+
+
+def test_citation_cff_stamp_rejects_a_document_it_cannot_fully_own() -> None:
+    """A duplicate top-level key would leave a stale value the stamp never touched.
+
+    ``re.sub(..., count=1)`` stamps the first match. With two ``version:`` keys
+    the second keeps the old value, the projection then agrees with itself, and
+    ``--check`` reports in sync while the artifact is wrong.
+    """
+    module = _gen_module()
+    doubled = _CITATION_SAMPLE + 'version: "3.10.0"\n'
+
+    with pytest.raises(module.ManifestValidationError, match="exactly one"):
+        module.render_citation_cff("3.14.159", doubled, today="2026-08-10")
+
+
+def test_citation_cff_stamp_rejects_a_non_scalar_version() -> None:
+    """``version:`` opening a block leaves nothing for the stamp to replace."""
+    module = _gen_module()
+    block = 'cff-version: 1.2.0\nversion:\n  - "3.10.0"\ndate-released: "2026-07-26"\n'
+
+    with pytest.raises(module.ManifestValidationError, match="not a scalar"):
+        module.render_citation_cff("3.14.159", block, today="2026-08-10")
+
+
+def test_citation_cff_stamp_rejects_a_date_that_only_looks_like_one() -> None:
+    """A preserved ``date-released`` is still validated, not trusted."""
+    module = _gen_module()
+    bad = 'cff-version: 1.2.0\nversion: "3.14.159"\ndate-released: "last Tuesday"\n'
+
+    with pytest.raises(module.ManifestValidationError, match="ISO 8601"):
+        module.render_citation_cff("3.14.159", bad, today="2026-08-10")
+
+
+def test_failed_provenance_puts_back_every_file_the_run_replaced(tmp_path: Path) -> None:
+    """A failed release gate must not leave the tree half-rewritten.
+
+    Provenance is verified against the regenerated ``server.json``, so the write
+    happens first. If the check then fails and the new bytes stay, the manifests
+    disagree about which version is being released -- and the next run finds no
+    drift and reports itself in sync.
+    """
+    module = _gen_module()
+
+    existing = tmp_path / "server.json"
+    existing.write_text('{"version": "3.10.0"}\n', encoding="utf-8")
+    created = tmp_path / "mcp.json"
+    created.write_text("new content\n", encoding="utf-8")
+
+    module._restore_replaced({existing: '{"version": "3.10.0"}\n', created: None})
+
+    assert existing.read_text(encoding="utf-8") == '{"version": "3.10.0"}\n'
+    assert not created.exists(), "a file this run created must be removed, not left empty"
+
+
+def test_provenance_failure_restores_before_it_returns() -> None:
+    """Pins the ordering the previous test cannot observe from outside."""
+    source = (_REPO / "scripts" / "gen_distribution_manifests.py").read_text(encoding="utf-8")
+
+    branch = source.partition("if not provenance.ok:")[2].partition("return 1")[0]
+    assert branch, "expected a provenance failure branch in main()"
+    assert "_restore_replaced(replaced)" in branch, (
+        "the provenance failure path must put back what the write phase replaced"
+    )
+
+
+def test_repository_citation_cff_matches_the_package_version() -> None:
+    """The checked-in file must already be stamped, or ``--check`` fails the release."""
+    module = _gen_module()
+
+    current = (_REPO / "CITATION.cff").read_text(encoding="utf-8")
+    assert f'version: "{module.pyproject_version()}"' in current
 
 
 def test_gen_script_check_mode_passes_and_is_idempotent(tmp_path: Path) -> None:
