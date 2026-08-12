@@ -25,6 +25,21 @@ landed since the newest one.
   resolve. An input the filesystem cannot represent, such as an embedded NUL,
   is reported as that error too rather than as a raw filesystem message.
   Refs #3080.
+- The two Slack webhook receivers (`POST /webhooks/slack/commands`,
+  `POST /webhooks/slack/events`) now require a signing secret, matching the
+  GitHub receiver. **Behaviour change:** with `SLACK_SIGNING_SECRET` unset
+  (and no `slack_signing_secret=` passed to `create_app`), both routes answer
+  `404` and create no task; previously they processed the request without
+  checking a signature. A configured deployment is unaffected - a correctly
+  signed delivery still returns `200` and a wrongly signed one still returns
+  `401`. Set the secret before pointing Slack at the endpoint, since the
+  `url_verification` handshake is a signed delivery like any other. See
+  [`docs/operations/slack-webhooks.md`](../operations/slack-webhooks.md).
+- `POST /webhooks/slack/events` validates the payload's shape before reading
+  it. The body must be a JSON object, and a present `event` member must be one
+  too; a list, string, number, boolean, or `null` in either position now
+  returns the documented `400` instead of a `500`. A payload with no `event`
+  member is still acknowledged with `200`.
 - Paths built from caller-supplied strings are now asserted to stay under
   their base directory. One shared helper,
   `bernstein.core.security.path_containment.contained_subpath`, joins a
