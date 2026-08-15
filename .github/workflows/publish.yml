@@ -459,15 +459,12 @@ jobs:
           # the index can lag the publish by a short window. Distinguish
           # "not yet visible" from "the RPM is broken" by waiting here, with
           # a bounded budget, before the smoke starts.
-          for _ in $(seq 1 30); do
-            if curl -fsS "https://pypi.org/pypi/bernstein/${VERSION}/json" >/dev/null 2>&1; then
-              echo "bernstein ${VERSION} is visible on PyPI"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::bernstein ${VERSION} never appeared on PyPI within the wait budget"
-          exit 1
+          #
+          # The wait polls the simple index rather than the JSON API: they are
+          # separate caches with separate propagation, and `pip` resolves
+          # against the index. Polling the JSON API let a green wait be
+          # followed by `No matching distribution found` (#3815).
+          python3 scripts/wait_for_pypi_visibility.py "${VERSION}"
       - name: Build the RPM, install it, run it offline
         env:
           SMOKE_IMAGE: ${{ matrix.image }}
