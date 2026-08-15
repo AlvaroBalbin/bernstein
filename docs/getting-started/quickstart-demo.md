@@ -1,5 +1,17 @@
 # Zero-config Flask TODO demo
 
+> **Preview.** This command does not yet complete a first run. `bernstein demo
+> --flask-todo` exits 0 while completing none of its tasks: all three seeded
+> tasks fail, the task server dies and restarts mid-run, and the summary
+> reports `Tasks completed 0 / 0` rather than `0 / 3`. Plain `bernstein demo`
+> has a separate first-run failure — a cold run can exceed the task-server
+> readiness budget and exit 1 (the error says `10.0s`; the actual budget is
+> 30s, see [#3905](https://github.com/sipyourdrink-ltd/bernstein/issues/3905))
+> — and aborts with a `UnicodeEncodeError`
+> on a Windows console using a legacy code page. Both are tracked from
+> [#3825](https://github.com/sipyourdrink-ltd/bernstein/issues/3825). Use
+> `bernstein init` to set up a real project in the meantime.
+
 `bernstein demo --flask-todo` runs a self-contained demo: it creates a temporary
 Flask TODO API project with intentional gaps, seeds three tasks against it,
 runs agents to complete them, and prints a summary — with no `bernstein.yaml`

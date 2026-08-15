@@ -61,16 +61,23 @@ bernstein init
 Expected output:
 
 ```
-✓ Initialized .sdd/ state directory
-✓ Created bernstein.yaml (edit to configure agents and budget)
-✓ Ready - run `bernstein -g "your goal"` to start
+Created .sdd/config.yaml
+Created bernstein.yaml
+Created templates/ (default roles & prompts)
+Created .gitignore (added .sdd/runtime/)
+
+Done. Next steps:
+  1. Edit bernstein.yaml: set a goal
+  2. Run bernstein to start the orchestra
 ```
 
-Two things happened:
+Four things happened:
 
 - **`.sdd/`** - your file-based state directory (backlog, logs, metrics, signals). This is
   the single source of truth. Inspect it, back it up, recover from it.
 - **`bernstein.yaml`** - your project config. The defaults are fine for a first run.
+- **`templates/`** - the default role prompts, copied in so you can edit them per project.
+- **`.gitignore`** - created or appended to, so `.sdd/runtime/` stays out of git.
 
 A minimal `bernstein.yaml` looks like:
 
@@ -164,6 +171,14 @@ bernstein demo --real     # use real agents (requires API key, ~$0.15)
 
 This is the fastest way to see the orchestrator move tasks through the lifecycle without
 configuring anything.
+
+> **Preview.** Two known first-run failures: a cold run can exceed the task-server
+> readiness budget and exit 1 (tracked from
+> [#3825](https://github.com/sipyourdrink-ltd/bernstein/issues/3825)), and on a
+> Windows console using a legacy code page the command aborts with a
+> `UnicodeEncodeError` on the first `✓` it prints
+> ([#3901](https://github.com/sipyourdrink-ltd/bernstein/issues/3901)). A second
+> run on a warm cache starts in under a second.
 
 ---
 

@@ -314,6 +314,18 @@ def _matrix_row_for(command: str) -> str:
             "> **Preview:** `bernstein listen`",
             "bernstein[voice]",
         ),
+        (
+            "`bernstein demo` |",
+            _REPO_ROOT / "docs" / "getting-started" / "first-run.md",
+            "UnicodeEncodeError",
+            "UnicodeEncodeError",
+        ),
+        (
+            "bernstein demo --flask-todo",
+            _REPO_ROOT / "docs" / "getting-started" / "quickstart-demo.md",
+            "Tasks completed 0 / 0",
+            "Tasks completed 0 / 0",
+        ),
     ],
 )
 def test_preview_fences_stay_visible(
