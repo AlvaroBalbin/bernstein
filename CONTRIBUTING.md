@@ -11,8 +11,16 @@ uv venv && uv pip install -e ".[dev]"
 
 ## Picking something to work on
 
-[ROADMAP.md](ROADMAP.md) says what is being built and when. Three
-labelled queues say where to start:
+[ROADMAP.md](ROADMAP.md) says what is being built and when.
+
+**Start here:** the volunteer workers program
+([#3863](https://github.com/sipyourdrink-ltd/bernstein/issues/3863)) is
+the current focus — donated AI compute working through open-source
+backlogs. It is greenfield, every sub-issue is sliced to be workable on
+its own with acceptance criteria written out, and design comments on
+the RFC count as contributions too.
+
+Beyond that, three labelled queues cover the rest:
 
 - [good first issue](https://github.com/sipyourdrink-ltd/bernstein/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
   — self-contained, acceptance criteria written out, no prior context needed.
