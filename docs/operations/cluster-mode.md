@@ -136,6 +136,16 @@ claims a task, and then cannot spawn the agent (`git worktree add` -> `fatal:
 not a git repository`), leaving the task stranded in `claimed` with no live
 agent (#3018).
 
+### Readiness signal
+
+A worker is ready when it prints `Registered as node <id>` — the central
+server has accepted its registration and it is eligible for claims. Until
+that line appears the worker is not yet part of the cluster; it retries
+registration on its poll interval, printing the connection error each time,
+rather than exiting. Automation should wait on that line rather than on a
+fixed delay, and `tests/integration/test_first_run_long_running_surfaces.py`
+holds the surface to it.
+
 ## JWT node authentication
 
 Cluster auth is JWT-based and is the recommended deployment mode in

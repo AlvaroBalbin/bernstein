@@ -227,7 +227,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | `bernstein run plan.yaml` | Full | 3 | Plan file execution |
 | `bernstein init` | Full | 2 | Workspace setup |
 | `bernstein stop` | Full | 3 | Graceful/force stop |
-| `bernstein live` | Full | 2 | TUI dashboard |
+| `bernstein live` | Full | 3 | TUI dashboard. Readiness is the first rendered frame, identified by the `AGENTS` and `TASKS` pane headers; `tests/integration/test_first_run_long_running_surfaces.py` starts it from an empty workspace, waits for that frame, and asserts a traceback-free exit on `SIGINT`. |
 | `bernstein dashboard` | Full | 3 | Web dashboard |
 | `bernstein status` | Full | 3 | Task summary |
 | `bernstein ps` | Full | 3 | Process list |
@@ -250,7 +250,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | `bernstein evolve ...` | Full | 2 | **Preview.** A clean directory exits before the evolution loop starts because `.sdd/` is missing; initialise a Bernstein workspace first. |
 | `bernstein ci fix` | Full | 3 | CI autofix |
 | `bernstein github setup` | Full | 3 | GitHub App setup |
-| [`bernstein worker`](../operations/cluster-mode.md) | Full | 2 | Join cluster as worker |
+| [`bernstein worker`](../operations/cluster-mode.md) | Full | 3 | Join cluster as worker. Readiness is the `Registered as node <id>` line; `tests/integration/test_first_run_long_running_surfaces.py` registers one against a live cluster-enabled server and separately asserts the non-git-workspace refusal names its reason. |
 | [`bernstein mcp`](../mcp/server.md) | Full | 3 | Run as MCP server |
 | [`bernstein chaos`](../operations/chaos-engineering.md) | Full | 3 | Fault injection |
 | [`bernstein audit`](../security/audit-log.md) | Full | 4 | Cryptographic audit chain. Seventeen subcommands: `seal`, `verify`, `verify-hmac`, `verify-gates`, `verify-multitenant`, `verify-suspension`, `show`, `query`, `diagnose`, `receipt`, `taint`, `capabilities`, `ack-tear`, `export`, `pack`, `slice`, `archive` |
