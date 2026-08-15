@@ -7,7 +7,10 @@ dist/
 build/
 
 # Python environments
-.venv/
+# No trailing slash: a worktree may carry ``.venv`` as a symlink to a shared
+# interpreter, and ``.venv/`` matches directories only, so the symlink would
+# otherwise be picked up by ``git add -A``.
+.venv
 
 # Environment variables
 .env
