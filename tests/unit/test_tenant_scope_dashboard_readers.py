@@ -1,6 +1,6 @@
 """HTTP-layer regression coverage for the dashboard and observability readers.
 
-``test_tenant_scope_http_isolation.py`` pins the property for the task
+``tests/unit/tenant_scope/`` pins the property for the task
 routes: the tenant a request is served under is derived from the
 authenticated principal, and it decides which rows the route reads.  The
 surfaces here reach the same task table from the operator-facing views - the
@@ -11,9 +11,9 @@ that scope for itself before it renders.
 
 The harness is the one next door, imported rather than rebuilt: the real
 ``create_app`` stack, one task per tenant, and every credential type the
-server accepts.  It lives in a file of its own because the two suites
-together exceed the per-file timeout in ``scripts/run_tests.py``, not
-because they test different machinery.
+server accepts.  It lives in a file of its own because the suites together
+exceed the per-file timeout in ``scripts/run_tests.py``, not because they
+test different machinery.
 """
 
 # pyright: reportPrivateUsage=false
@@ -36,7 +36,7 @@ from bernstein.core.server.server_models import TaskCreate
 # ``anyio_backend``, ``client``, ``fx``, ``jsonl_path`` and ``sdd_dir`` are
 # fixtures: pytest resolves them from this module's namespace, so importing
 # them here is what makes them available to the tests below.
-from tests.unit.test_tenant_scope_http_isolation import (
+from tests.unit.tenant_scope.conftest import (
     READ_CREDENTIALS,
     READ_CREDENTIALS_WITH_OWN_TENANT,
     TENANT_A,
