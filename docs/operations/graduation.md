@@ -27,8 +27,21 @@ orchestrator is allowed to do.
 | `GET /graduation/status` | All tracked sessions, current stage, and whether each can graduate. |
 | `GET /graduation/config/policies` | The active per-stage thresholds. |
 | `GET /graduation/{session_id}` | Stage, accumulated metrics, promotion log, and graduation readiness for one session. |
-| `POST /graduation/{session_id}/record-event` | Record a task success/failure against the session's current-stage metrics. |
-| `POST /graduation/{session_id}/promote` | Manually promote a session to the next stage. Returns 409 if already `autonomous`. |
+| `POST /graduation/{session_id}/record-event` | Record a task success/failure against the session's current-stage metrics. Body required: `task_id` (string) and `success` (bool) are mandatory; `duration_s`, `cost_usd`, and `initial_stage` default to `0.0`, `0.0`, and `"sandbox"`. |
+| `POST /graduation/{session_id}/promote` | Manually promote a session to the next stage. Returns 409 if already `autonomous`. Send a body (`{}` is enough); `reason` and `promoted_by` default to `"manual"` and `"operator"`. |
+
+Both `POST` endpoints validate their body, so calling them with no body — or
+with `success` but no `task_id` — returns `422`, not `400`. A session record
+is created on the first `record-event`; `GET /graduation/{session_id}` before
+that returns `404`.
+
+```bash
+# record three successful tasks, then promote out of sandbox
+curl -X POST "$BASE/graduation/$SESSION/record-event" \
+  -H "Content-Type: application/json" -d '{"task_id":"t1","success":true}'
+curl -X POST "$BASE/graduation/$SESSION/promote" \
+  -H "Content-Type: application/json" -d '{}'
+```
 
 ## Default policies
 

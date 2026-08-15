@@ -167,7 +167,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | [Webhook node](../operations/webhook-node.md) | Full | 3 | Outbound webhook node with recomputable inbound-event and node hashes (`core/trigger_sources/webhook_node.py`, `webhook verify`) |
 | Automation bridge | Full | 3 | Signed trigger receipts and chain-anchored status callbacks for external automations (`core/trigger_sources/automation_platforms.py`) |
 | Plugin hooks (pluggy) | Full | 3 | SDK docs in CONTRIBUTING.md |
-| Cluster/worker primitives | Full | 2 | `bernstein worker --server URL`, cluster routes documented |
+| Cluster/worker primitives | Full | 3 | `bernstein worker --server URL`, cluster routes documented. A worker registering against a live cluster-enabled server is covered by `tests/integration/test_first_run_long_running_surfaces.py`, which is the same code path the `bernstein worker` CLI row rests on. |
 | Multi-repo workspaces | Full | 3 | `workspace:` in bernstein.yaml, workspace CLI |
 | [MCP server mode](../mcp/server.md) | Full | 3 | `bernstein mcp`, MCP server in `mcp/server.py` |
 | [MCP tool registry](../integrations/mcp-server-injection.md) | Full | 3 | Auto-discovery and per-task config |
@@ -200,7 +200,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | Benchmark suite | Full | 4 | `bernstein eval run/compare/swe-bench/programbench` |
 | [Eval harness](../eval/golden-harness.md) | Full | 4 | `bernstein eval run/report/failures` |
 | SWE-Bench harness | Full | 4 | Verified eval in `benchmarks/swe_bench/run.py` |
-| [Graduation system](../operations/graduation.md) | Full | 2 | Agent promotion stages, routes in `routes/graduation.py` |
+| [Graduation system](../operations/graduation.md) | Full | 3 | Agent promotion stages, routes in `routes/graduation.py`. The documented REST surface is driven end to end against a real server by `tests/integration/test_first_run_graduation_surface.py`: policies, record-event, eligibility at the sandbox threshold, and promotion to `shadow`. |
 | [Semantic caching](../concepts/semantic-caching.md) | Full | 3 | `semantic_cache.py` prompt deduplication |
 | [Cascade router (intra-Claude tier escalation)](../architecture/model-routing.md) | Full | 3 | Tier escalation within a single provider (`core/routing/cascade_router.py`) |
 | [Cascade fallback manager (cross-adapter failover)](../architecture/model-routing.md) | Full | 3 | Cross-adapter provider failover (`core/routing/cascade.py`) |
@@ -209,7 +209,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | Output style customization | Brief | 3 | `.bernstein/output-styles/*.md`, selected by `output_style:` in `bernstein.yaml`, injected into the spawn prompt |
 | [Installation mismatch detection](../operations/doctor.md) | Full | 4 | Detects adapter/installation gaps |
 | [Worker badge identity](../operations/worker-process-identity.md) | Full | 3 | Process identification in `ps`/Activity Monitor |
-| [Keybinding system (TUI)](../operations/tui-keybindings.md) | Full | 2 | Configurable TUI keyboard shortcuts |
+| [Keybinding system (TUI)](../operations/tui-keybindings.md) | Full | 3 | Configurable TUI keyboard shortcuts. `tests/unit/test_first_run_keybinding_overrides.py` resolves the documented three layers and then presses the overridden key against a running Textual app, asserting the bound action fires and the pre-override key no longer does. |
 | Diff folding display | Brief | 3 | `bernstein diff --fold`; the TUI agent log also folds long diffs in its historical tail |
 | Word-level diff rendering | Brief | 3 | `bernstein diff --word-diff` highlights only the tokens that changed |
 | Contextual tips system | Brief | 3 | One cooldown-limited hint after an interactive command; `BERNSTEIN_NO_TIPS` opts out |
