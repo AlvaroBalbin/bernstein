@@ -43,12 +43,12 @@ existing artefacts in this repository.
 | Project website and discussion channel | `https://bernstein.run`, GitHub Issues, GitHub Discussions. |
 | Documented contribution process | `CONTRIBUTING.md`. |
 | OSI-approved license, license file present | `LICENSE` (Apache-2.0). |
-| Documented build instructions | `README.md` "install" section; `docs/getting-started/install.md`. |
+| Documented build instructions | `README.md` "install in 30 seconds" section; `docs/getting-started/install.md`. |
 | Cryptographically signed releases | Tag-based `.github/workflows/auto-release.yml` hands off to `publish.yml` (Sigstore build-provenance attestation) + signed PyPI uploads; `SECURITY.md`. |
 | Vulnerability reporting process | `SECURITY.md`. |
 | Documented secure development knowledge for at least one committer | `docs/operations/security-and-identity.md`; CONTRIBUTING checklist. |
 | Public bug tracker | GitHub Issues. |
-| Test suite invocable with a documented command | `pytest`; `README.md` "Build & test" block. |
+| Test suite invocable with a documented command | `pytest`; `AGENTS.md` "Build & test" block. |
 | Static analysis (SAST) in CI | CodeQL (`.github/workflows/codeql.yml`); Bandit and Semgrep jobs in `.github/workflows/ci.yml`; `.github/workflows/static-analysis-extended.yml`. |
 | Dynamic analysis / fuzzing | Hypothesis property tests in `tests/`; ClusterFuzzLite at `.clusterfuzzlite/` + `.github/workflows/cifuzz-pr.yml`. |
 | Dependency vulnerability scanning | Dependabot, OSV via Scorecard, `.github/workflows/dependency-review.yml`. |
@@ -71,10 +71,11 @@ ClusterFuzzLite gives OSSF Scorecard a signal it recognizes. Files:
 - `.clusterfuzzlite/requirements.txt` -- hash-pinned PyYAML for the
   build step.
 - `.clusterfuzzlite/fuzz_seed_parser.py` -- minimal entry point against
-  `yaml.safe_load`, the parser primitive `bernstein.core.config.seed_parser`
-  sits on top of (the OSS-Fuzz base-builder-python image ships Python
-  3.11; bernstein requires 3.12+, so the harness targets the underlying
-  YAML primitive instead of importing the full package).
+  `yaml.safe_load`, the parser primitive that
+  `bernstein.core.config.seed_parser` sits on top of. The OSS-Fuzz
+  base-builder-python image ships Python 3.11 and bernstein requires
+  3.12+, so the harness targets the underlying YAML primitive instead of
+  importing the full package.
 - `.github/workflows/cifuzz-pr.yml` -- per-PR run via
   `google/clusterfuzzlite/actions/run_fuzzers` (SHA-pinned). Job-level
   token permissions are kept read-only (Scorecard `TokenPermissionsID`);
