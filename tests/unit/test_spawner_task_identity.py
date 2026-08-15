@@ -22,6 +22,7 @@ from bernstein.adapters.plugin_sdk import (
     AdapterPluginInfo,
     PluginAdapter,
 )
+from tests.factories import make_task as make_task_factory
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,6 +35,7 @@ class _IdentityAwareAdapter(PluginAdapter):
         super().__init__()
         self.seen_task_id: str | None = None
         self.seen_task_title: str | None = None
+        self.seen_explicit_max_turns: int | None = None
 
     def plugin_info(self) -> AdapterPluginInfo:
         return AdapterPluginInfo(
@@ -63,9 +65,11 @@ class _IdentityAwareAdapter(PluginAdapter):
         multimodal_context: Any | None = None,
         task_id: str = "",
         task_title: str = "",
+        explicit_max_turns: int | None = None,
     ) -> SpawnResult:
         self.seen_task_id = task_id
         self.seen_task_title = task_title
+        self.seen_explicit_max_turns = explicit_max_turns
         return SpawnResult(pid=4242, log_path=workdir / "stub.log")
 
     def name(self) -> str:
@@ -161,3 +165,38 @@ class TestTaskIdentitySpawnPath:
         spawner.spawn_for_tasks([make_task()])
 
         assert adapter.spawn_calls == 1
+
+
+class TestExplicitMaxTurnsSpawnPath:
+    def test_explicit_max_turns_reaches_capable_adapter(self, tmp_path: Path, make_task) -> None:
+        """spawn() must receive the task's max_turns, not None.
+
+        Fails before the spawner forwards max_turns: the adapter records
+        None and every per-task turn budget degrades to the auto-computed
+        fallback.
+        """
+        adapter = _IdentityAwareAdapter()
+        spawner = _make_spawner(adapter, tmp_path)
+
+        spawner.spawn_for_tasks([make_task_factory(max_turns=7)])
+
+        assert adapter.seen_explicit_max_turns == 7
+
+    def test_explicit_max_turns_survives_caching_wrapper(self, tmp_path: Path, make_task) -> None:
+        """Production wraps every adapter in CachingAdapter; the turn cap
+        must be relayed through the wrapper to the inner adapter."""
+        adapter = _IdentityAwareAdapter()
+        spawner = _make_spawner(adapter, tmp_path, enable_caching=True)
+
+        spawner.spawn_for_tasks([make_task_factory(max_turns=7)])
+
+        assert adapter.seen_explicit_max_turns == 7
+
+    def test_explicit_max_turns_absent_stays_none(self, tmp_path: Path, make_task) -> None:
+        """Tasks without max_turns must not fabricate a cap."""
+        adapter = _IdentityAwareAdapter()
+        spawner = _make_spawner(adapter, tmp_path, enable_caching=True)
+
+        spawner.spawn_for_tasks([make_task_factory()])
+
+        assert adapter.seen_explicit_max_turns is None

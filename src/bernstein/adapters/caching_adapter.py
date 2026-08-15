@@ -112,6 +112,7 @@ class CachingAdapter(CLIAdapter):
         multimodal_context: Any | None = None,
         task_id: str = "",
         task_title: str = "",
+        explicit_max_turns: int | None = None,
     ) -> SpawnResult:
         """Spawn agent with caching: process prompt, check response cache, then delegate.
 
@@ -194,13 +195,30 @@ class CachingAdapter(CLIAdapter):
         # signature gate the spawner applies. Production always wraps the
         # adapter in this class, so without the relay the spawner would gate
         # on the wrapper's signature and the identity would never reach an
-        # inner adapter that wants it.
+        # inner adapter that wants it. explicit_max_turns hits the same wall:
+        # the spawner forwards it gated on *this* wrapper's signature, so a
+        # missing parameter here makes the operator's per-task turn cap
+        # silently vanish on every cached spawn while the fallback warning
+        # blames the inner adapter, which actually supports it.
         _identity_kwargs: dict[str, Any] = {}
         _inner_params = inspect.signature(self._inner.spawn).parameters
         if task_id and "task_id" in _inner_params:
             _identity_kwargs["task_id"] = task_id
         if task_title and "task_title" in _inner_params:
             _identity_kwargs["task_title"] = task_title
+        if explicit_max_turns is not None:
+            if "explicit_max_turns" in _inner_params:
+                _identity_kwargs["explicit_max_turns"] = explicit_max_turns
+            else:
+                # Inner adapter cannot carry the cap; drop it quietly at
+                # debug level. The spawner's warning can no longer fire here
+                # (its gate now sees the wrapper's accepting signature), so
+                # this is the only trace that the cap was not applied.
+                logger.debug(
+                    "CachingAdapter: inner adapter %s spawn() does not accept explicit_max_turns; dropping cap %d",
+                    self._inner.name(),
+                    explicit_max_turns,
+                )
         return self._inner.spawn(
             prompt=prompt,
             workdir=workdir,
