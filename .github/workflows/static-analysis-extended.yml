@@ -10,12 +10,29 @@ name: static-analysis (extended)
 # Scanning so the Security tab is the single source of truth.
 #
 # Lane split (issue #2764): the security-signal jobs (semgrep, trivy-fs,
-# trivy-iac) run on push / merge_group / schedule. The advisory
+# trivy-iac) run on push to main and on the schedule. The advisory
 # style-and-hygiene jobs (vulture, refurb, perflint) run on the weekly
-# schedule and workflow_dispatch only, so merge-queue runs stay lean and
-# the code-scanning alert feed stays a security signal. The refurb SARIF
+# schedule and workflow_dispatch only, so the code-scanning alert feed
+# stays a security signal. The refurb SARIF
 # upload is additionally filtered to error-level results so its style
 # findings no longer create alerts that bury real security findings.
+#
+# Not on merge_group, deliberately. Two independent reasons:
+#
+#   1. The queue's only required context is `CI gate`, so this lane never
+#      gated a queue merge - it competed with ci.yml for runners on every
+#      queue entry and every queue reshuffle, starving the one check the
+#      queue actually waits for.
+#   2. Code Scanning attaches alerts to the ref the run was for, and a
+#      merge-queue ref (`gh-readonly-queue/main/pr-<n>-<sha>`) is deleted
+#      the moment the entry merges or the queue re-shuffles. These
+#      scanners take minutes, so the SARIF upload regularly landed after
+#      the branch was gone and failed the job over a report that had
+#      nowhere to go, while the scan itself had passed.
+#
+# The alerts that matter are the ones on `main`; the push trigger above
+# uploads those against a ref that persists, at most minutes after the
+# queue would have produced the same finding.
 #
 # Ref: .sdd/backlog/open/2026-05-19-feat-ci-semgrep-trivy-pipaudit.md
 
@@ -35,11 +52,6 @@ on:
       - "examples/**/docker-compose*.yml"
       - ".github/workflows/static-analysis-extended.yml"
       - ".semgrep/**"
-  # Full-width static-analysis surface runs on the merge queue's ephemeral
-  # branch rather than on every PR push. merge_group has no paths filter, so
-  # the whole suite runs pre-merge; the weekly cron and push-to-main keep the
-  # main branch covered between merges.
-  merge_group: {}
   schedule:
     # Weekly safety net so dormant findings still surface even when
     # only docs change. Sunday 05:23 UTC keeps it clear of the
