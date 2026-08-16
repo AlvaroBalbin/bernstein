@@ -2116,12 +2116,25 @@ def replay_cmd(
     # named error rather than a silent no-op -- the whole point of this
     # fix is that an accepted flag must never be quietly ignored (#3976).
     if yes_i_want_to_publish and not (args and args[0] == "publish"):
-        console.print(
-            "[red]Error:[/red] --yes-i-want-to-publish only applies to "
-            "'bernstein replay publish'; refusing rather than silently "
-            "ignoring it here."
+        # Routed through _fail so this refusal is machine-readable too. It is
+        # a refusal the flag fix itself introduced (#3991), and it had no
+        # JSON form at all -- a caller passing --as-json got prose for the
+        # one error most likely to be produced by a script (#3996).
+        from bernstein.cli.commands.replay_cmd import ReplayError, _fail
+
+        raise SystemExit(
+            _fail(
+                as_json=as_json,
+                error=ReplayError["FLAG_NOT_APPLICABLE"],
+                prose=(
+                    "[red]Error:[/red] --yes-i-want-to-publish only applies to "
+                    "'bernstein replay publish'; refusing rather than silently "
+                    "ignoring it here."
+                ),
+                detail=("--yes-i-want-to-publish only applies to 'bernstein replay publish'"),
+                code=2,
+            )
         )
-        raise SystemExit(2)
 
     if args and args[0] == "diff":
         _replay_diff_dispatch(args[1:], sdd_dir=sdd_dir, as_json=as_json)
