@@ -134,6 +134,14 @@ rather than as its own attribution is exempted by hand there, with the reason.
   to declare effects consistent with its effective tool tier. `load_skill`
   now says explicitly that it returns file contents and executes nothing.
   Docs: `docs/mcp/server.md`. Refs #3645.
+- A crash-torn journal tail is now repairable: `bernstein replay repair
+  <RUN_ID>` truncates a trailing JSON fragment (the only discard that is a
+  torn write rather than corruption) so a suspended task's journal can be
+  resumed again. The repair restores byte-for-byte the prefix the surviving
+  chain head already commits to, refuses a discard in the middle of the file,
+  refuses (before writing) a truncation that would contradict an external
+  seal, and reports a no-op on a clean journal. `resume`'s refusal message now
+  names the repair path when the discard is a trailing fragment. Refs #3910.
 - The `deep-review` label did not start a review on a PR that was already open.
   `.github/workflows/bernstein-pr-review.yml` gates its `review` job on that
   label but did not list `labeled` as a trigger type, so adding the label to a

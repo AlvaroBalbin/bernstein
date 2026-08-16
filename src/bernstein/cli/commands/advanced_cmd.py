@@ -2101,6 +2101,7 @@ def replay_cmd(
       bernstein replay publish <AGENT_ID> [OUT] --yes-i-want-to-publish # redacted publish (#1799)
       bernstein replay verify <RECEIPT>           # offline verifier (#1799)
       bernstein replay diff-journal A B           # per-step divergence finder
+      bernstein replay repair <RUN_ID>            # truncate a crash-torn tail (#3910)
       bernstein replay debug <RUN>                # forensic single-chain walk (#2605)
       bernstein replay debug <LEFT> <RIGHT>       # two-run time-travel path diff
       bernstein replay debug <RUN> --fork-from N  # fork-and-reproduce at step N
@@ -2151,7 +2152,7 @@ def replay_cmd(
             limit=limit,
         )
         return
-    if args and args[0] in {"export", "publish", "verify", "diff-journal"}:
+    if args and args[0] in {"export", "publish", "verify", "diff-journal", "repair"}:
         _replay_journal_dispatch(
             args,
             sdd_dir=sdd_dir,
@@ -2342,6 +2343,18 @@ def _replay_journal_dispatch(
             sdd_dir=sdd_path,
             as_json=as_json,
         )
+        if rc != 0:
+            raise SystemExit(rc)
+        return
+
+    if verb == "repair":
+        if len(args) != 2:
+            console.print("[red]Usage:[/red] bernstein replay repair <RUN_ID>")
+            raise SystemExit(2)
+
+        from bernstein.cli.commands.replay_cmd import replay_repair
+
+        rc = replay_repair(run_id=args[1], sdd_dir=sdd_path, as_json=as_json)
         if rc != 0:
             raise SystemExit(rc)
         return

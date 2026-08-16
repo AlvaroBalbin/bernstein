@@ -851,11 +851,90 @@ def _debug_two_run(
     return 1
 
 
+def replay_repair(
+    run_id: str,
+    sdd_dir: Path,
+    *,
+    as_json: bool = False,
+) -> int:
+    """Repair a crash-torn journal tail so a suspended task can resume.
+
+    A crash partway through appending leaves a truncated final line with
+    no trailing newline; ``EventJournal.resume`` refuses such a journal
+    (its tolerant read discarded the physical line). This truncates the
+    torn fragment and nothing else, restoring exactly the bytes the
+    surviving chain head already commits to.
+
+    The repair is explicit-only by design: an orchestrator that silently
+    truncates journals to keep going would be a worse failure than a
+    stuck task, so this surface never runs without an explicit operator
+    action (issue #3910 open decision).
+
+    Args:
+        run_id: The run whose journal to repair.
+        sdd_dir: The project ``.sdd`` directory.
+        as_json: Emit a machine-readable JSON envelope instead of prose.
+
+    Returns:
+        Exit code: 0 repaired or no-op, 2 usage/refusal errors.
+    """
+    from bernstein.cli.helpers import console
+    from bernstein.core.replay.journal import (
+        JournalPathError,
+        repair_journal_tail,
+        run_journal_path,
+    )
+
+    try:
+        journal_path = run_journal_path(sdd_dir, run_id)
+    except JournalPathError as exc:
+        console.print(f"[red]Refusing to repair:[/red] {exc}")
+        return 2
+
+    if not journal_path.exists():
+        console.print(f"[red]No journal found:[/red] {journal_path}")
+        return 2
+
+    try:
+        result = repair_journal_tail(journal_path)
+    except ValueError as exc:
+        console.print(f"[red]Repair refused:[/red] {exc}")
+        return 2
+
+    if as_json:
+        console.print_json(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "journal": str(journal_path),
+                    "repaired": result.repaired,
+                    "removed_line_indices": list(result.removed_line_indices),
+                    "event_count": result.event_count,
+                    "head": result.head,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    if not result.repaired:
+        console.print("[green]Nothing to repair:[/green] journal tail is intact.")
+        console.print(f"[dim]head={result.head or '(empty)'} events={result.event_count}[/dim]")
+        return 0
+
+    removed = ", ".join(str(index) for index in result.removed_line_indices)
+    console.print(f"[green]Repaired:[/green] truncated torn tail (physical line(s): {removed}).")
+    console.print(f"[dim]head={result.head or '(empty)'} events={result.event_count}[/dim]")
+    console.print(f"[dim]journal now resumable:[/dim] bernstein replay {run_id}")
+    return 0
+
+
 __all__ = [
     "replay_agent_view",
     "replay_debug",
     "replay_diff_journals",
     "replay_export",
     "replay_publish",
+    "replay_repair",
     "replay_verify",
 ]
