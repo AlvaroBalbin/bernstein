@@ -475,6 +475,13 @@ jobs:
         # hash, translated a code block, or altered the verbatim header/footer.
         # Run `uv run bernstein readme-l10n sync` after editing README.md.
         run: uv run bernstein readme-l10n verify --workdir .
+      - name: Docs requirements pin drift check (#3995)
+        # Fails if docs/requirements.txt pins a version docs/requirements.in
+        # forbids, or drops a directly-declared requirement. Offline and
+        # deterministic: it reads the committed pins rather than recompiling,
+        # so it can block without ever going red because an index hiccuped.
+        # It does NOT catch a stale transitive pin - see the script docstring.
+        run: uv run python scripts/check_docs_requirements_pins.py
       - name: Distribution manifest drift check
         # Fails in under a minute if server.json / .plugin/plugin.json or the
         # Agent Plugins 1.0.0 root manifests (plugin.json / mcp.json) drift

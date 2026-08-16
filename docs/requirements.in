@@ -4,8 +4,14 @@
 # set. Regenerate after any change here with:
 #
 #   uv run --python 3.13 --with pip-tools -- \
-#     pip-compile --generate-hashes --output-file docs/requirements.txt \
-#     docs/requirements.in
+#     pip-compile --generate-hashes --strip-extras \
+#     --output-file docs/requirements.txt docs/requirements.in
+#
+# `--strip-extras` is not optional: it is what produced the committed file
+# (see its header), and omitting it leaves `mkdocs-material[imaging]` as an
+# extras-bearing entry that the pin gate then reports as a *missing*
+# dependency. Kept in step with `REGEN_COMMAND` in
+# `scripts/check_docs_requirements_pins.py` by a test in that script's suite.
 #
 # The `imaging` extra pulls cairosvg/pillow for the Material `social` card
 # plugin (mkdocs.yml); the matching native libs (libcairo, ...) are installed
