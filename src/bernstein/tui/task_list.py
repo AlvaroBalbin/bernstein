@@ -5,12 +5,15 @@ from __future__ import annotations
 import contextlib
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 from textual.widgets import DataTable, Static
 
 from bernstein.tui.accessibility import accessible_status_label, replace_unicode
+
+if TYPE_CHECKING:
+    from textual.widgets.data_table import RowKey
 
 # Sparkline characters for cost trend visualization
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
@@ -423,7 +426,7 @@ class TaskListWidget(DataTable[Text]):
         """
         # Build a lookup of incoming rows by task_id
         incoming: dict[str, TaskRow] = {r.task_id: r for r in rows}
-        existing_keys: set[str] = set(self.rows)
+        existing_keys: set[RowKey] = set(self.rows)
 
         # Remove rows no longer present
         for key in existing_keys - incoming.keys():
