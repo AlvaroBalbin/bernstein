@@ -301,6 +301,52 @@ def test_bootstrap_from_seed_exits_when_server_never_becomes_ready(
             bootstrap_from_seed(tmp_path / "bernstein.yaml", tmp_path)
 
 
+def test_bootstrap_from_seed_timeout_message_derives_from_ready_constant(
+    tmp_path: Path,
+    invariants_module: types.ModuleType,
+) -> None:
+    """The timeout error message must show the real wait budget, not a stale literal."""
+    from bernstein.core.server_launch import _SERVER_READY_TIMEOUT_S
+
+    from bernstein.cli.utils.errors import BernsteinError
+
+    printed: list[str] = []
+
+    def _capture_print(self: BernsteinError) -> None:
+        printed.append(self.what)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.dict(sys.modules, {"bernstein.evolution.invariants": invariants_module}))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap.console", MagicMock()))
+        stack.enter_context(
+            patch("bernstein.core.orchestration.bootstrap.concurrent.futures.ThreadPoolExecutor", _Executor)
+        )
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap.parse_seed", return_value=_seed()))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap.preflight_checks"))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap.ensure_sdd"))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap._clean_stale_runtime"))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap._discover_catalog"))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap._build_codebase_index"))
+        stack.enter_context(
+            patch("bernstein.core.orchestration.bootstrap._resolve_bind_host", return_value="127.0.0.1")
+        )
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap._resolve_auth_token", return_value=None))
+        stack.enter_context(
+            patch("bernstein.core.orchestration.bootstrap._resolve_server_url", return_value="http://server")
+        )
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap.supervised_server", return_value=111))
+        stack.enter_context(patch("bernstein.core.orchestration.bootstrap._wait_for_server", return_value=False))
+        stack.enter_context(patch.object(BernsteinError, "print", _capture_print))
+        with pytest.raises(SystemExit):
+            bootstrap_from_seed(tmp_path / "bernstein.yaml", tmp_path)
+
+    assert printed, "expected the timeout error to be printed"
+    assert str(_SERVER_READY_TIMEOUT_S) in printed[0], (
+        f"rendered message {printed[0]!r} must carry the real budget {_SERVER_READY_TIMEOUT_S}"
+    )
+    assert "10.0s" not in printed[0], f"rendered message {printed[0]!r} still has the stale literal"
+
+
 def test_bootstrap_from_goal_autowrites_seed_on_first_run(
     tmp_path: Path,
     invariants_module: types.ModuleType,
