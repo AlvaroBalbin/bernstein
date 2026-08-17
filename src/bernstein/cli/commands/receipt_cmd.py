@@ -65,7 +65,9 @@ def verify_cmd(
 
     Without ``--expected-manifest-digest`` the bundle's ``manifest_sha256`` is
     carried but never compared, and the command says so rather than letting a
-    bare ``✓`` read as a policy check.
+    bare ``✓`` read as a policy check. ``--prev-digest`` gets the same
+    treatment: continuity with a predecessor is reported as answered or not
+    asked, so a caller walking a sequence never has to infer it from ``ok``.
     """
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -111,6 +113,7 @@ def verify_cmd(
                     "digest": result.digest,
                     "pinned_key": pinned,
                     "manifest_digest_checked": result.manifest_digest_checked,
+                    "prev_digest_checked": result.prev_digest_checked,
                     "errors": [{"field": e.field, "message": e.message} for e in result.errors],
                 },
                 indent=2,
@@ -126,6 +129,10 @@ def verify_cmd(
                 click.echo(f"  manifest: checked against {expected_manifest_digest}")
             else:
                 click.echo("  manifest: carried, NOT checked")
+            if result.prev_digest_checked:
+                click.echo(f"  chain: checked against {prev_digest}")
+            else:
+                click.echo("  chain: carried, NOT checked")
             if not pinned:
                 click.echo("  note: provenance requires pinning the worker key with --pubkey", err=True)
             if not result.manifest_digest_checked:
@@ -157,7 +164,10 @@ def verify_cmd(
     "manifest_repo",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
-    help="Repository root whose .bernstein/volunteer.json supplies manifest_sha256, overriding the spec.",
+    help=(
+        "Repository root whose .bernstein/volunteer.json supplies manifest_sha256, overriding the spec. "
+        "With this flag the spec may omit manifest_sha256 entirely; without it the field is still required."
+    ),
 )
 def create_cmd(spec_path: Path, signing_key_path: Path, output_path: Path, manifest_repo: Path | None) -> None:
     """Build and sign a result receipt bundle from a JSON spec.
@@ -199,7 +209,12 @@ def create_cmd(spec_path: Path, signing_key_path: Path, output_path: Path, manif
     if manifest_repo is not None:
         try:
             manifest = load_manifest_from_repo(manifest_repo)
-        except (FileNotFoundError, VolunteerManifestError) as exc:
+        # OSError rather than FileNotFoundError: load_manifest_from_repo guards
+        # with is_file() and then reads, so a manifest that exists but cannot be
+        # read -- a permission bit, or a path that changes shape between the two
+        # calls -- raises a sibling of FileNotFoundError. Both are a manifest we
+        # could not load, and both deserve the refusal rather than a traceback.
+        except (OSError, VolunteerManifestError) as exc:
             _fail(f"could not load manifest from {manifest_repo}: {exc}")
             return
 
