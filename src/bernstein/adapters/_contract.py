@@ -700,8 +700,12 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "generic": AdapterStrategy(),
     # Goose speaks ACP natively; Bernstein consumes its lifecycle over the
     # JSON-RPC client transport and journals each event content-addressed,
-    # so its stdout lifecycle parser is bypassed.
-    "goose": AdapterStrategy(event_channel=EventChannel.ACP),
+    # so its stdout lifecycle parser is bypassed. Autonomy is GOOSE_MODE, an
+    # environment variable rather than a flag - there is no CLI switch for it.
+    "goose": AdapterStrategy(
+        dangerous_mode=DangerousModeStrategy.ENV_VAR,
+        event_channel=EventChannel.ACP,
+    ),
     "gptme": AdapterStrategy(),
     # Hermes is driven through its one-shot mode, which auto-bypasses approvals
     # rather than exposing a flag to do so - the CLI is unattended by

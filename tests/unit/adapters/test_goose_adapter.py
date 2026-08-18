@@ -8,6 +8,7 @@ agent starts, so a worker spawned that way dies without doing any work.
 
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ import pytest
 import yaml
 from bernstein.core.models import ModelConfig
 
-from bernstein.adapters.goose import GooseAdapter
+from bernstein.adapters.goose import GooseAdapter, GooseUsage, parse_run_events
 from bernstein.core.routing.llm import _CLI_FLAGS
 
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "contract" / "contracts" / "goose.yaml"
@@ -55,6 +56,28 @@ def _spawn_and_capture(tmp_path: Path, **overrides: Any) -> list[str]:
     return _inner_argv(list(mock_popen.call_args[0][0]))
 
 
+def _spawn_and_capture_env(tmp_path: Path, **overrides: Any) -> dict[str, str]:
+    """Spawn the adapter with Popen patched; return the env passed to Popen."""
+    kwargs: dict[str, Any] = {
+        "prompt": "Refactor the auth module",
+        "workdir": tmp_path,
+        "model_config": ModelConfig(model="sonnet", effort="normal"),
+        "session_id": "backend-goose-task-1",
+        "mcp_config": None,
+        "task_scope": "medium",
+        "budget_multiplier": 1.0,
+        "system_addendum": "",
+        "timeout_seconds": 0,
+    }
+    kwargs.update(overrides)
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_popen.return_value = mock_proc
+        GooseAdapter().spawn(**kwargs)
+    return mock_popen.call_args.kwargs["env"]
+
+
 def test_spawn_does_not_pass_singular_instruction_flag(tmp_path: Path) -> None:
     """``--instruction`` is rejected by goose's parser (exit 2); never emit it."""
     argv = _spawn_and_capture(tmp_path)
@@ -88,7 +111,7 @@ def test_contract_fixture_declares_only_flags_goose_accepts() -> None:
     assert "--instruction" not in spec["required_flags"]
 
 
-@pytest.mark.parametrize("flag", ["--text", "--model"])
+@pytest.mark.parametrize("flag", ["--text", "--model", "--output-format", "--no-session", "--max-turns"])
 def test_contract_fixture_covers_the_flags_the_adapter_spawns(flag: str, tmp_path: Path) -> None:
     """Every flag the adapter always passes is guarded by the drift contract."""
     spec = yaml.safe_load(CONTRACT_PATH.read_text(encoding="utf-8"))
@@ -103,7 +126,104 @@ def test_spawn_without_a_model_is_still_a_valid_invocation(tmp_path: Path) -> No
     a model-less spawn malformed.
     """
     argv = _spawn_and_capture(tmp_path, model_config=ModelConfig(model="", effort="normal"))
-    assert argv == ["goose", "run", "--text", "Refactor the auth module"]
+    assert argv == [
+        "goose",
+        "run",
+        "--text",
+        "Refactor the auth module",
+        "--output-format",
+        "stream-json",
+        "--no-session",
+        "--max-turns",
+        "37",
+    ]
+
+
+def test_spawn_uses_stream_json_output_format(tmp_path: Path) -> None:
+    """Structured lifecycle events replace prose parsing."""
+    argv = _spawn_and_capture(tmp_path)
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+
+
+def test_spawn_passes_no_session(tmp_path: Path) -> None:
+    """A task leaves no goose session behind."""
+    argv = _spawn_and_capture(tmp_path)
+    assert "--no-session" in argv
+
+
+def test_spawn_derives_max_turns_from_task_scope(tmp_path: Path) -> None:
+    """A larger task scope buys more turns before the CLI stops itself."""
+    argv = _spawn_and_capture(
+        tmp_path,
+        task_scope="large",
+        model_config=ModelConfig(model="sonnet", effort="high"),
+    )
+    assert argv[argv.index("--max-turns") + 1] == "100"
+
+
+def test_spawn_sets_goose_mode_to_auto_by_default(tmp_path: Path) -> None:
+    """The default spawn is fully autonomous, matching every other adapter."""
+    env = _spawn_and_capture_env(tmp_path)
+    assert env["GOOSE_MODE"] == "auto"
+
+
+def test_spawn_sets_goose_mode_to_approve_when_dangerous_mode_is_off(tmp_path: Path) -> None:
+    """Turning dangerous mode off restricts the agent to an approval gate."""
+    env = _spawn_and_capture_env(tmp_path, dangerous_mode=False)
+    assert env["GOOSE_MODE"] == "approve"
+
+
+def test_spawn_never_inherits_goose_mode_from_the_operator_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient ``GOOSE_MODE`` in the orchestrator's own shell must not leak through."""
+    monkeypatch.setenv("GOOSE_MODE", "chat")
+    env = _spawn_and_capture_env(tmp_path)
+    assert env["GOOSE_MODE"] == "auto"
+
+
+def test_parse_run_events_error_event_overrides_completed_status() -> None:
+    """An ``error`` event marks the run failed even though a later ``complete``
+    event still reports ``status: "completed"``.
+    """
+    stream = "\n".join(
+        [
+            json.dumps({"type": "error", "message": "tool call failed"}),
+            json.dumps({"type": "complete", "status": "completed"}),
+        ]
+    )
+    result = parse_run_events(stream)
+    assert result.succeeded is False
+
+
+def test_parse_run_events_extracts_usage_from_the_completion_envelope() -> None:
+    stream = json.dumps(
+        {
+            "type": "complete",
+            "status": "completed",
+            "usage": {"total": 1200, "input": 900, "output": 300, "cache_read": 50, "cache_write": 10},
+            "cost_usd": 0.42,
+        }
+    )
+    result = parse_run_events(stream)
+    assert result.succeeded is True
+    assert result.usage == GooseUsage(
+        total_tokens=1200,
+        input_tokens=900,
+        output_tokens=300,
+        cache_read_tokens=50,
+        cache_write_tokens=10,
+        cost_usd=0.42,
+    )
+
+
+def test_parse_run_events_reports_unknown_usage_without_an_envelope() -> None:
+    """No completion envelope means unknown usage, never a silent zero."""
+    stream = json.dumps({"type": "complete", "status": "completed"})
+    result = parse_run_events(stream)
+    assert result.succeeded is True
+    assert result.usage is None
 
 
 def test_internal_llm_provider_path_uses_the_run_subcommand() -> None:

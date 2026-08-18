@@ -12,6 +12,19 @@ worker agent.
 prompt text.  Passing one makes the argument parser abort with exit code 2
 before the agent starts, so the worker dies having done no work.
 
+Every spawn also carries ``--output-format stream-json`` (structured
+lifecycle events instead of prose), ``--no-session`` (a task leaves no
+session behind), and ``--max-turns`` derived from the task scope, so a
+looping agent stops on its own limit rather than the orchestrator's
+watchdog.  Autonomy is set through the ``GOOSE_MODE`` environment variable -
+Goose has no CLI flag for it - and is always assigned explicitly rather than
+inherited from the operator's environment.
+
+``goose run`` returns exit code 0 on every terminal path once the agent has
+started, and its terminal event's ``status`` field reads ``"completed"``
+even after an ``error`` event.  Neither is a success signal; only the
+absence of an ``error`` event is.  See :func:`parse_run_events`.
+
 Last verified against upstream Goose 1.45.0 on 2026-08-10.
 Install: ``brew install --cask block-goose`` (macOS), or
 ``curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash``.
@@ -19,9 +32,11 @@ Install: ``brew install --cask block-goose`` (macOS), or
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from bernstein.adapters.base import (
@@ -31,6 +46,7 @@ from bernstein.adapters.base import (
     build_worker_cmd,
 )
 from bernstein.adapters.env_isolation import build_filtered_env
+from bernstein.core.defaults import COST
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -47,6 +63,76 @@ _MODEL_MAP: dict[str, str] = {
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+
+# GOOSE_MODE values, most to least autonomous. Bernstein only ever drives the
+# two ends of the range: full autonomy for a normal spawn, and an approval
+# gate when dangerous mode is off.
+_GOOSE_MODE_DANGEROUS = "auto"
+_GOOSE_MODE_RESTRICTED = "approve"
+
+
+@dataclass(frozen=True)
+class GooseUsage:
+    """Token and cost accounting read from a goose completion envelope."""
+
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    cost_usd: float
+
+
+@dataclass(frozen=True)
+class GooseRunResult:
+    """Outcome of a goose ``--output-format stream-json`` run.
+
+    ``succeeded`` is driven by whether an ``error`` event appeared in the
+    stream, not by the terminal event's ``status`` field: goose assigns
+    ``status: "completed"`` on every terminal path, including one that
+    followed an error, so that field is never a verdict.
+    """
+
+    succeeded: bool
+    usage: GooseUsage | None  # None: no completion envelope was found
+
+
+def parse_run_events(stream_text: str) -> GooseRunResult:
+    """Parse a recorded goose ``--output-format stream-json`` event log.
+
+    Args:
+        stream_text: The full newline-delimited JSON event stream, as
+            written to the adapter's own log file.
+
+    Returns:
+        Whether the run succeeded and, when a completion envelope was
+        present, the token/cost usage it carried.
+    """
+    saw_error = False
+    usage: GooseUsage | None = None
+    for line in stream_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        event_type = event.get("type")
+        if event_type == "error":
+            saw_error = True
+        elif event_type == "complete":
+            envelope = event.get("usage")
+            if isinstance(envelope, dict):
+                usage = GooseUsage(
+                    total_tokens=int(envelope.get("total", 0)),
+                    input_tokens=int(envelope.get("input", 0)),
+                    output_tokens=int(envelope.get("output", 0)),
+                    cache_read_tokens=int(envelope.get("cache_read", 0)),
+                    cache_write_tokens=int(envelope.get("cache_write", 0)),
+                    cost_usd=float(event.get("cost_usd", 0.0)),
+                )
+    return GooseRunResult(succeeded=not saw_error, usage=usage)
 
 
 class GooseAdapter(CLIAdapter):
@@ -69,6 +155,7 @@ class GooseAdapter(CLIAdapter):
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
         multimodal_context: Any | None = None,
+        dangerous_mode: bool = True,
     ) -> SpawnResult:
         """Launch a Goose agent process.
 
@@ -79,6 +166,12 @@ class GooseAdapter(CLIAdapter):
             session_id: Unique identifier for this agent session.
             mcp_config: Optional MCP server configuration (ignored by Goose).
             timeout_seconds: Hard kill timeout in seconds.
+            task_scope: Task scope ("small", "medium", "large") used to
+                derive ``--max-turns``.
+            dangerous_mode: Whether the agent should skip its own approval
+                gate. Goose has no CLI flag for this; it is driven through
+                ``GOOSE_MODE``, set explicitly on every spawn rather than
+                inherited from the operator's environment.
 
         Returns:
             SpawnResult with the process PID and log file path.
@@ -92,8 +185,22 @@ class GooseAdapter(CLIAdapter):
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         model_id = _MODEL_MAP.get(model_config.model, model_config.model)
+        effort = getattr(model_config, "effort", "high")
+        base_turns = COST.effort_base_turns.get(effort, 50)
+        scope_multiplier = COST.scope_multipliers.get(task_scope, 1.5)
+        max_turns = max(1, int(base_turns * scope_multiplier))
 
-        cmd = ["goose", "run", "--text", prompt]
+        cmd = [
+            "goose",
+            "run",
+            "--text",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--no-session",
+            "--max-turns",
+            str(max_turns),
+        ]
         if model_id:
             cmd += ["--model", model_id]
 
@@ -113,8 +220,9 @@ class GooseAdapter(CLIAdapter):
         # vector (DB URLs, internal tokens, unrelated provider keys).
         # Goose accepts model creds via Anthropic/OpenAI/OpenRouter envs.
         env = build_filtered_env(
-            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY"],
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY", "GOOSE_MODE"],
         )
+        env["GOOSE_MODE"] = _GOOSE_MODE_DANGEROUS if dangerous_mode else _GOOSE_MODE_RESTRICTED
         with log_path.open("w") as log_file:
             try:
                 proc = subprocess.Popen(

@@ -1,7 +1,8 @@
 # Contract for the Goose CLI (adapter: goose).
 #
 # Always-passed surface from src/bernstein/adapters/goose.py:
-# ``goose run --text <prompt> [--model <id>]``.
+# ``goose run --text <prompt> --output-format stream-json --no-session
+# --max-turns <n> [--model <id>]``.
 #
 # ``--text`` is the inline-prompt flag; the file-based sibling is
 # ``--instructions <FILE>``.  A singular ``--instruction`` is NOT accepted and
@@ -30,6 +31,9 @@ auth:
 required_flags:
   - "--text"
   - "--model"
+  - "--output-format"
+  - "--no-session"
+  - "--max-turns"
 required_subcommands:
   - "run"
 # Goose sub-flags live under ``goose run --help``.

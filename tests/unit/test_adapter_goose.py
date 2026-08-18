@@ -29,7 +29,7 @@ pytestmark = pytest.mark.usefixtures("no_watchdog_threads")
 class TestGooseAdapterSpawn:
     """GooseAdapter.spawn() builds the expected ``goose run`` command."""
 
-    def _spawn(self, tmp_path: Path, *, model: str = "sonnet", pid: int = 900) -> list[str]:
+    def _spawn(self, tmp_path: Path, *, model: str = "sonnet", pid: int = 900, **overrides: object) -> list[str]:
         adapter = GooseAdapter()
         proc_mock = make_popen_mock(pid=pid)
         with patch("bernstein.adapters.goose.subprocess.Popen", return_value=proc_mock) as popen:
@@ -38,8 +38,24 @@ class TestGooseAdapterSpawn:
                 workdir=tmp_path,
                 model_config=ModelConfig(model=model, effort="high"),
                 session_id="goose-s1",
+                **overrides,
             )
         return inner_cmd(popen.call_args.args[0])
+
+    def _spawn_env(
+        self, tmp_path: Path, *, model: str = "sonnet", pid: int = 900, **overrides: object
+    ) -> dict[str, str]:
+        adapter = GooseAdapter()
+        proc_mock = make_popen_mock(pid=pid)
+        with patch("bernstein.adapters.goose.subprocess.Popen", return_value=proc_mock) as popen:
+            adapter.spawn(
+                prompt="fix the bug",
+                workdir=tmp_path,
+                model_config=ModelConfig(model=model, effort="high"),
+                session_id="goose-s1",
+                **overrides,
+            )
+        return popen.call_args.kwargs["env"]
 
     def test_uses_run_subcommand(self, tmp_path: Path) -> None:
         inner = self._spawn(tmp_path)
@@ -74,3 +90,24 @@ class TestGooseAdapterSpawn:
         inner = self._spawn(tmp_path, model="sonnet", pid=901)
         assert "--model" in inner
         assert inner[inner.index("--model") + 1] == "claude-sonnet-4-6"
+
+    def test_output_format_is_stream_json(self, tmp_path: Path) -> None:
+        inner = self._spawn(tmp_path)
+        assert inner[inner.index("--output-format") + 1] == "stream-json"
+
+    def test_no_session_flag_present(self, tmp_path: Path) -> None:
+        inner = self._spawn(tmp_path)
+        assert "--no-session" in inner
+
+    def test_max_turns_present(self, tmp_path: Path) -> None:
+        inner = self._spawn(tmp_path)
+        assert "--max-turns" in inner
+        assert inner[inner.index("--max-turns") + 1].isdigit()
+
+    def test_goose_mode_defaults_to_auto(self, tmp_path: Path) -> None:
+        env = self._spawn_env(tmp_path)
+        assert env["GOOSE_MODE"] == "auto"
+
+    def test_goose_mode_restricted_when_dangerous_mode_disabled(self, tmp_path: Path) -> None:
+        env = self._spawn_env(tmp_path, dangerous_mode=False)
+        assert env["GOOSE_MODE"] == "approve"

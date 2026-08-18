@@ -1155,8 +1155,9 @@ _PROFILE_LIST: tuple[AdapterCapabilityProfile, ...] = (
             prompt_flag="--text",
         ),
         mcp_client=True,
+        dangerous_mode=DangerousModeStrategy.ENV_VAR,
         event_channel=EventChannel.ACP,
-        notes="Goose (AAIF). Speaks ACP natively; model flag is optional and module-supplied.",
+        notes="Goose (AAIF). Speaks ACP natively; autonomy is GOOSE_MODE, an env var, not a flag.",
     ),
 )
 
