@@ -479,7 +479,7 @@ def list_contracts(contracts_dir: Path | None = None) -> list[str]:
 # Per-adapter strategy enums (issue #1627)
 # ---------------------------------------------------------------------------
 #
-# Every CLI agent expresses the same four concepts differently:
+# Every CLI agent expresses the same five concepts differently:
 #
 #   * resume        - ``--resume <id>`` for some, ``--session-id <id>`` for
 #                     others, a subcommand ``<cli> resume <id>`` for a third
@@ -493,6 +493,11 @@ def list_contracts(contracts_dir: Path | None = None) -> list[str]:
 #   * output mode    - what the adapter's run *produces* as its unit of work:
 #                     a git commit on the worktree branch, or a canonical
 #                     artifact recorded as a signed lineage entry.
+#   * session state  - whether the spawned process is the whole of the
+#                     agent's state (stateless: every spawn starts from
+#                     nothing Bernstein did not supply) or whether the agent
+#                     carries state in a backend of its own that Bernstein
+#                     neither supplies nor records (external).
 #
 # Capturing each axis as a typed per-adapter enum compresses the scattered
 # ``if adapter == "X"`` conditionals into one dispatch per axis and makes
@@ -567,13 +572,35 @@ class OutputMode(StrEnum):
     ARTIFACT = "artifact"
 
 
+class SessionStateStrategy(StrEnum):
+    """Whether an agent's state lives entirely in the spawned process.
+
+    Bernstein hashes every input a step consumed into the replay journal, so
+    two runs of the same plan reproduce byte-identically. That guarantee
+    assumes the spawned process *is* the whole of the agent's state. Some
+    adapters front a CLI that reaches a long-lived agent whose memory
+    persists across separate invocations by design (Letta Code is the
+    shipped example); the memory the agent read at decision time is an input
+    Bernstein never observes and cannot hash, so this axis lets an adapter
+    say so rather than have its run recorded as if it were reproducible.
+    """
+
+    #: Every spawn starts from nothing Bernstein did not supply itself.
+    STATELESS = "stateless"
+    #: The agent carries state in a backend of its own -- cross-task memory,
+    #: an agent id, memory blocks -- that Bernstein neither supplies nor
+    #: records. That state is a hidden input to the agent's decisions.
+    EXTERNAL = "external"
+
+
 class StrategyView(TypedDict):
-    """JSON-serialisable view of an :class:`AdapterStrategy`'s four axes."""
+    """JSON-serialisable view of an :class:`AdapterStrategy`'s five axes."""
 
     resume: str
     dangerous_mode: str
     event_channel: str
     output_mode: str
+    session_state: str
 
 
 class StrategyRow(StrategyView):
@@ -593,6 +620,10 @@ class AdapterStrategy:
     #: committing. An adapter driving a non-coding worker declares ``artifact``
     #: so the completion path reads its canonical output instead of HEAD.
     output_mode: OutputMode = OutputMode.GIT_DIFF
+    #: Defaults to ``stateless``: a fresh spawn starts from nothing. An
+    #: adapter fronting a CLI whose agent persists memory across separate
+    #: invocations in a backend of its own declares ``external``.
+    session_state: SessionStateStrategy = SessionStateStrategy.STATELESS
 
     def to_dict(self) -> StrategyView:
         """Return a JSON-serialisable view for operator-facing tables."""
@@ -601,6 +632,7 @@ class AdapterStrategy:
             "dangerous_mode": str(self.dangerous_mode),
             "event_channel": str(self.event_channel),
             "output_mode": str(self.output_mode),
+            "session_state": str(self.session_state),
         }
 
 
@@ -667,7 +699,16 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "charm": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "kimi": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "rovo": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
-    "letta_code": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
+    # Letta Code's defining feature is cross-task memory persisted via Letta
+    # Cloud: the agent maintains long-lived state across separate `letta -p`
+    # invocations in Letta's own backend, opaque to Bernstein (see the
+    # adapter docstring and docs.letta.com/letta-code/quickstart). The
+    # process is fresh; the agent is not, so this declares external session
+    # state rather than the stateless default.
+    "letta_code": AdapterStrategy(
+        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+        session_state=SessionStateStrategy.EXTERNAL,
+    ),
     # Codex drives unattended via its sandbox/full-auto flag.
     "codex": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     # Everyone else - no native resume, text-signal channel. Dangerous-mode

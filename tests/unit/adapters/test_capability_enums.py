@@ -1,10 +1,11 @@
 """Per-adapter strategy enum tests (issue #1627).
 
-Covers the three typed axes added to the adapter contract -- resume,
-dangerous-mode, and event-channel -- plus the conformance failure when a
-shipped adapter is missing its declaration, the registry-name resolution
-used by ``CLIAdapter.strategy``, and back-compat with the legacy two-state
-resume capability the ``bernstein resume`` env contract still depends on.
+Covers the typed axes added to the adapter contract -- resume,
+dangerous-mode, event-channel, output-mode, and session-state -- plus the
+conformance failure when a shipped adapter is missing its declaration, the
+registry-name resolution used by ``CLIAdapter.strategy``, and back-compat
+with the legacy two-state resume capability the ``bernstein resume`` env
+contract still depends on.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from bernstein.adapters._contract import (
     EventChannel,
     OutputMode,
     ResumeStrategy,
+    SessionStateStrategy,
     resume_capability,
     strategy_for,
     strategy_table,
@@ -88,6 +90,18 @@ def test_event_channel_parses_from_wire_value(raw: str, expected: EventChannel) 
     assert str(expected) == raw
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("stateless", SessionStateStrategy.STATELESS),
+        ("external", SessionStateStrategy.EXTERNAL),
+    ],
+)
+def test_session_state_strategy_parses_from_wire_value(raw: str, expected: SessionStateStrategy) -> None:
+    assert SessionStateStrategy(raw) is expected
+    assert str(expected) == raw
+
+
 def test_unknown_wire_value_raises() -> None:
     with pytest.raises(ValueError, match="not a valid"):
         ResumeStrategy("teleport")
@@ -103,6 +117,7 @@ def test_default_adapter_strategy_is_conservative() -> None:
     assert DEFAULT_ADAPTER_STRATEGY.dangerous_mode is DangerousModeStrategy.UNSUPPORTED
     assert DEFAULT_ADAPTER_STRATEGY.event_channel is EventChannel.TEXT_SIGNALS
     assert DEFAULT_ADAPTER_STRATEGY.output_mode is OutputMode.GIT_DIFF
+    assert DEFAULT_ADAPTER_STRATEGY.session_state is SessionStateStrategy.STATELESS
 
 
 def test_only_the_computer_use_family_declares_artifact_output_mode() -> None:
@@ -125,6 +140,25 @@ def test_output_mode_is_a_closed_two_value_axis() -> None:
     assert {m.value for m in OutputMode} == {"git-diff", "artifact"}
 
 
+def test_only_letta_code_declares_external_session_state() -> None:
+    """Letta Code's own docstring documents cross-task memory in its backend.
+
+    Every other shipped adapter keeps the ``stateless`` default: a fresh
+    spawn starts from nothing Bernstein did not supply. Growing this set is
+    a deliberate declaration, not a default drift (issue #3670).
+    """
+    external = {name for name, s in STRATEGY_MATRIX.items() if s.session_state is SessionStateStrategy.EXTERNAL}
+    assert external == {"letta_code"}
+
+
+def test_letta_code_declares_external_session_state() -> None:
+    assert strategy_for("letta_code").session_state is SessionStateStrategy.EXTERNAL
+
+
+def test_session_state_is_a_closed_two_value_axis() -> None:
+    assert {m.value for m in SessionStateStrategy} == {"stateless", "external"}
+
+
 def test_strategy_for_unknown_adapter_returns_default() -> None:
     assert strategy_for("this-adapter-does-not-exist") is DEFAULT_ADAPTER_STRATEGY
 
@@ -141,6 +175,7 @@ def test_adapter_strategy_to_dict_round_trips() -> None:
         "dangerous_mode": "env-var",
         "event_channel": "hooks",
         "output_mode": "artifact",
+        "session_state": "stateless",
     }
 
 
@@ -204,7 +239,14 @@ def test_strategy_table_rows_sorted_and_complete() -> None:
     rows = strategy_table(["gemini", "aider"])
     assert [r["adapter"] for r in rows] == ["aider", "gemini"]
     for row in rows:
-        assert set(row) == {"adapter", "resume", "dangerous_mode", "event_channel", "output_mode"}
+        assert set(row) == {
+            "adapter",
+            "resume",
+            "dangerous_mode",
+            "event_channel",
+            "output_mode",
+            "session_state",
+        }
 
 
 def test_strategy_conformance_table_covers_registry() -> None:

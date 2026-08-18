@@ -9,7 +9,7 @@ stream-json for some, a plain-text signal grammar for others, and upstream
 hooks for the rest.
 
 To keep the orchestrator free of `if adapter == "X"` branches, each adapter
-declares its strategy on three typed axes. The orchestrator dispatches off
+declares its strategy on five typed axes. The orchestrator dispatches off
 the enum, so adding a new adapter is a contract-completion exercise rather
 than a hunt-and-patch across the core.
 
@@ -18,7 +18,7 @@ The enums and the declaration matrix live in
 Strategy is **declared**, not probed: Bernstein never runs the CLI at start
 just to discover its capabilities.
 
-## The four axes
+## The five axes
 
 ### Resume strategy (`ResumeStrategy`)
 
@@ -73,6 +73,24 @@ Every shipped adapter declares `git-diff` (the default), so the coding path is
 unchanged. See [../operations/artifacts.md](../operations/artifacts.md) for the
 artifact-mode completion path.
 
+### Session state (`SessionStateStrategy`)
+
+Whether the spawned process is the whole of the agent's state, or the agent
+carries state in a backend of its own that Bernstein neither supplies nor
+records.
+
+| Value | Meaning |
+| --- | --- |
+| `stateless` | Every spawn starts from nothing Bernstein did not supply. |
+| `external` | The agent persists state (memory, an agent id) across separate invocations in its own backend, opaque to Bernstein. |
+
+Bernstein's determinism claim holds because every input a step consumed is
+hashed into the run journal. An `external`-state agent's memory at decision
+time is an input never hashed, so this axis names where that guarantee cannot
+be checked rather than let the run be recorded as if it were reproducible.
+Every shipped adapter declares `stateless` (the default) except `letta_code`,
+whose own docstring documents cross-task memory persisted in Letta's backend.
+
 ## Declaring a strategy
 
 The canonical declaration is a row in `STRATEGY_MATRIX`, keyed by registry
@@ -108,52 +126,52 @@ adapters at a glance.
 
 ## Shipped adapter declarations
 
-| Adapter | Resume | Dangerous mode | Event channel |
-| --- | --- | --- | --- |
-| `aichat` | unsupported | unsupported | text-signals |
-| `aider` | unsupported | unsupported | text-signals |
-| `amp` | unsupported | unsupported | text-signals |
-| `auggie` | unsupported | unsupported | text-signals |
-| `autohand` | unsupported | unsupported | text-signals |
-| `charm` | unsupported | cli-flag | text-signals |
-| `claude` | flag | cli-flag | stream-json |
-| `cline` | unsupported | cli-flag | text-signals |
-| `clm` | unsupported | unsupported | text-signals |
-| `codebuff` | unsupported | unsupported | text-signals |
-| `codex` | unsupported | cli-flag | text-signals |
-| `cody` | unsupported | unsupported | text-signals |
-| `composio` | unsupported | unsupported | hooks |
-| `continue` | unsupported | unsupported | text-signals |
-| `copilot` | unsupported | unsupported | text-signals |
-| `cursor` | unsupported | cli-flag | stream-json |
-| `devin_terminal` | unsupported | unsupported | poll-pty |
-| `droid` | unsupported | unsupported | text-signals |
-| `forge` | unsupported | unsupported | text-signals |
-| `gemini` | unsupported | cli-flag | stream-json |
-| `generic` | unsupported | unsupported | text-signals |
-| `goose` | unsupported | unsupported | text-signals |
-| `gptme` | unsupported | unsupported | text-signals |
-| `hermes` | unsupported | always-on | text-signals |
-| `iac` | unsupported | unsupported | text-signals |
-| `junie` | unsupported | unsupported | text-signals |
-| `kilo` | unsupported | unsupported | text-signals |
-| `kimi` | unsupported | cli-flag | text-signals |
-| `kiro` | unsupported | unsupported | text-signals |
-| `letta_code` | unsupported | cli-flag | text-signals |
-| `mistral` | unsupported | unsupported | text-signals |
-| `mock` | unsupported | unsupported | text-signals |
-| `muse` | unsupported | cli-flag | text-signals |
-| `ollama` | unsupported | unsupported | text-signals |
-| `open_interpreter` | unsupported | unsupported | text-signals |
-| `openai_agents` | flag | always-on | hooks |
-| `opencode` | unsupported | unsupported | text-signals |
-| `openhands` | unsupported | unsupported | text-signals |
-| `pi` | unsupported | unsupported | text-signals |
-| `plandex` | unsupported | unsupported | text-signals |
-| `q_dev` | unsupported | unsupported | text-signals |
-| `qwen` | unsupported | unsupported | text-signals |
-| `ralphex` | unsupported | unsupported | text-signals |
-| `rovo` | unsupported | cli-flag | text-signals |
+| Adapter | Resume | Dangerous mode | Event channel | Session state |
+| --- | --- | --- | --- | --- |
+| `aichat` | unsupported | unsupported | text-signals | stateless |
+| `aider` | unsupported | unsupported | text-signals | stateless |
+| `amp` | unsupported | unsupported | text-signals | stateless |
+| `auggie` | unsupported | unsupported | text-signals | stateless |
+| `autohand` | unsupported | unsupported | text-signals | stateless |
+| `charm` | unsupported | cli-flag | text-signals | stateless |
+| `claude` | flag | cli-flag | stream-json | stateless |
+| `cline` | unsupported | cli-flag | text-signals | stateless |
+| `clm` | unsupported | unsupported | text-signals | stateless |
+| `codebuff` | unsupported | unsupported | text-signals | stateless |
+| `codex` | unsupported | cli-flag | text-signals | stateless |
+| `cody` | unsupported | unsupported | text-signals | stateless |
+| `composio` | unsupported | unsupported | hooks | stateless |
+| `continue` | unsupported | unsupported | text-signals | stateless |
+| `copilot` | unsupported | unsupported | text-signals | stateless |
+| `cursor` | unsupported | cli-flag | stream-json | stateless |
+| `devin_terminal` | unsupported | unsupported | poll-pty | stateless |
+| `droid` | unsupported | unsupported | text-signals | stateless |
+| `forge` | unsupported | unsupported | text-signals | stateless |
+| `gemini` | unsupported | cli-flag | stream-json | stateless |
+| `generic` | unsupported | unsupported | text-signals | stateless |
+| `goose` | unsupported | unsupported | text-signals | stateless |
+| `gptme` | unsupported | unsupported | text-signals | stateless |
+| `hermes` | unsupported | always-on | text-signals | stateless |
+| `iac` | unsupported | unsupported | text-signals | stateless |
+| `junie` | unsupported | unsupported | text-signals | stateless |
+| `kilo` | unsupported | unsupported | text-signals | stateless |
+| `kimi` | unsupported | cli-flag | text-signals | stateless |
+| `kiro` | unsupported | unsupported | text-signals | stateless |
+| `letta_code` | unsupported | cli-flag | text-signals | external |
+| `mistral` | unsupported | unsupported | text-signals | stateless |
+| `mock` | unsupported | unsupported | text-signals | stateless |
+| `muse` | unsupported | cli-flag | text-signals | stateless |
+| `ollama` | unsupported | unsupported | text-signals | stateless |
+| `open_interpreter` | unsupported | unsupported | text-signals | stateless |
+| `openai_agents` | flag | always-on | hooks | stateless |
+| `opencode` | unsupported | unsupported | text-signals | stateless |
+| `openhands` | unsupported | unsupported | text-signals | stateless |
+| `pi` | unsupported | unsupported | text-signals | stateless |
+| `plandex` | unsupported | unsupported | text-signals | stateless |
+| `q_dev` | unsupported | unsupported | text-signals | stateless |
+| `qwen` | unsupported | unsupported | text-signals | stateless |
+| `ralphex` | unsupported | unsupported | text-signals | stateless |
+| `rovo` | unsupported | cli-flag | text-signals | stateless |
 
 The matrix is the source of truth; this table is regenerated from
 `strategy_conformance_table()`. Out of scope for this contract: runtime
