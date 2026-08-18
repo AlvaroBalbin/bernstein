@@ -203,6 +203,9 @@ dev = [
     # being skipped by importorskip. types-croniter below stubs the same
     # library for mypy.
     "croniter>=6.0",
+    # Rendering-fetcher tests (#3120) exercise the headless browser against
+    # a local fixture server. Runtime extra: bernstein[research-render].
+    "playwright>=1.62.0",
     # NOTE: semgrep is intentionally NOT a dev dep. Its transitive pins
     # (click<8.2, opentelemetry-sdk<1.38) collide with our production
     # floors (click>=8.3.3, opentelemetry-sdk>=1.41.1). Install via
@@ -324,6 +327,9 @@ otel = [
 #   pip install 'bernstein[observability]'
 observability = [
     "sentry-sdk[fastapi]>=2.20",
+]
+research-render = [
+    "playwright>=1.62.0",
 ]
 
 [project.scripts]
@@ -1028,6 +1034,7 @@ dev = [
     "lxml-stubs>=0.5.1",  # lxml, via signxml (SAML assertion parsing)
     "boto3-stubs>=1.43.56",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
     "botocore-stubs>=1.43.14",  # botocore, same publisher
+    "playwright>=1.62.0",
 ]
 
 [tool.uv]
