@@ -266,6 +266,7 @@ class TaskMailbox:
         self._lock = threading.Lock()
         self._messages: list[MailboxMessage] = []
         self._load_problems: list[str] = []
+        self._consumed_seqs: dict[str, int] = {}
         self._replay()
 
     # -- loading --------------------------------------------------------------
@@ -318,6 +319,22 @@ class TaskMailbox:
         """
         return [m for m in self._messages if m.task_id == task_id and m.seq > since_seq]
 
+    def get_consumed_cursor(self, task_id: str) -> int:
+        """Return the highest consumed sequence number for ``task_id``, or -1 if none."""
+        with self._lock:
+            return self._consumed_seqs.get(task_id, -1)
+
+    def record_consumption(self, task_id: str, seq: int) -> None:
+        """Record message consumption for ``task_id`` up to ``seq``.
+
+        Updating the consumption cursor drains the task's pending count so
+        that consumed messages no longer count against MAX_PENDING_PER_TASK.
+        """
+        with self._lock:
+            current = self._consumed_seqs.get(task_id, -1)
+            if seq > current:
+                self._consumed_seqs[task_id] = seq
+
     # -- writing ----------------------------------------------------------------
 
     def _entry_hash(self, binding: dict[str, Any]) -> str:
@@ -361,8 +378,10 @@ class TaskMailbox:
             raise MessageTooLarge(f"message body exceeds {MAX_MESSAGE_BODY_BYTES} bytes")
 
         with self._lock:
-            if sum(1 for m in self._messages if m.task_id == task_id) >= MAX_PENDING_PER_TASK:
-                raise MailboxFull(f"task {task_id!r} already holds {MAX_PENDING_PER_TASK} messages")
+            consumed_cursor = self._consumed_seqs.get(task_id, -1)
+            unconsumed_count = sum(1 for m in self._messages if m.task_id == task_id and m.seq > consumed_cursor)
+            if unconsumed_count >= MAX_PENDING_PER_TASK:
+                raise MailboxFull(f"task {task_id!r} already holds {MAX_PENDING_PER_TASK} unconsumed messages")
 
             stored_body, redaction_count = redact_text(body)
             body_hash = "sha256:" + hashlib.sha256(stored_body.encode("utf-8")).hexdigest()

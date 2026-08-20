@@ -120,7 +120,8 @@ def test_body_byte_cap_enforced(tmp_path: Path) -> None:
     assert mailbox.pending("t") == []
 
 
-def test_per_task_pending_cap_enforced(tmp_path: Path) -> None:
+def test_unconsumed_messages_still_hit_the_cap(tmp_path: Path) -> None:
+    """Issue #4152: 128 unconsumed messages hit MailboxFull on the 129th post."""
     mailbox = _mailbox(tmp_path)
     for i in range(MAX_PENDING_PER_TASK):
         mailbox.post(task_id="t", sender="a", kind="finding", body=f"m{i}")
@@ -129,6 +130,23 @@ def test_per_task_pending_cap_enforced(tmp_path: Path) -> None:
     # Other tasks are unaffected by one task's full mailbox.
     other = mailbox.post(task_id="u", sender="a", kind="finding", body="ok")
     assert other.task_id == "u"
+
+
+def test_consumed_messages_do_not_count_against_max_pending(tmp_path: Path) -> None:
+    """Issue #4152: Consumed messages no longer count against MAX_PENDING_PER_TASK."""
+    mailbox = _mailbox(tmp_path)
+    last_msg = None
+    for i in range(MAX_PENDING_PER_TASK):
+        last_msg = mailbox.post(task_id="t", sender="a", kind="finding", body=f"m{i}")
+
+    assert last_msg is not None
+    # Record consumption of all 128 messages
+    mailbox.record_consumption("t", last_msg.seq)
+
+    # 129th post must succeed because unconsumed count is 0
+    overflow = mailbox.post(task_id="t", sender="a", kind="finding", body="drained_ok")
+    assert overflow.task_id == "t"
+    assert overflow.seq == MAX_PENDING_PER_TASK
 
 
 # ---------------------------------------------------------------------------
