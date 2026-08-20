@@ -29,7 +29,8 @@ import uuid
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from bernstein.core.models import (
+from bernstein.core.persistence.store import BaseTaskStore, RoleSummary, StatusSummary
+from bernstein.core.tasks.models import (
     CompletionSignal,
     Complexity,
     RiskAssessment,
@@ -40,11 +41,11 @@ from bernstein.core.models import (
     TaskType,
     UpgradeProposalDetails,
 )
-from bernstein.core.persistence.store import BaseTaskStore, RoleSummary, StatusSummary
 
 if TYPE_CHECKING:
     from bernstein.core.persistence.store_redis import RedisCoordinator
-    from bernstein.core.server import ArchiveRecord, TaskCreate
+    from bernstein.core.server import TaskCreate
+    from bernstein.core.tasks.task_store import ArchiveRecord
 
 _ARCHIVE_INSERT_SQL = """
                 INSERT INTO task_archive
@@ -684,8 +685,27 @@ class PostgresTaskStore(BaseTaskStore):
         self,
         status: str | None = None,
         cell_id: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
     ) -> list[Task]:
-        """Return tasks filtered by status and/or cell_id."""
+        """Return tasks filtered by status and/or cell_id.
+
+        When *status* is ``"open"``, tasks whose dependencies are not all
+        ``DONE`` are excluded (they are not yet claimable).
+
+        Args:
+            status: If provided, only tasks with this status are returned.
+            cell_id: If provided, only tasks in this cell are returned.
+            limit: If provided, return at most this many tasks after filtering,
+                applied as SQL ``LIMIT``. If ``None`` (the default), no bound is
+                applied and every matching row is fetched — callers that need a
+                safety ceiling on large tables must pass an explicit limit.
+            offset: If provided, skip this many tasks after filtering, applied
+                as SQL ``OFFSET``. Combine with ``limit`` for paginated iteration.
+
+        Returns:
+            List of matching tasks.
+        """
         assert self._pool is not None
 
         conditions: list[str] = []
@@ -704,6 +724,16 @@ class PostgresTaskStore(BaseTaskStore):
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = f"SELECT * FROM tasks {where} ORDER BY priority, created_at"
+
+        if limit is not None:
+            sql += f" LIMIT ${param_n}"
+            params.append(limit)
+            param_n += 1
+
+        if offset is not None:
+            sql += f" OFFSET ${param_n}"
+            params.append(offset)
+            param_n += 1
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
@@ -756,7 +786,7 @@ class PostgresTaskStore(BaseTaskStore):
 
     async def read_archive(self, limit: int = 50) -> list[ArchiveRecord]:
         """Return the last *limit* archive records, oldest-first."""
-        from bernstein.core.server import ArchiveRecord as AR
+        from bernstein.core.tasks.task_store import ArchiveRecord as AR
 
         assert self._pool is not None
         async with self._pool.acquire() as conn:
