@@ -381,3 +381,28 @@ def test_read_archive_bound_keeps_passing(monkeypatch: pytest.MonkeyPatch) -> No
     assert len(records) == 5
     assert "LIMIT  $1" in conn.queries[0][0]
     assert conn.queries[0][1] == (5,)
+
+
+def test_postgres_count_tasks_executes_select_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store_postgres, "_ASYNCPG_AVAILABLE", True)
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.executed_query: str | None = None
+            self.executed_params: tuple[object, ...] = ()
+
+        async def fetchval(self, query: str, *args: object) -> object:
+            await asyncio.sleep(0)
+            self.executed_query = query
+            self.executed_params = args
+            return 42
+
+    store = store_postgres.PostgresTaskStore("postgresql://example")
+    conn = _Conn()
+    cast("Any", store)._pool = _FakePool(conn)
+
+    count = asyncio.run(store.count_tasks(status="done", cell_id="cell-1", tenant_id="tenant-a"))
+
+    assert count == 42
+    assert conn.executed_query == "SELECT COUNT(*) FROM tasks WHERE status = $1 AND cell_id = $2 AND tenant_id = $3"
+    assert conn.executed_params == ("done", "cell-1", "tenant-a")

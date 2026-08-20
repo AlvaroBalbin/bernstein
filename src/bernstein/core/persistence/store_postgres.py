@@ -745,6 +745,54 @@ class PostgresTaskStore(BaseTaskStore):
                 tasks = [t for t in tasks if all(dep in done_ids for dep in t.depends_on)]
         return tasks
 
+    async def count_tasks(
+        self,
+        status: str | None = None,
+        cell_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> int:
+        """Return task count, optionally filtered, issuing SELECT COUNT(*) FROM tasks."""
+        assert self._pool is not None
+
+        conditions: list[str] = []
+        params: list[Any] = []
+        param_n = 1
+
+        if status is not None:
+            conditions.append(f"status = ${param_n}")
+            params.append(status)
+            param_n += 1
+
+        if cell_id is not None:
+            conditions.append(f"cell_id = ${param_n}")
+            params.append(cell_id)
+            param_n += 1
+
+        if tenant_id is not None:
+            conditions.append(f"tenant_id = ${param_n}")
+            params.append(tenant_id)
+            param_n += 1
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        async with self._pool.acquire() as conn:
+            if status == "open":
+                sql = f"SELECT * FROM tasks {where} ORDER BY priority, created_at"
+                rows = await conn.fetch(sql, *params)
+                done_rows = await conn.fetch("SELECT id FROM tasks WHERE status='done'")
+                done_ids = {r["id"] for r in done_rows}
+                count = 0
+                for r in rows:
+                    raw_deps = r.get("depends_on")
+                    deps = json.loads(raw_deps) if isinstance(raw_deps, str) else (raw_deps or [])
+                    if all(dep in done_ids for dep in deps):
+                        count += 1
+                return count
+
+            sql = f"SELECT COUNT(*) FROM tasks {where}"
+            val = await conn.fetchval(sql, *params)
+            return int(val or 0)
+
     async def get_task(self, task_id: str) -> Task | None:
         """Return a single task by ID."""
         assert self._pool is not None

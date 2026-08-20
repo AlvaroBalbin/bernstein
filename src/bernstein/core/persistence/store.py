@@ -258,6 +258,21 @@ class BaseTaskStore(ABC):
         """
 
     @abstractmethod
+    async def count_tasks(
+        self,
+        status: str | None = None,
+        cell_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> int:
+        """Return task count, optionally filtered without constructing Task objects.
+
+        Args:
+            status: If provided, only count tasks with this status.
+            cell_id: If provided, only count tasks in this cell.
+            tenant_id: If provided, only count tasks for this tenant.
+        """
+
+    @abstractmethod
     async def get_task(self, task_id: str) -> Task | None:
         """Return a single task by ID, or ``None`` if not found."""
 

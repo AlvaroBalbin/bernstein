@@ -3131,6 +3131,50 @@ class TaskStore:
         end = start + max(0, limit)
         return filtered[start:end]
 
+    def count_tasks(
+        self,
+        status: str | None = None,
+        cell_id: str | None = None,
+        tenant_id: str | None = None,
+        claimed_by_session: str | None = None,
+        parent_session_id: str | None = None,
+    ) -> int:
+        """Return task count, optionally filtered, without materialising task lists.
+
+        Args:
+            status: If provided, only count tasks with this status.
+            cell_id: If provided, only count tasks in this cell.
+            tenant_id: If provided, only count tasks in this tenant.
+            claimed_by_session: If provided, only count tasks claimed by this session.
+            parent_session_id: If provided, only count tasks scoped to this parent session.
+
+        Returns:
+            Number of matching tasks.
+        """
+        if status is not None:
+            try:
+                ts = TaskStatus(status)
+                seed: list[Task] = list(self._by_status[ts].values())
+            except ValueError:
+                return 0
+        else:
+            seed = list(self._tasks.values())
+
+        normalized_tenant = normalize_tenant_id(tenant_id) if tenant_id is not None else None
+        check_open_deps = status == "open"
+
+        count = 0
+        for t in seed:
+            if (
+                (cell_id is None or t.cell_id == cell_id)
+                and (normalized_tenant is None or t.tenant_id == normalized_tenant)
+                and (claimed_by_session is None or t.claimed_by_session == claimed_by_session)
+                and (parent_session_id is None or t.parent_session_id == parent_session_id)
+                and (not check_open_deps or self._dependencies_satisfied(t))
+            ):
+                count += 1
+        return count
+
     def count_by_status(self, tenant_id: str | None = None) -> dict[str, int]:
         """Return task counts per status without materialising task lists.
 
