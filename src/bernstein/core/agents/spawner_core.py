@@ -1729,11 +1729,10 @@ class AgentSpawner:
     def _render_mailbox_section(self, tasks: list[Task]) -> str:
         """Render pending coordination-mailbox messages for *tasks* (#2357).
 
-        A deterministic projection of the task-server mailbox journal at
-        ``.sdd/runtime/mailbox.jsonl``: reading requires no key, the render
-        is a pure function of the journal, and every adapter type receives
-        the identical bytes. Best-effort - a missing or unreadable journal
-        renders nothing and never blocks a spawn.
+        Records consumption in the audit chain at render time. Render time is
+        the single chokepoint where all messages pass before reaching the
+        prompt, making it the best place to record that a message was
+        delivered to a worker's context.
         """
         try:
             from bernstein.core.communication.task_mailbox import (
@@ -1743,12 +1742,33 @@ class AgentSpawner:
 
             journal = self._workdir / ".sdd" / "runtime" / "mailbox.jsonl"
             if not journal.is_file():
+                logger.info("Mailbox journal missing at %s, rendering empty section.", journal)
                 return ""
             mailbox = TaskMailbox(journal)
             pending = [message for task in tasks for message in mailbox.pending(task.id)]
+
+            # Record consumption for each message rendered into the prompt (#3451).
+            if pending:
+                from bernstein.core.security.audit import AuditLog
+
+                audit = AuditLog(audit_dir=self._workdir / ".sdd" / "audit")
+                for msg in pending:
+                    audit.log(
+                        event_type="task.mailbox_consumed",
+                        actor="spawner",
+                        resource_type="task",
+                        resource_id=msg.task_id,
+                        details={
+                            "seq": msg.seq,
+                            "entry_hash": msg.entry_hash,
+                            "body_hash": msg.body_hash,
+                            "kind": msg.kind,
+                        },
+                    )
+
             return render_mailbox_section(pending)
         except Exception as exc:
-            logger.debug("Mailbox section rendering skipped: %s", type(exc).__name__)
+            logger.warning("Mailbox section rendering skipped: %s", type(exc).__name__)
             return ""
 
     # -- Worktree lifecycle (delegated to spawner_worktree) --------------------
