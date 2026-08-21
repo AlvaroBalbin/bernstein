@@ -47,6 +47,8 @@ from bernstein.core.security.path_containment import (
     contained_path,
 )
 
+from .base import VERSION_TOKEN_RE
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
@@ -131,10 +133,7 @@ LAST_GREEN_JSON_PATH = Path(__file__).parent / "last_green.json"
 LAST_GREEN_DOC_PATH = Path(__file__).parents[3] / "docs" / "adapters" / "conformance-canary.md"
 
 _ADAPTER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-#: First dotted-numeric token in a ``--version`` blob. Possessive quantifiers
-#: plus the digit-run anchor keep the scan linear on untrusted subprocess
-#: output; see the matching constant in ``adapters/security_floor.py``.
-_VERSION_TOKEN_RE = re.compile(r"(?<!\d)\d++(?:\.\d++){1,3}")
+
 _VERSION_TIMEOUT_SECONDS = 10
 
 
@@ -316,7 +315,7 @@ def probe_binary_version(binary_path: str) -> str | None:
         logger.debug("canary: version probe failed for %s (%s)", binary_path, type(exc).__name__)
         return None
     blob = f"{proc.stdout}\n{proc.stderr}"
-    match = _VERSION_TOKEN_RE.search(blob)
+    match = VERSION_TOKEN_RE.search(blob)
     return match.group(0) if match else None
 
 
