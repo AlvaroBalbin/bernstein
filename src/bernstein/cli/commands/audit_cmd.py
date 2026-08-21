@@ -275,13 +275,13 @@ def verify_cmd(merkle_only: bool, hmac_only: bool, receipt_path: str | None, pay
         console.print("[red]--payload requires --receipt.[/red]")
         raise SystemExit(2)
 
-    all_passed = True
+    failed_pillars: list[str] = []
 
-    if not merkle_only:
-        all_passed = _verify_hmac_chain() and all_passed
+    if not merkle_only and not _verify_hmac_chain():
+        failed_pillars.append("HMAC Chain")
 
-    if not hmac_only:
-        all_passed = _verify_merkle_tree() and all_passed
+    if not hmac_only and not _verify_merkle_tree():
+        failed_pillars.append("Merkle Tree")
 
     # Checkpoint extension is the pillar that makes a shrink sticky: a
     # truncation that leaves the HMAC chain intact still conflicts with the
@@ -289,69 +289,101 @@ def verify_cmd(merkle_only: bool, hmac_only: bool, receipt_path: str | None, pay
     # failing until an operator acknowledges it. Like the evidence-bundle
     # pillar, it runs regardless of --hmac-only / --merkle-only: a cron job
     # invoking either narrow form must still go red when history shrinks.
-    all_passed = _verify_checkpoints() and all_passed
+    if not _verify_checkpoints():
+        failed_pillars.append("Checkpoints")
 
     # Evidence bundles are a third integrity pillar: a tampered evidence file
     # must fail verify exactly like a tampered chain entry (#2362). This runs
     # regardless of --hmac-only / --merkle-only because it is orthogonal to
     # both the HMAC chain and the Merkle seal.
-    all_passed = _verify_evidence_bundles() and all_passed
+    if not _verify_evidence_bundles():
+        failed_pillars.append("Evidence Bundles")
 
     # Agent-posted artifacts are a further integrity pillar: a flipped byte in a
     # stored artifact blob or its journal row must fail verify with the artifact
     # named (#2553). Orthogonal to both the HMAC chain and the Merkle seal.
-    all_passed = _verify_run_artifacts() and all_passed
+    if not _verify_run_artifacts():
+        failed_pillars.append("Run Artifacts")
 
     # Tournament selection receipts are a further integrity pillar: a tampered
     # score or a hand-picked winner must fail verify exactly like a tampered
     # chain entry (#2353). Orthogonal to both HMAC chain and Merkle seal.
-    all_passed = _verify_tournament_receipts() and all_passed
+    if not _verify_tournament_receipts():
+        failed_pillars.append("Tournament Receipts")
 
     # Clearance gates are a further integrity pillar: a dependent task claimed
     # while its blocker gate was still open, or a tampered graph_delta_hash,
     # must fail verify (#2556). Orthogonal to both HMAC chain and Merkle seal.
-    all_passed = _verify_clearance_gates() and all_passed
+    if not _verify_clearance_gates():
+        failed_pillars.append("Clearance Gates")
 
     # Credential grant chains are a further integrity pillar: a mutated,
     # deleted, or reordered grant / exchange / revocation record must fail
     # verify exactly like a tampered chain entry (#2516). Orthogonal to both
     # HMAC chain and Merkle seal.
-    all_passed = _verify_grant_chains() and all_passed
+    if not _verify_grant_chains():
+        failed_pillars.append("Grant Chains")
 
     # Approval cards are a further integrity pillar: a resolved approval must be
     # re-checkable offline (#2511). A mutated stored envelope, a decision that
     # echoed an unknown card_hash, or a decision made after expiry must fail
     # verify. Orthogonal to both HMAC chain and Merkle seal.
-    all_passed = _verify_approval_cards() and all_passed
+    if not _verify_approval_cards():
+        failed_pillars.append("Approval Cards")
 
     # Fleet config-plane events are a further integrity pillar: a variable
     # write spliced out of its per-name lineage, or a connection resolution
     # naming a document that was never created, must fail verify beyond the
     # HMAC check (#2550). Orthogonal to both HMAC chain and Merkle seal.
-    all_passed = _verify_fleet_config() and all_passed
+    if not _verify_fleet_config():
+        failed_pillars.append("Fleet Config")
 
     # Named sandbox pools are a further integrity pillar: a tampered pool body
     # (its content-addressed hash no longer recomputes) or a forged placement
     # receipt (a widened effective manifest, a swapped backend) must fail verify
     # exactly like a tampered chain entry (#2547). Orthogonal to both the HMAC
     # chain and the Merkle seal.
-    all_passed = _verify_pool_receipts() and all_passed
+    if not _verify_pool_receipts():
+        failed_pillars.append("Pool Receipts")
 
     # Sovereign posture attestations + drift records are a further integrity
     # pillar: a mutated effective-policy document, a forged posture signature,
     # or a drift record whose hashes agree must fail verify exactly like a
     # tampered chain entry (#2518). Orthogonal to both HMAC chain and Merkle seal.
-    all_passed = _verify_sovereign_attestations() and all_passed
+    if not _verify_sovereign_attestations():
+        failed_pillars.append("Sovereign Attestations")
 
     # Benchmark-score trajectory receipts are a further integrity pillar: a
     # tampered published score, a contaminated suite, a fabricated scalar, or a
     # cherry-picked best-of-N candidate must fail verify with the offending task
     # named (#2925). Absent receipts are a silent no-op; any present-and-tampered
     # receipt hard-fails. Orthogonal to both HMAC chain and Merkle seal.
-    all_passed = _verify_trajectory_receipts() and all_passed
+    if not _verify_trajectory_receipts():
+        failed_pillars.append("Trajectory Receipts")
 
     console.print()
-    raise SystemExit(0 if all_passed else 1)
+    if not failed_pillars:
+        console.print(
+            Panel(
+                "[bold green]Audit Verification: PASSED[/bold green]\n"
+                "[dim]All audit log pillars passed verification.[/dim]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        console.print()
+        raise SystemExit(0)
+
+    failing_list = "\n".join(f"  [red]![/red] {p}" for p in failed_pillars)
+    console.print(
+        Panel(
+            f"[bold red]Audit Verification: FAILED[/bold red]\n\n[bold]Failing pillar(s):[/bold]\n{failing_list}",
+            border_style="red",
+            expand=False,
+        )
+    )
+    console.print()
+    raise SystemExit(1)
 
 
 def _verify_key(pillar: str) -> bytes | None:
