@@ -7,10 +7,13 @@ Concrete implementations:
 
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from bernstein.core.server import TaskCreate

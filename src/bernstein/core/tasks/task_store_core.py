@@ -45,7 +45,7 @@ from bernstein.core.tasks.unreachable import blocking_dependency, unreachable_ta
 from bernstein.core.tenanting import ensure_tenant_layout, normalize_tenant_id, try_normalize_tenant_id
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from bernstein.core.security.audit_chain import AuditChainStore
     from bernstein.core.tasks.contracts import ContractViolation, WorkerCompletion, WorkerRefusal
@@ -457,6 +457,7 @@ class TaskStore:
         archive_path: Path = DEFAULT_ARCHIVE_PATH,
         metrics_jsonl_path: Path | None = None,
     ) -> None:
+        self._task_listeners: list[Callable[[Task], None]] = []
         self._tasks: dict[str, Task] = {}
         self._agents: dict[str, AgentSession] = {}
         # Secondary indices for O(1) status/role lookups
@@ -513,6 +514,24 @@ class TaskStore:
                 ``None`` to detach.
         """
         self._audit_chain = chain
+
+    def add_task_listener(self, listener: Callable[[Task], None]) -> None:
+        """Register a callback invoked whenever a task's status or record is updated."""
+        if listener not in self._task_listeners:
+            self._task_listeners.append(listener)
+
+    def remove_task_listener(self, listener: Callable[[Task], None]) -> None:
+        """Unregister a task update callback."""
+        if listener in self._task_listeners:
+            self._task_listeners.remove(listener)
+
+    def _notify_task_updated(self, task: Task) -> None:
+        """Invoke registered task listeners with the updated task."""
+        for listener in list(self._task_listeners):
+            try:
+                listener(task)
+            except Exception:
+                logger.exception("Error in task listener for task %s", task.id)
 
     @staticmethod
     def _claim_snapshot(task: Task) -> ClaimSnapshot:
@@ -1220,6 +1239,7 @@ class TaskStore:
             blocking_task_id,
             blocker.status.value,
         )
+        self._notify_task_updated(task)
         return True
 
     async def _cascade_failed_dependency(self, *task_ids: str) -> None:
