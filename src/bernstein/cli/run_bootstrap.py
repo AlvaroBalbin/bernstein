@@ -230,27 +230,35 @@ def _load_dry_run_tasks(plan_file: Path | None) -> list[Any]:
     return [Task.from_dict(td) for td in tasks_data]
 
 
-def _confirm_run(*, goal: str | None, seed_file: str | None) -> bool:
+def _confirm_run(
+    *,
+    goal: str | None,
+    seed_file: str | None,
+    model_override: str | None = None,
+    cli_override: str | None = None,
+) -> bool:
     """Show confirmation prompt before execution. Returns True to proceed."""
     effective_goal = goal
     team: list[str] | None = None
 
-    if effective_goal is None:
-        _peek_path: Path | None = Path(seed_file) if seed_file is not None else find_seed_file()
-        if _peek_path is not None:
-            with suppress(Exception):
-                from bernstein.core.seed import parse_seed as _parse_seed
+    _peek_path: Path | None = Path(seed_file) if seed_file is not None else find_seed_file()
+    _seed = None
+    if _peek_path is not None:
+        with suppress(Exception):
+            from bernstein.core.seed import parse_seed as _parse_seed
 
-                _seed = _parse_seed(_peek_path)
+            _seed = _parse_seed(_peek_path)
+            if effective_goal is None:
                 effective_goal = _seed.goal
-                team = list(_seed.team) if _seed.team != "auto" else None
-                from bernstein.core.plan_approval import configure_plan_models
+            team = list(_seed.team) if _seed.team != "auto" else None
 
-                configure_plan_models(
-                    _seed.role_model_policy,
-                    default_model=_seed.model,
-                    default_cli=(_seed.cli if _seed.cli and _seed.cli != "auto" else None),
-                )
+    from bernstein.core.plan_approval import configure_plan_models
+
+    configure_plan_models(
+        _seed.role_model_policy if _seed else None,
+        default_model=model_override or (_seed.model if _seed else None),
+        default_cli=cli_override or (_seed.cli if _seed and _seed.cli != "auto" else None),
+    )
 
     if effective_goal:
         plan_obj, plan_tasks = _build_synthetic_plan(effective_goal, team)
@@ -2570,8 +2578,18 @@ def _run_impl(
     # --plan-only`` started a server, spawned an agent, created a worktree and
     # reached the merge path (gh-3255).
     if plan_only:
-        from bernstein.core.plan_approval import create_plan
+        from bernstein.core.plan_approval import configure_plan_models, create_plan
         from bernstein.core.plan_builder import PlanBuilder
+
+        # --plan-only previews the run without reading a seed here, so there
+        # is no role policy to apply; the explicit None keeps the required
+        # positional honest rather than letting the panel fall back to the
+        # complexity default for the model.
+        configure_plan_models(
+            None,
+            default_model=model,
+            default_cli=cli,
+        )
 
         rerun_hint: str | None = None
 
@@ -2685,7 +2703,7 @@ def _run_impl(
             raise SystemExit(1) from exc
 
     # Confirmation prompt before execution (skip with --auto-approve)
-    if not auto_approve and not _confirm_run(goal=goal, seed_file=seed_file):
+    if not auto_approve and not _confirm_run(goal=goal, seed_file=seed_file, model_override=model, cli_override=cli):
         return
 
     if goal is not None:
