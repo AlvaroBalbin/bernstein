@@ -576,6 +576,12 @@ Note what that means for containment. Bernstein gives each task its own worktree
 
 **Env vars:** `CLINE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`.
 
+**Self-hosted OpenAI-compatible endpoints:** set `OPENAI_API_KEY` and
+`OPENAI_BASE_URL`. Cline persists provider settings to disk rather than
+reading them from the environment on every run, so the adapter runs
+`cline auth -p openai-compatible -b <url>` once per spawn to point the CLI
+at the configured endpoint before starting the session.
+
 **Best for:** Cline users in VS Code who want the same agent behavior under Bernstein.
 
 ---
