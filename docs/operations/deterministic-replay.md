@@ -180,7 +180,8 @@ slice, and two of the three need the operator's key material or a live
 `.sdd/`. The **run receipt** (`core/replay/run_receipt.py`, issue #2924) binds
 them into one signed artefact: the file alone proves integrity, the file plus
 the operator's out-of-band public key proves provenance (see the trust-model
-note below):
+note below). For the normative field-by-field wire format and a
+stdlib-only reference verifier, see [run receipt format spec](../security/run-receipt-format.md).
 
 ```bash
 # Build: signs .sdd/runs/<run_id>/run-receipt.json

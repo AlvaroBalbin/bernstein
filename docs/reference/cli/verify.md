@@ -90,6 +90,8 @@ labelled accordingly:
 
 Full format description:
 [deterministic replay](../../operations/deterministic-replay.md#signed-run-receipt-one-file-offline-verification).
+Normative field-by-field spec plus a stdlib-only reference verifier:
+[run receipt format spec](../../security/run-receipt-format.md).
 
 ## Ladder receipts (`verify ladder RECEIPT_HASH`)
 
