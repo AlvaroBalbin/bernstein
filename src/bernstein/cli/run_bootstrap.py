@@ -1420,10 +1420,14 @@ def _poll_no_plan_after_spawn() -> dict[str, Any] | None:
     return status_payload
 
 
+#: Ceiling for the terminal-state wait when the caller names no other.
+_RUN_WAIT_DEFAULT_S = 3600.0
+
+
 def _wait_for_run_completion(
     *,
     poll_interval_s: float = 2.0,
-    timeout_s: float = 3600.0,
+    timeout_s: float = _RUN_WAIT_DEFAULT_S,
 ) -> dict[str, Any] | None:
     """Poll the server until the run reaches a terminal state.
 
@@ -2057,6 +2061,21 @@ def exec_restart() -> None:
     ),
 )
 @click.option(
+    "--wait",
+    is_flag=False,
+    flag_value=str(_RUN_WAIT_DEFAULT_S),
+    default=None,
+    type=float,
+    metavar="[SECONDS]",
+    help=(
+        "Block until the run reaches a terminal state and exit with its "
+        "outcome, keeping the progress output. Takes an optional ceiling in "
+        f"seconds (default {_RUN_WAIT_DEFAULT_S:.0f}); a fleet that allows a "
+        "run longer than that has to say so. Without it a non-interactive "
+        "run detaches once the first agent is up."
+    ),
+)
+@click.option(
     "--task",
     "-t",
     "task_filter",
@@ -2223,6 +2242,7 @@ def run(
     from_plan: Path | None = None,
     auto_approve: bool = False,
     quiet: bool = False,
+    wait: float | None = None,
     skip_gate: tuple[str, ...] = (),
     skip_gate_reason: str | None = None,
     audit: bool = False,
@@ -2276,6 +2296,7 @@ def run(
             from_plan=from_plan,
             auto_approve=auto_approve,
             quiet=quiet,
+            wait=wait,
             skip_gate=skip_gate,
             skip_gate_reason=skip_gate_reason,
             audit=audit,
@@ -2328,6 +2349,7 @@ def _run_impl(
     plan_only: bool,
     from_plan: Path | None,
     auto_approve: bool,
+    wait: float | None = None,
     quiet: bool,
     skip_gate: tuple[str, ...],
     skip_gate_reason: str | None,
@@ -2715,7 +2737,7 @@ def _run_impl(
                 )
                 persist_server_port(port, workdir)
 
-            _finalize_run_output(quiet=quiet)
+            _finalize_run_output(quiet=quiet, wait=wait)
             return
         except BernsteinFirstRunError:
             # Already carries a structured category and exit code; let the
@@ -2764,7 +2786,7 @@ def _run_impl(
 
             bootstrap_failed(exc).print()
             raise SystemExit(1) from exc
-        _finalize_run_output(quiet=quiet)
+        _finalize_run_output(quiet=quiet, wait=wait)
         return
 
     # Seed file mode
@@ -2809,7 +2831,7 @@ def _run_impl(
         bootstrap_failed(exc).print()
         raise SystemExit(1) from exc
 
-    _finalize_run_output(quiet=quiet)
+    _finalize_run_output(quiet=quiet, wait=wait)
 
     # Close the first-run timer (spec 2026-05-17).  Fail-closed.
     if _telemetry_first_run_timer is not None:
