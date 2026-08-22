@@ -50,8 +50,13 @@ BuildRequires:  %{python_pkg}
 # A C++ toolchain, because not every chroot has a prebuilt wheel for every
 # dependency. On the released Fedora and EPEL chroots the closure resolves to
 # manylinux wheels and nothing compiles; on a chroot whose interpreter is ahead
-# of the wheel publishers - rawhide is permanently in that state - pip falls
-# back to building a sdist and the build dies on a missing `g++`.
+# of the wheel publishers - rawhide is permanently in that state, and the
+# currently-branched Fedora is in it until it goes stable - pip falls back to
+# building a sdist. `g++` alone is not enough for that fallback to succeed:
+# cbor2 and grpcio still fail their source builds there, so those chroots stay
+# out of the project's supported set (docs/operations/release.md, "Chroots")
+# and out of the release gate (scripts/copr_build_watch.py,
+# NON_GATING_CHROOT_MARKERS) rather than being forced green.
 BuildRequires:  gcc-c++
 Requires:       %{python_pkg}
 

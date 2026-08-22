@@ -46,7 +46,13 @@ USER_AGENT = "bernstein-copr-build-watch"
 # costs more than it catches. Reading the aggregate state alone contradicts
 # that, so a `failed` aggregate is re-read per chroot and only the gating ones
 # decide the verdict.
-NON_GATING_CHROOT_MARKERS = ("rawhide",)
+#
+# fedora-45 is in the same boat for now: Copr enabled it when Fedora branched
+# it, but it has not gone stable and its interpreter is ahead of what the
+# dependency closure has wheels for, so it fails to build the same way
+# rawhide does (see packaging/rpm/bernstein.spec). Drop it from this tuple
+# once fedora-45 ships and joins docs/operations/release.md's chroot table.
+NON_GATING_CHROOT_MARKERS = ("rawhide", "fedora-45")
 
 SUCCESS_STATES = frozenset({"succeeded"})
 # `skipped` means Copr already had this exact build and did not rebuild it. It

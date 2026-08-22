@@ -121,6 +121,10 @@ RAWHIDE_FAILED = {
     "fedora-rawhide-x86_64": "failed",
     "fedora-rawhide-aarch64": "failed",
 }
+FEDORA_45_FAILED = {
+    "fedora-45-x86_64": "failed",
+    "fedora-45-aarch64": "failed",
+}
 
 
 def _chroots(states: dict[str, str]):
@@ -151,6 +155,28 @@ def test_failure_confined_to_rawhide_does_not_hold_the_release(
     assert "::error::" not in out
     assert "::notice::" in out
     assert "fedora-rawhide-x86_64" in out
+
+
+def test_failure_confined_to_fedora_45_and_rawhide_does_not_hold_the_release(
+    mod: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """fedora-45 hasn't gone stable yet and fails the same way rawhide does."""
+    clock = FakeClock()
+    code = mod.watch(
+        BUILD_ID,
+        fetch=_fetcher(["pending", "failed"]),
+        fetch_chroot_states=_chroots({**GATING_PUBLISHED, **FEDORA_45_FAILED, **RAWHIDE_FAILED}),
+        deadline_seconds=600,
+        poll_seconds=30,
+        time_fn=clock.time,
+        sleep_fn=clock.sleep,
+    )
+    assert code == 0
+
+    out = capsys.readouterr().out
+    assert "::error::" not in out
+    assert "::notice::" in out
+    assert "fedora-45-x86_64" in out
 
 
 def test_failure_on_a_released_chroot_still_fails_the_job(mod: ModuleType, capsys: pytest.CaptureFixture[str]) -> None:
