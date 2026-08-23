@@ -1,0 +1,27 @@
+# Contract for the Letta Code CLI (adapter: letta_code).
+#
+# Always-passed surface from src/bernstein/adapters/letta_code.py:
+# ``letta --permission-mode <mode> --new-agent -p <prompt>``.
+adapter: letta_code
+binary: letta
+install:
+  method: npm
+  spec: "@letta-ai/letta-code@latest"
+auth:
+  required_for_help: false
+  required_for_models: false
+  secret_env:
+    - "LETTA_API_KEY"
+required_flags:
+  - "--permission-mode"
+  - "--new-agent"
+  - "-p"
+required_subcommands: []
+# --new-agent forces a fresh agent on every spawn (Bernstein never resumes a
+# prior Letta session), so the derived id pins that new agent's own
+# conversation rather than reattaching to an existing one. See
+# docs/adapters/session_isolation.md.
+session_id_flag: "--conversation"
+expected_models:
+  command: []
+  required_present: []

@@ -698,9 +698,9 @@ Note what that means for containment. Bernstein gives each task its own worktree
 
 **Env vars:** `LETTA_API_KEY`, `LETTA_BASE_URL`, plus `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` for the underlying model.
 
-**Invocation:** `letta --yolo -p '<prompt>'`. The `-p` flag is the documented one-off prompt mode; `--yolo` bypasses most permission prompts.
+**Invocation:** `letta --permission-mode <mode> --new-agent --conversation <id> -p '<prompt>'`. The `-p` flag is the documented one-off prompt mode; `--permission-mode` is derived from the adapter's declared dangerous-mode strategy (`unrestricted`, equivalent to `--yolo`, when escalated). `--new-agent` and `--conversation <id>` (the latter a deterministic id derived from the Bernstein session id) bind each spawn to its own fresh agent and conversation.
 
-**Caveats:** Letta Code's signature feature is cross-task memory via Letta Cloud. **Bernstein wraps Letta as a leaf-node one-shot agent** - Bernstein does not coordinate Letta's memory across tasks. Cross-task memory still works in Letta's own backend; it's just opaque to Bernstein's accounting and routing.
+**Caveats:** Letta Code's signature feature is cross-task memory via Letta Cloud. Headless mode otherwise reuses the last agent from the working directory and its default conversation, so without the binding above a retry would inherit a prior attempt's memory - **Bernstein wraps Letta as a leaf-node one-shot agent** and pins a fresh agent/conversation per spawn instead. Bernstein does not otherwise coordinate Letta's memory across tasks; cross-task memory still works in Letta's own backend, it's just opaque to Bernstein's accounting and routing.
 
 **Best for:** Teams running Letta Cloud who want one-shot Letta sessions inside a larger Bernstein plan.
 
