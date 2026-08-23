@@ -316,6 +316,60 @@ class TestTaskStoreFailurePropagation:
         await store.abandon("A", "out_of_scope", "not doable")
         assert dependent.status is TaskStatus.BLOCKED_BY_ABANDON
 
+    async def test_a_successful_retry_revives_a_blocked_dependent(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        await _insert(store, "A", status=TaskStatus.IN_PROGRESS)
+        dependent = await _insert(store, "B", depends_on=["A"])
+        await store.fail("A", "boom")
+        assert dependent.status is TaskStatus.BLOCKED_BY_FAILED_DEP
+
+        # The retry is a new task id, as `retry_or_fail_task` creates it, and
+        # carries the lineage link the retry path stamps on every retry.
+        await _insert(store, "A2", status=TaskStatus.CLAIMED, metadata={"original_task_id": "A"})
+        await store.complete("A2", "fixed it")
+
+        assert dependent.status is TaskStatus.OPEN
+        assert dependent.depends_on == ["A2"]
+        assert "blocking_task_id" not in dependent.metadata
+        claimed = await store.claim_next("backend")
+        assert claimed is not None
+        assert claimed.id == "B"
+
+    async def test_a_successful_retry_revives_a_transitive_dependent_too(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        await _insert(store, "A", status=TaskStatus.IN_PROGRESS)
+        b = await _insert(store, "B", depends_on=["A"])
+        c = await _insert(store, "C", depends_on=["B"])
+        await store.fail("A", "boom")
+        assert b.status is TaskStatus.BLOCKED_BY_FAILED_DEP
+        assert c.status is TaskStatus.BLOCKED_BY_FAILED_DEP
+
+        await _insert(store, "A2", status=TaskStatus.CLAIMED, metadata={"original_task_id": "A"})
+        await store.complete("A2", "fixed it")
+
+        assert b.status is TaskStatus.OPEN
+        assert c.status is TaskStatus.OPEN
+        # C never named A directly, so its edge onto B is untouched.
+        assert c.depends_on == ["B"]
+
+    async def test_completing_an_unrelated_task_does_not_revive_a_blocked_dependent(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        await _insert(store, "A", status=TaskStatus.IN_PROGRESS)
+        dependent = await _insert(store, "B", depends_on=["A"])
+        await store.fail("A", "boom")
+        await _insert(store, "Z", status=TaskStatus.CLAIMED)
+        await store.complete("Z", "unrelated work")
+        assert dependent.status is TaskStatus.BLOCKED_BY_FAILED_DEP
+
+    async def test_a_dependency_that_fails_with_no_retry_stays_blocked(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        await _insert(store, "A", status=TaskStatus.IN_PROGRESS)
+        dependent = await _insert(store, "B", depends_on=["A"])
+        await store.fail("A", "boom")
+        assert dependent.status is TaskStatus.BLOCKED_BY_FAILED_DEP
+        assert await store.claim_next("backend") is None
+        assert dependent.status is TaskStatus.BLOCKED_BY_FAILED_DEP
+
     async def test_status_summary_reports_the_unreachable_set_with_causes(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         await _insert(store, "A", status=TaskStatus.IN_PROGRESS)

@@ -1196,6 +1196,100 @@ class TaskStore:
 
         return dfs(new_task.id)
 
+    @staticmethod
+    def _lineage_id(task: Task) -> str:
+        """Return *task*'s retry lineage id.
+
+        ``retry_or_fail_task`` stamps every retry's ``metadata["original_task_id"]``
+        with the id of the first attempt, so a task and every retry of it share
+        one lineage id even though each retry gets a fresh task id. A task that
+        was never retried is its own lineage.
+        """
+        original = task.metadata.get("original_task_id")
+        return original if isinstance(original, str) and original else task.id
+
+    async def _revive_task(self, task: Task, *, blocking_task_id: str, resolved_task_id: str) -> bool:
+        """Move *task* from ``BLOCKED_BY_FAILED_DEP`` back to ``OPEN``.
+
+        *resolved_task_id* is the id that now actually satisfies the edge
+        that stranded *task* - the succeeded retry itself when the strand is
+        resolved by lineage, or *blocking_task_id* unchanged when *task* was
+        stranded transitively by a dependent that just revived under its own,
+        unretried id. ``depends_on`` is rewritten accordingly so the normal
+        satisfaction check (``blocking_dependency`` / ``_dependencies_satisfied``)
+        sees a live edge instead of the permanently-failed original attempt.
+
+        The counterpart of :meth:`_mark_blocked_by_failed_dep`: journalled the
+        same way, with a release receipt minted for the (rare but possible)
+        case the task was still holding a claim when it was stranded.
+
+        Returns ``True`` when the task moved, ``False`` when it was already
+        past the point where revival applies.
+        """
+        reason = "blocking dependency retried and succeeded"
+        snapshot = self._claim_snapshot(task)
+        self._index_remove(task)
+        try:
+            transition_task(task, TaskStatus.OPEN, actor="task_store", reason=reason)
+        except IllegalTransitionError:
+            self._index_add(task)
+            return False
+        task.depends_on = [resolved_task_id if dep == blocking_task_id else dep for dep in task.depends_on]
+        task.result_summary = None
+        task.terminal_reason = None
+        task.metadata.pop("blocking_task_id", None)
+        task.claimed_at = None
+        task.claimed_by_session = None
+        task.version += 1
+        self._index_add(task)
+        await self._append_jsonl(self._task_to_record(task))
+        self._record_release_receipt(task, snapshot, release_path="blocked_dependency_revived", reason=reason)
+        logger.info("Task %s revived: %s", task.id, reason)
+        self._notify_task_updated(task)
+        return True
+
+    async def _revive_blocked_by_retry(self, succeeded_task_id: str) -> None:
+        """Reopen every task stranded by a dependency a successful retry supersedes.
+
+        ``metadata["blocking_task_id"]`` names the exact attempt that stranded
+        a dependent, and that attempt itself never leaves ``FAILED`` - the
+        retry that finally succeeds is a new task id (#4376). Revival is
+        therefore keyed on retry lineage rather than on the stranding id
+        directly: the attempt that stranded the dependent and the attempt that
+        just succeeded share a lineage id (see :meth:`_lineage_id`) whenever
+        they trace back to the same first attempt.
+
+        Propagation is transitive exactly like ``_cascade_failed_dependency``:
+        once a dependent reopens, whatever depends on IT is found on the next
+        ring, keyed this time on the revived task's own id rather than on
+        lineage.
+
+        Must be called with ``self._lock`` held.
+        """
+        succeeded = self._tasks.get(succeeded_task_id)
+        if succeeded is None:
+            return
+        lineage_id = self._lineage_id(succeeded)
+        frontier = {succeeded_task_id}
+        while frontier:
+            next_frontier: set[str] = set()
+            for candidate in sorted(self._tasks.values(), key=lambda t: t.id):
+                if candidate.status is not TaskStatus.BLOCKED_BY_FAILED_DEP:
+                    continue
+                blocking_id = candidate.metadata.get("blocking_task_id")
+                if not blocking_id:
+                    continue
+                if blocking_id in frontier:
+                    resolved_id = blocking_id
+                else:
+                    blocker = self._tasks.get(blocking_id)
+                    if blocker is None or self._lineage_id(blocker) != lineage_id:
+                        continue
+                    resolved_id = succeeded_task_id
+                if await self._revive_task(candidate, blocking_task_id=blocking_id, resolved_task_id=resolved_id):
+                    next_frontier.add(candidate.id)
+            frontier = next_frontier
+
     async def _mark_blocked_by_failed_dep(self, task: Task, blocking_task_id: str) -> bool:
         """Move *task* to ``BLOCKED_BY_FAILED_DEP``, naming what stranded it.
 
@@ -2187,6 +2281,7 @@ class TaskStore:
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
             await self._complete_parent_if_ready(task.parent_task_id)
+            await self._revive_blocked_by_retry(task_id)
         if completion is not None:
             self._audit_contract_outcome(task_id, outcome="valid")
         return task
