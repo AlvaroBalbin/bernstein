@@ -24,3 +24,11 @@ parses instead of being rejected as malformed (#4182).
 filtered the same session with a different expression, so a reaped agent could
 read as active on one surface and not on another. A single `_agent_is_alive`
 predicate now owns the call on every surface (#4360).
+
+## Working notes stopped riding along in commits
+
+Three PR-body drafts reached `main` under `scratch/` in one week, each
+carried in by a change that had nothing to do with them. The directory is
+ignored now, the three files are gone, and a test fails if either the
+ignore rule or the untracked state regresses — an ignore rule alone does
+not untrack a file already in the index.
