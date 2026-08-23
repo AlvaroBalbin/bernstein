@@ -32,3 +32,13 @@ carried in by a change that had nothing to do with them. The directory is
 ignored now, the three files are gone, and a test fails if either the
 ignore rule or the untracked state regresses — an ignore rule alone does
 not untrack a file already in the index.
+
+## Spawn-time prompt budget
+
+An assembled agent prompt is now measured before the adapter is invoked, and a
+prompt consuming more than a configurable fraction of the model's context
+window logs a warning naming the sections responsible. The measurement runs on
+the spawner's own prompt builder, so it reports on the prompt a run actually
+sends. Thresholds: `TOKEN.spawn_prompt_budget_pct` (default 25%) with
+`TOKEN.spawn_prompt_budget_abs` (32,768 tokens) as the fallback when the
+model's context window is unknown (#4377).
