@@ -66,8 +66,12 @@ _PATTERN_RULES: Final[tuple[_PatternRule, ...]] = (
         "session_cap",
     ),
     _PatternRule("spending limit", HTTP429Classification.STANDING, "spend_cap"),
+    _PatternRule("spend limit", HTTP429Classification.STANDING, "spend_cap"),
     _PatternRule("daily limit", HTTP429Classification.STANDING, "spend_cap"),
     _PatternRule("budget exceeded", HTTP429Classification.STANDING, "spend_cap"),
+    _PatternRule("insufficient_quota", HTTP429Classification.STANDING, "quota_exceeded"),
+    _PatternRule("quota exceeded", HTTP429Classification.STANDING, "quota_exceeded"),
+    _PatternRule("credit balance", HTTP429Classification.STANDING, "credit_cap"),
 )
 
 

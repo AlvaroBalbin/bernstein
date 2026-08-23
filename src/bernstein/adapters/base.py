@@ -81,6 +81,10 @@ class StandingCapError(SpawnError):
     the run, so it must not consume the retry budget or trigger backoff.
     """
 
+    def __init__(self, message: str, reason_code: str = "standing_cap_exceeded") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
 
 # ---------------------------------------------------------------------------
 # Rate-limit meter (per-adapter observability surface)
