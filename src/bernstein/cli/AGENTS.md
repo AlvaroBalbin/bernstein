@@ -13,6 +13,7 @@ group and registers every subcommand; implementations live in
 | `commands/` | Command and group implementations |
 | `helpers.py` | Shared console and utility helpers |
 | `run_cmd.py` | `bernstein run` entry; bootstrap/confirm split into siblings |
+| `commands/identity_attest_cmd.py` | `bernstein identity attest` run attestation CLI commands |
 
 ## Invariants
 
@@ -33,4 +34,4 @@ Single files only, e.g.
 `uv run pytest tests/unit/test_agents_md_cmd.py -x -q`; most commands
 have a matching `test_<name>_cmd.py` under `tests/unit/`.
 
-<!-- Reviewed 2026-08-18 against this subtree; the notes above still hold. -->
+<!-- Reviewed 2026-08-24 against this subtree; the notes above still hold. -->

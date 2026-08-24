@@ -37,4 +37,4 @@ uv run python scripts/run_tests.py tests/unit/test_foo.py[::test_name]  # one fi
 - Live adapter conformance tests are opt-in via the `--live` flag
   registered in `conftest.py`.
 
-<!-- Reviewed 2026-08-18 against this subtree; the notes above still hold. -->
+<!-- Reviewed 2026-08-24 against this subtree; the notes above still hold. -->

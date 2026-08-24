@@ -13,6 +13,8 @@ invocation and streams results back; flat layout, one module per tool.
 | `capability_profile.py` | Declarative adapter capability profiles and profile factory |
 | `skills_injector.py` | Copies sanitized skill markdown into the worktree at dispatch |
 | `canary.py` | Nightly conformance canary matrix over adapter contracts |
+| `http_429_classifier.py` | Classifies HTTP 429 errors into standing quotas vs. transient rate limits |
+| `onboarding.py` | Interactive probe and capability discovery for newly installed agent CLIs |
 | `mock.py` | Mock agent for zero-API-key demos; produces the same completion evidence real agents do (`Modified:` log lines plus a per-fix commit scoped to the mutated file) |
 
 ## Invariants
@@ -20,14 +22,12 @@ invocation and streams results back; flat layout, one module per tool.
 - Every adapter has a YAML contract in `tests/contract/contracts/` naming
   its required flags/subcommands. Capability assertions only, never snapshot
   `--help` text (`_contract.py` docstring); drift is a hard fail (exit 2).
-- Artifact writes go through the lineage-spine boundary in `base.py`;
-  do not add adapter-local artifact write paths
-  (`../core/lineage/spine.py`).
+- Artifact writes go through the lineage-spine boundary in `base.py`; do not
+  add adapter-local artifact write paths (`../core/lineage/spine.py`).
 - Keep adapter module import time free of replay-journal imports;
   `base.py` duplicates capability constants for exactly this reason.
-- Default spawned-process timeout is 30 minutes
-  (`DEFAULT_TIMEOUT_SECONDS` in `base.py`); adapters get SIGTERM, then
-  SIGKILL after a grace period.
+- Default spawned-process timeout is 30 minutes (`DEFAULT_TIMEOUT_SECONDS` in
+  `base.py`); adapters get SIGTERM, then SIGKILL after a grace period.
 
 ## Testing
 
@@ -37,4 +37,4 @@ Both layouts are current; follow whichever one an adapter already uses, and
 run one file at a time. Contract checks live under `tests/contract/`;
 live-binary conformance is opt-in via the `--live` pytest flag.
 
-<!-- Reviewed 2026-08-18 against this subtree; the notes above still hold. -->
+<!-- Reviewed 2026-08-24 against this subtree; the notes above still hold. -->

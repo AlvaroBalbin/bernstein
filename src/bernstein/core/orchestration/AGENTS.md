@@ -37,4 +37,4 @@ completion) and `../agents/` (spawner, heartbeat, crash detection, reaping).
 Single files only: `uv run pytest tests/unit/test_orchestrator.py -x -q`.
 Never run the full suite (see `tests/AGENTS.md`).
 
-<!-- Reviewed 2026-08-18 against this subtree; the notes above still hold. -->
+<!-- Reviewed 2026-08-24 against this subtree; the notes above still hold. -->
