@@ -1530,9 +1530,31 @@ class Orchestrator:
             len(tasks_by_status.get("failed", [])),
         )
 
+        # 1c. Build the task graph. Construction is deliberately un-gated:
+        #     the readiness filter just below and the critical-path claim
+        #     ordering in step 1c-ii both run on every tick and both need a
+        #     graph. A fast tick already paid for the identical construction
+        #     inside ``DependencyValidator.critical_path``, which is only
+        #     ``TaskGraph(tasks).critical_path()``, so building it once here
+        #     and reusing it costs a fast tick nothing and drops a normal
+        #     tick from two constructions to one. What stays gated behind
+        #     _run_normal is the expensive work built on top of the graph:
+        #     analyse(), full dependency validation, the snapshot write
+        #     (step 1c-ii) and warm-pool preparation (step 3).
+        all_tasks = list(itertools.chain.from_iterable(tasks_by_status.values()))
+        self._latest_tasks_by_id = {task.id: task for task in all_tasks}
+
+        task_graph = TaskGraph(all_tasks)
+        # A declared cycle is opened by dropping one edge, but the dropped
+        # edge stays in the dependent's depends_on. Without exempting it
+        # here every task on the cycle would fail the readiness filter
+        # forever and the board would stay wedged - the failure #4287
+        # describes. Keyed (dependent, dependency) to match the lookup below.
+        broken_deps = {(b.edge.target, b.edge.source) for b in task_graph.cycle_breaks}
+
         # The server returns tasks matching the requested status; apply the
         # dependency filter here for "open" tasks.
-        done_tasks = tasks_by_status["done"]
+        done_tasks = tasks_by_status.get("done", [])
         # A dependency is satisfied by any terminal-success status, not just
         # "done": once a done task's agent is reaped and its branch merged,
         # the task moves to "closed" (the store soft-archives via status).
@@ -1543,8 +1565,8 @@ class Orchestrator:
         now = time.time()
         open_tasks = [
             t
-            for t in tasks_by_status["open"]
-            if all(dep in done_ids for dep in t.depends_on)
+            for t in tasks_by_status.get("open", [])
+            if all(dep in done_ids or (t.id, dep) in broken_deps for dep in t.depends_on)
             # Skip tasks with future created_at (retry backoff)
             and t.created_at <= now
         ]
@@ -1623,15 +1645,11 @@ class Orchestrator:
             # Check for file-based approval grant
             self._check_workflow_approval()
 
-        # 1c. Build task graph and compute optimal parallelism
-        #     Graph analysis + dependency validation are expensive - gate behind
-        #     _run_normal. The all_tasks list and task ID cache are always needed.
-        all_tasks = list(itertools.chain.from_iterable(tasks_by_status.values()))
-        self._latest_tasks_by_id = {task.id: task for task in all_tasks}
-
-        task_graph: TaskGraph | None = None
+        # 1c-ii. Analyse the graph and validate dependencies. Both walk the
+        #        board repeatedly and the snapshot write touches disk, so
+        #        they are gated behind _run_normal; the graph they run on
+        #        was built above because every tick needs one.
         if _run_normal:
-            task_graph = TaskGraph(all_tasks)
             analysis = task_graph.analyse()
             dep_validator = DependencyValidator()
             dep_validation = dep_validator.validate(all_tasks)
@@ -1646,7 +1664,7 @@ class Orchestrator:
                 )
             for warning in dep_validation.warnings:
                 logger.warning("Dependency validation: %s", warning)
-            critical_path_ids = set(dep_validator.critical_path(all_tasks))
+            critical_path_ids = set(task_graph.critical_path())
             # Cache for use in fast ticks
             self._cached_critical_path_ids = critical_path_ids
 
@@ -1683,7 +1701,7 @@ class Orchestrator:
             # so reusing only the cache from the last normal tick left the
             # first spawn batch without the critical-path priority boost
             # and served stale boosts to tasks created between normal ticks.
-            critical_path_ids = set(DependencyValidator().critical_path(all_tasks))
+            critical_path_ids = set(task_graph.critical_path())
             self._cached_critical_path_ids = critical_path_ids
 
         # 3. Count alive agents, spawn if capacity (capped by graph parallel width)
@@ -1722,7 +1740,12 @@ class Orchestrator:
         alive_count = sum(1 for a in self._agents.values() if a.status != "dead")
         result.active_agents = alive_count
 
-        if task_graph is not None:
+        # Warm-pool preparation creates worktree and adapter capacity, so it
+        # is normal-tick work. It used to ride on ``task_graph is not None``,
+        # which only held on a normal tick back when the graph was built
+        # inside the gate; the condition is spelled out now that the graph is
+        # always available.
+        if _run_normal:
             prepare_speculative_warm_pool(self, task_graph, all_tasks)
 
         # 3a. Build alive-per-role map for task distribution prioritization.
