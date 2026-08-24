@@ -174,3 +174,19 @@ for every installed catalog skill and reports rows that do not match the
 lockfile. Drift indicates either a manual edit under
 `.bernstein/skills/<name>/` or an upstream rewrite; either is
 operator-actionable, never silently re-installed.
+
+## Agent Plugins directory installs (#3772)
+
+A separate, local-only path: `bernstein skills install <dir>` detects an
+Agent Plugins v1.0.0 directory layout (root `plugin.json` with `name`
+and `skills` fields - strict check, so an unrelated directory that
+happens to contain a `skills/` folder is not mistaken for a plugin) and
+installs every conformant `skills/<name>/SKILL.md` in one invocation.
+
+Installs go through the same lifecycle as a single local skill
+(`install_local`) and land in the same `skills.lock` with `source =
+"plugin"` and the content digest, so `bernstein skills sync` and the
+drift checks treat them like any other local install. A malformed skill
+inside the pack is skipped with a diagnostic naming it rather than
+aborting the whole install. No MCP server registration happens here -
+that is the sibling slice (#3540, out of scope for #3772).

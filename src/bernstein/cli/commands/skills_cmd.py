@@ -31,6 +31,8 @@ from bernstein.core.skills.lifecycle import (
     SkillsTomlError,
     init_skill,
     install_local,
+    install_plugin_local,
+    is_agent_plugins_layout,
     remove_skill,
     sync_skills,
 )
@@ -314,8 +316,35 @@ def skills_install(source: Path, scope: str, override_name: str | None, strict: 
     """
     install_scope = _parse_scope(scope)
     try:
+        resolved = source.resolve()
+        if is_agent_plugins_layout(resolved):
+            if override_name is not None:
+                console.print(
+                    "[red]install failed:[/red] --name does not apply to a plugin "
+                    "directory (a pack installs every skill under skills/ under "
+                    "its own name)"
+                )
+                raise SystemExit(1)
+            plugin_result = install_plugin_local(
+                resolved,
+                scope=install_scope,
+                workdir=Path.cwd(),
+                strict_lint=strict,
+                accept_risk=accept_risk,
+            )
+            for result in plugin_result.installed:
+                console.print(
+                    f"[green]installed[/green] {result.name} -> {result.install_dir} "
+                    f"(digest {result.digest.digest[:12]}...)",
+                )
+            for skipped in plugin_result.skipped:
+                console.print(f"[yellow]skipped[/yellow] {skipped.name}: {skipped.reason}")
+            if not plugin_result.installed:
+                console.print("[red]plugin install failed:[/red] no skills could be installed")
+                raise SystemExit(1)
+            return
         result = install_local(
-            source.resolve(),
+            resolved,
             scope=install_scope,
             workdir=Path.cwd(),
             override_name=override_name,
