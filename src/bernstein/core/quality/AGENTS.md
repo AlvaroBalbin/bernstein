@@ -21,9 +21,9 @@ configurable gate pipeline plus the janitor's claim verification.
 - Gate names are a closed set: a step name must be in `VALID_GATE_NAMES` or
   come from a registered gate plugin; the runner rejects anything else
   (`gate_runner.py`).
-- Defaults are deliberate: `lint`, `pii_scan`, `dlp_scan` on; `tests`,
-  `type_check`, and the heavier gates off (`quality_gates.py`). Do not
-  flip defaults as a side effect of another change.
+- Defaults are deliberate: `lint`, `pii_scan`, `dlp_scan`, `run_config` on;
+  `tests`, `type_check`, heavier gates off (`quality_gates.py`); never flip one
+  as a side effect. `run_config` is a safety invariant (`../config/run_overlay.py`).
 - Blocking vs advisory semantics are per-gate; a new gate must declare
   which it is.
 - No package-level `__getattr__` re-export magic in this package;
