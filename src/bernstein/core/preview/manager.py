@@ -37,6 +37,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    import builtins
+
 from bernstein.core.preview.command_discovery import (
     DiscoveredCommand,
     discover_commands,
@@ -214,7 +217,7 @@ class PreviewStore:
         """Return the state-file path."""
         return self._path
 
-    def list(self) -> list[PreviewState]:
+    def list(self) -> builtins.list[PreviewState]:
         """Return every persisted preview record."""
         with self._lock:
             return self._load()
@@ -257,7 +260,7 @@ class PreviewStore:
             logger.warning("Preview state read failed for %s: %s", self._path, exc)
             return []
         items = raw.get("previews", []) if isinstance(raw, dict) else []
-        out: list[PreviewState] = []
+        out: builtins.list[PreviewState] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -339,7 +342,7 @@ class PreviewManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def list(self) -> list[PreviewState]:
+    def list(self) -> builtins.list[PreviewState]:
         """Return every active preview the manager knows about."""
         return self._store.list()
 
