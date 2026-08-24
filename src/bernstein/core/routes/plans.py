@@ -16,9 +16,10 @@ from bernstein.core.lifecycle import transition_task
 from bernstein.core.models import PlanStatus, TaskStatus
 from bernstein.core.routes._unconfigured import UNCONFIGURED_STATUS
 from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
+from bernstein.core.security.plan_approval import PlanHashMismatchError
 
 if TYPE_CHECKING:
-    from bernstein.core.plan_approval import PlanStore
+    from bernstein.core.security.plan_approval import PlanStore
 
 router = APIRouter(prefix="/plans", tags=["plans"])
 
@@ -92,7 +93,7 @@ def get_plan(request: Request, plan_id: str) -> dict[str, Any]:
     "/{plan_id}/approve",
     responses={
         404: {"description": "Plan not found, or plan mode is not enabled on this server"},
-        409: {"description": "Plan already decided"},
+        409: {"description": "Plan already decided, or the plan changed after it was rendered for review"},
     },
 )
 def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None = None) -> dict[str, Any]:
@@ -109,6 +110,13 @@ def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | Non
         raise HTTPException(status_code=409, detail=f"Plan already {plan.status.value}")
 
     reason = body.reason if body else ""
+
+    # Bind the decision to the reviewed rendering: refuse to promote tasks if
+    # the plan changed after it was rendered for approval.
+    try:
+        store.verify_rendering_hash(plan_id)
+    except PlanHashMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # Promote tasks from PLANNED to OPEN
     task_store = request.app.state.store  # type: ignore[attr-defined]
@@ -141,7 +149,7 @@ def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | Non
     "/{plan_id}/reject",
     responses={
         404: {"description": "Plan not found, or plan mode is not enabled on this server"},
-        409: {"description": "Plan already decided"},
+        409: {"description": "Plan already decided, or the plan changed after it was rendered for review"},
     },
 )
 def reject_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None = None) -> dict[str, Any]:
@@ -157,6 +165,13 @@ def reject_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None
         raise HTTPException(status_code=409, detail=f"Plan already {plan.status.value}")
 
     reason = body.reason if body else ""
+
+    # Bind the decision to the reviewed rendering: refuse to cancel tasks if
+    # the plan changed after it was rendered for review.
+    try:
+        store.verify_rendering_hash(plan_id)
+    except PlanHashMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # Cancel PLANNED tasks
     task_store = request.app.state.store  # type: ignore[attr-defined]
