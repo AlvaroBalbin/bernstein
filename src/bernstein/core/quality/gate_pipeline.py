@@ -74,6 +74,7 @@ VALID_GATE_NAMES = frozenset(
         "integration_test_gen",
         "review_rubric",
         "test_expansion",
+        "agent_test_mutation",
         "incident_evals",
     }
 )

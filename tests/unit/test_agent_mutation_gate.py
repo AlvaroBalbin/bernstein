@@ -277,3 +277,53 @@ class TestAgentMutationPipelineStep:
         pipeline = build_default_pipeline(config)
         step = next(s for s in pipeline if s.name == "agent_test_mutation")
         assert step.required is True
+
+    def test_all_default_gate_specs_are_in_valid_gate_names(self) -> None:
+        """Every gate name in _DEFAULT_GATE_SPECS must be in VALID_GATE_NAMES (#4488)."""
+        from bernstein.core.quality.gate_pipeline import _DEFAULT_GATE_SPECS, VALID_GATE_NAMES
+
+        default_names = {name for _, name, _, _ in _DEFAULT_GATE_SPECS}
+        missing = default_names - VALID_GATE_NAMES
+        assert not missing, f"Gate names in _DEFAULT_GATE_SPECS missing from VALID_GATE_NAMES: {missing}"
+
+    def test_seed_parser_accepts_agent_test_mutation_step(self, tmp_path: Path) -> None:
+        """A seed whose quality_gates.pipeline names agent_test_mutation parses correctly (#4488)."""
+        from bernstein.core.config.seed_parser import parse_seed
+
+        seed_file = tmp_path / "bernstein.yaml"
+        seed_file.write_text(
+            "version: '1.0'\n"
+            "goal: Test mutation gate parsing\n"
+            "quality_gates:\n"
+            "  pipeline:\n"
+            "    - name: agent_test_mutation\n"
+            "      required: true\n"
+            "      condition: tests_changed\n",
+            encoding="utf-8",
+        )
+        parsed = parse_seed(seed_file)
+        assert parsed.quality_gates is not None
+        assert parsed.quality_gates.pipeline is not None
+        step = parsed.quality_gates.pipeline[0]
+        assert step.name == "agent_test_mutation"
+        assert step.required is True
+        assert step.condition == "tests_changed"
+
+    def test_seed_parser_rejects_unsupported_gate_name(self, tmp_path: Path) -> None:
+        """A seed naming a non-existent gate raises SeedError naming the invalid gate."""
+        import pytest
+
+        from bernstein.core.config.seed_parser import SeedError, parse_seed
+
+        seed_file = tmp_path / "bernstein.yaml"
+        seed_file.write_text(
+            "version: '1.0'\n"
+            "goal: Test unknown gate\n"
+            "quality_gates:\n"
+            "  pipeline:\n"
+            "    - name: nonexistent_bogus_gate\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SeedError) as exc_info:
+            parse_seed(seed_file)
+        assert "nonexistent_bogus_gate" in str(exc_info.value)
