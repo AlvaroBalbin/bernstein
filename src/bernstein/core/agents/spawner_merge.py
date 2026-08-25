@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from bernstein.core.agents.in_process_agent import InProcessAgent
     from bernstein.core.agents.warm_pool import PoolSlot, WarmPool
     from bernstein.core.merge_queue import MergeQueue
+    from bernstein.core.quality.quality_gates import QualityGatesConfig
     from bernstein.core.worktree import WorktreeManager
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,81 @@ def _file_scope_refusal(
     )
 
 
+def _resolve_quality_gate_config(worktree_root: Path) -> QualityGatesConfig | None:
+    """Resolve quality gates configuration from seed file if present."""
+    seed_file = worktree_root / "bernstein.yaml"
+    if seed_file.exists():
+        try:
+            from bernstein.core.config.seed_parser import parse_seed
+
+            seed = parse_seed(seed_file)
+            return seed.quality_gates
+        except Exception as exc:
+            logger.debug("Failed to parse quality_gates from %s: %s", seed_file, exc)
+    return None
+
+
+def _quality_gate_refusal(
+    session: AgentSession,
+    worktree_root: Path,
+    branch: str,
+    *,
+    quality_gate_config: QualityGatesConfig | None = None,
+) -> MergeResult | None:
+    """Run quality gates on the agent's worktree before merging into base branch (#4393).
+
+    If quality gates are enabled, runs all configured gates on the still-alive
+    worktree before the merge lands. A blocking gate failure or execution error
+    leaves the agent branch unmerged.
+    """
+    config = quality_gate_config
+    if config is None:
+        config = _resolve_quality_gate_config(worktree_root)
+
+    if config is None or not config.enabled:
+        return None
+
+    from bernstein.core.models import Task
+    from bernstein.core.quality.quality_gates import run_quality_gates
+
+    worktree_path = worktree_root / ".sdd" / "worktrees" / session.id
+    run_dir = worktree_path if worktree_path.exists() else worktree_root
+
+    task_ids = session.task_ids or [session.id]
+    for task_id in task_ids:
+        surrogate_task = Task(
+            id=task_id,
+            role=getattr(session, "role", "backend") or "backend",
+            title=getattr(session, "task_title", "") or task_id,
+            description="",
+        )
+        try:
+            qg_result = run_quality_gates(surrogate_task, run_dir, worktree_root, config)
+        except Exception as exc:
+            logger.warning("Quality gates execution failed for task %s in %s: %s", task_id, run_dir, exc)
+            return _refuse_merge(
+                session,
+                worktree_root,
+                branch,
+                reason=f"refused: quality gates execution errored for task {task_id}: {exc}",
+                code="quality-gates-errored",
+            )
+
+        if not qg_result.passed:
+            failed_gates = [f"quality_gate:{r.gate}" for r in qg_result.gate_results if r.blocked and not r.passed]
+            if not failed_gates:
+                failed_gates = ["quality_gate:failed"]
+            return _refuse_merge(
+                session,
+                worktree_root,
+                branch,
+                reason=f"refused: quality gates blocked merge for task {task_id}: {', '.join(failed_gates)}",
+                code="quality-gates-blocked",
+            )
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Merge and worktree branch merge
 # ---------------------------------------------------------------------------
@@ -398,6 +474,7 @@ def _run_merge_and_push(
     session: AgentSession,
     worktree_root: Path,
     merge_worktree_branch_fn: Any,
+    quality_gate_config: QualityGatesConfig | None = None,
 ) -> MergeResult | None:
     """Run the merge subprocess, record metrics, and push on success.
 
@@ -460,6 +537,18 @@ def _run_merge_and_push(
     if file_scope_refusal is not None:
         return file_scope_refusal
 
+    # Quality gates (#4393): run quality gates on the still-alive worktree
+    # before landing the merge commit. A failing gate refuses the merge and
+    # leaves the agent branch unmerged.
+    quality_gate_refusal = _quality_gate_refusal(
+        session,
+        worktree_root,
+        f"agent/{session.id}",
+        quality_gate_config=quality_gate_config,
+    )
+    if quality_gate_refusal is not None:
+        return quality_gate_refusal
+
     merge_start = time.perf_counter()
     # Provenance: record the call site before invoking the merge so the
     # log line identifies the WORKER branch + WORKTREE root that triggered
@@ -505,6 +594,7 @@ def _do_merge(
     merge_locks: dict[Path, threading.Lock],
     merge_worktree_branch_fn: Any,
     merge_queue: MergeQueue | None = None,
+    quality_gate_config: QualityGatesConfig | None = None,
 ) -> MergeResult | None:
     """Execute the merge under a lock, record metrics, and push.
 
@@ -522,6 +612,8 @@ def _do_merge(
         merge_queue: Optional :class:`MergeQueue` for serialized FIFO merges
             across concurrent agents.  When None, falls back to the
             per-repo lock.
+        quality_gate_config: Optional :class:`QualityGatesConfig` evaluated
+            before merge (#4393).
 
     Returns:
         The MergeResult.
@@ -530,11 +622,21 @@ def _do_merge(
         task_id = session.task_ids[0] if session.task_ids else ""
         task_title = getattr(session, "task_title", "") or ""
         with merge_queue.submit(session.id, task_id=task_id, task_title=task_title):
-            return _run_merge_and_push(session, worktree_root, merge_worktree_branch_fn)
+            return _run_merge_and_push(
+                session,
+                worktree_root,
+                merge_worktree_branch_fn,
+                quality_gate_config=quality_gate_config,
+            )
 
     merge_lock = merge_locks.setdefault(worktree_root, threading.Lock())
     with merge_lock:
-        return _run_merge_and_push(session, worktree_root, merge_worktree_branch_fn)
+        return _run_merge_and_push(
+            session,
+            worktree_root,
+            merge_worktree_branch_fn,
+            quality_gate_config=quality_gate_config,
+        )
 
 
 def _do_cleanup(
@@ -565,6 +667,7 @@ def merge_and_cleanup_worktree(
     workdir: Path,
     merge_worktree_branch_fn: Any,
     merge_queue: MergeQueue | None = None,
+    quality_gate_config: QualityGatesConfig | None = None,
 ) -> MergeResult | None:
     """Merge worktree branch back and optionally clean up.
 
@@ -588,6 +691,8 @@ def merge_and_cleanup_worktree(
             merges through a FIFO queue.  Preferred over the ad-hoc
             ``merge_locks`` dict; when None the legacy per-repo lock path
             is used (preserves single-agent behaviour and test harnesses).
+        quality_gate_config: Optional :class:`QualityGatesConfig` evaluated
+            before merge (#4393).
 
     Returns:
         MergeResult when worktrees are enabled and skip_merge is False
@@ -612,6 +717,7 @@ def merge_and_cleanup_worktree(
             merge_locks,
             merge_worktree_branch_fn,
             merge_queue=merge_queue,
+            quality_gate_config=quality_gate_config,
         )
 
     if not defer_cleanup:
@@ -959,6 +1065,7 @@ def reap_completed_agent(
     traces: dict[str, AgentTrace],
     trace_store: TraceStore,
     merge_queue: MergeQueue | None = None,
+    quality_gate_config: QualityGatesConfig | None = None,
 ) -> MergeResult | None:
     """Terminate and wait on the subprocess for a completed agent.
 
@@ -1002,6 +1109,7 @@ def reap_completed_agent(
                 workdir=workdir,
                 merge_worktree_branch_fn=merge_worktree_branch_fn,
                 merge_queue=merge_queue,
+                quality_gate_config=quality_gate_config,
             )
             outcome = "completed" if session.status != "dead" else "timed_out"
             get_plugin_manager().fire_agent_reaped(session_id=session.id, role=session.role, outcome=outcome)
@@ -1021,6 +1129,7 @@ def reap_completed_agent(
         workdir=workdir,
         merge_worktree_branch_fn=merge_worktree_branch_fn,
         merge_queue=merge_queue,
+        quality_gate_config=quality_gate_config,
     )
     outcome = "completed" if session.status != "dead" else "timed_out"
     get_plugin_manager().fire_agent_reaped(session_id=session.id, role=session.role, outcome=outcome)

@@ -1619,6 +1619,7 @@ class AgentSpawner:
         # dashboard can observe pending jobs and so merge-tree conflict checks
         # can be inserted on the queue's boundary ( fix).
         self._merge_queue: Any = None
+        self._quality_gate_config: Any = None
         self._traces: dict[str, AgentTrace] = {}
         self._trace_store = TraceStore(workdir / ".sdd" / "traces")
         self._runtime_bridge = runtime_bridge
@@ -1959,6 +1960,10 @@ class AgentSpawner:
         """
         self._merge_queue = merge_queue
 
+    def set_quality_gate_config(self, config: Any) -> None:
+        """Wire in the orchestrator's :class:`QualityGatesConfig` (#4393)."""
+        self._quality_gate_config = config
+
     def _merge_and_cleanup_worktree(
         self,
         session: AgentSession,
@@ -1979,6 +1984,7 @@ class AgentSpawner:
             workdir=self._workdir,
             merge_worktree_branch_fn=self._merge_worktree_branch,
             merge_queue=self._merge_queue,
+            quality_gate_config=self._quality_gate_config,
         )
 
     def _touch_prespawn_heartbeat(self, session_id: str) -> None:
@@ -2082,6 +2088,7 @@ class AgentSpawner:
             traces=self._traces,
             trace_store=self._trace_store,
             merge_queue=self._merge_queue,
+            quality_gate_config=self._quality_gate_config,
         )
         # Artifact-mode session (issue #2996): no worktree, so the merge path
         # above was a structural no-op; remove the plain workspace directory
