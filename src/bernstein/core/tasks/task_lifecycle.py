@@ -3075,6 +3075,20 @@ def _gate_repair_enabled(orch: Any) -> bool:
     return bool(getattr(orch._config, "gate_repair_enabled", True))
 
 
+def _repairable_gate_failures(qg_result: Any) -> list[Any]:
+    """Blocked, non-passed gate results a code change could plausibly fix.
+
+    Excludes ``status == "inconclusive"`` (issue #4548): that status means
+    the gate could not honestly evaluate the diff at all -- e.g. its command
+    is not installed -- so there is no code-side defect for a repair agent
+    to act on. Spawning one anyway just burns the run's budget re-running
+    the same missing command.
+    """
+    return [
+        r for r in qg_result.gate_results if r.blocked and not r.passed and getattr(r, "status", None) != "inconclusive"
+    ]
+
+
 def _build_gate_repair_goal(qg_result: Any) -> str:
     """Build the repair task's goal: the tail of the real gate output plus
     the fixed repair instruction (issue #4463).
@@ -3086,7 +3100,7 @@ def _build_gate_repair_goal(qg_result: Any) -> str:
     actual failure instead of a pointer to a log the operator has to
     excavate.
     """
-    blocked = [r for r in qg_result.gate_results if r.blocked and not r.passed]
+    blocked = _repairable_gate_failures(qg_result)
     # Gate results from older callers (and their test doubles) may not carry
     # ``detail``; a missing field means "no output captured", never a crash.
     details = [(r, getattr(r, "detail", None)) for r in blocked]
@@ -3117,15 +3131,21 @@ def _maybe_schedule_gate_repair(
     branch from main.
 
     Returns the new task's id, or ``None`` when no repair was scheduled
-    (switch off, already attempted, no worktree to resume, no server, or the
-    create call failed) -- callers treat ``None`` as "handle this exactly as
-    before".
+    (switch off, already attempted, no worktree to resume, no server, no
+    repairable failure, or the create call failed) -- callers treat ``None``
+    as "handle this exactly as before".
     """
     if qg_result is None or qg_result.passed:
         return None
     if not _gate_repair_enabled(orch):
         return None
     if task.metadata.get("gate_repair_attempted"):
+        return None
+    if not _repairable_gate_failures(qg_result):
+        # Every blocking gate is "inconclusive" (issue #4548) -- there is no
+        # code-side failure to hand a repair agent, so fall through to the
+        # caller's normal reopen/permanent-fail handling instead.
+        logger.debug("gate_repair: task=%s no repairable gate failures, skipping repair", task.id)
         return None
     if worktree is None:
         logger.debug("gate_repair: no worktree for task %s, skipping repair", task.id)

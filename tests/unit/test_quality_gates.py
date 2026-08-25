@@ -70,6 +70,18 @@ class TestRunCommand:
         ok, _output = _run_command("nonexistent_command_xyz_12345", tmp_path, timeout_s=5)
         assert not ok
 
+    def test_missing_command_is_tagged_distinctly_from_a_real_failure(self, tmp_path: Path) -> None:
+        ok, output = _run_command("nonexistent_command_xyz_12345", tmp_path, timeout_s=5)
+        assert not ok
+        assert output.startswith("Command not found: ")
+
+    def test_real_nonzero_exit_is_not_tagged_as_command_not_found(self, tmp_path: Path) -> None:
+        # A script that legitimately exits 127 without the shell's
+        # "not found" wording must not be misread as a missing command.
+        ok, output = _run_command("exit 127", tmp_path, timeout_s=5)
+        assert not ok
+        assert not output.startswith("Command not found: ")
+
 
 # ---------------------------------------------------------------------------
 # run_quality_gates: disabled master switch

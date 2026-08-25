@@ -103,6 +103,22 @@ def _passing_qg_result(task_id: str = "task123") -> QualityGatesResult:
     )
 
 
+def _missing_command_qg_result(task_id: str = "task123") -> QualityGatesResult:
+    return QualityGatesResult(
+        task_id=task_id,
+        passed=False,
+        gate_results=[
+            QualityGateCheckResult(
+                gate="lint",
+                passed=False,
+                blocked=True,
+                detail="Command not found: /bin/sh: 1: ruff: not found",
+                status="inconclusive",
+            ),
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # _build_gate_repair_goal
 # ---------------------------------------------------------------------------
@@ -115,6 +131,25 @@ def test_goal_embeds_gate_output_tail_and_fix_instructions() -> None:
     assert "line 10: ruff violation" not in goal  # older than the ~40-line tail
     assert "do not rewrite the feature" in goal.lower()
     assert "smallest possible diffs" in goal.lower() or "small" in goal.lower()
+
+
+def test_goal_omits_inconclusive_gates_mixed_with_a_real_failure() -> None:
+    """An inconclusive gate (missing command) alongside a real failure keeps
+    the repair goal focused on the failure a code change can address.
+    """
+    qg_result = QualityGatesResult(
+        task_id="task123",
+        passed=False,
+        gate_results=[
+            QualityGateCheckResult(gate="lint", passed=False, blocked=True, detail="E501 line too long", status="fail"),
+            *_missing_command_qg_result("task123").gate_results,
+        ],
+    )
+
+    goal = _build_gate_repair_goal(qg_result)
+
+    assert "E501 line too long" in goal
+    assert "ruff: not found" not in goal
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +282,27 @@ def test_no_worktree_skips_scheduling() -> None:
 
     assert new_id is None
     assert client.posts == []
+
+
+# ---------------------------------------------------------------------------
+# _maybe_schedule_gate_repair -- gate could not run at all (issue #4548)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_gate_command_does_not_spawn_gate_repair() -> None:
+    """A gate blocked only by 'inconclusive' (e.g. its command is missing) has
+    no code-side defect a repair agent could act on, so no repair task is
+    seeded -- the task falls through to the normal reopen/permanent-fail path.
+    """
+    client = _FakeClient()
+    orch = _make_orch(client)
+    task = _make_task()
+
+    new_id = _maybe_schedule_gate_repair(orch, task, _missing_command_qg_result(), Path("/tmp/wt"))
+
+    assert new_id is None
+    assert client.posts == []
+    assert orch._preserved_worktrees == {}
 
 
 # ---------------------------------------------------------------------------

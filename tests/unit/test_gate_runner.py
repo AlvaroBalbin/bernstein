@@ -11,7 +11,9 @@ from unittest.mock import patch
 import pytest
 from bernstein.core.gate_runner import GatePipelineStep, GateRunner, normalize_gate_condition
 from bernstein.core.models import Complexity, Scope, Task
-from bernstein.core.quality_gates import QualityGatesConfig
+from bernstein.core.quality_gates import QualityGatesConfig, _legacy_result_from_report
+
+from bernstein.core.tasks.task_lifecycle import _repairable_gate_failures
 
 
 def _make_task(*, owned_files: list[str] | None = None) -> Task:
@@ -149,6 +151,116 @@ def test_non_required_fail_does_not_block(tmp_path: Path) -> None:
     assert report.overall_pass
     assert report.results[0].status == "fail"
     assert not report.results[0].blocked
+
+
+# ---------------------------------------------------------------------------
+# Missing gate command vs. a real violation (issue #4548)
+#
+# These run real subprocesses through the actual gate runner instead of
+# mocking `_run_command` -- the bug lives in how a genuine process result
+# gets mapped to a gate status, so a mocked (ok, detail) tuple would not
+# exercise it.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_gate_command_is_not_reported_as_lint_failure(tmp_path: Path) -> None:
+    config = QualityGatesConfig(
+        pipeline=[
+            GatePipelineStep(
+                name="lint",
+                required=True,
+                condition="always",
+                command_override="nonexistent_command_xyz_12345",
+            )
+        ],
+        cache_enabled=False,
+    )
+    runner = GateRunner(config, tmp_path)
+    task = _make_task()
+
+    report = asyncio.run(runner.run_all(task, tmp_path))
+
+    assert report.results[0].status == "inconclusive"
+    assert report.results[0].reason == "evidence-missing"
+    assert report.results[0].status != "fail"
+
+
+def test_missing_gate_command_blocks_merge(tmp_path: Path) -> None:
+    config = QualityGatesConfig(
+        pipeline=[
+            GatePipelineStep(
+                name="lint",
+                required=True,
+                condition="always",
+                command_override="nonexistent_command_xyz_12345",
+            )
+        ],
+        cache_enabled=False,
+    )
+    runner = GateRunner(config, tmp_path)
+    task = _make_task()
+
+    report = asyncio.run(runner.run_all(task, tmp_path))
+
+    assert report.results[0].blocked is True
+    assert not report.overall_pass
+
+
+def test_missing_gate_command_does_not_spawn_gate_repair(tmp_path: Path) -> None:
+    """The legacy result feeding gate-repair marks this un-repairable too."""
+    config = QualityGatesConfig(
+        pipeline=[
+            GatePipelineStep(
+                name="lint",
+                required=True,
+                condition="always",
+                command_override="nonexistent_command_xyz_12345",
+            )
+        ],
+        cache_enabled=False,
+    )
+    runner = GateRunner(config, tmp_path)
+    task = _make_task()
+
+    report = asyncio.run(runner.run_all(task, tmp_path))
+    legacy = _legacy_result_from_report(report)
+
+    assert _repairable_gate_failures(legacy) == []
+
+
+def test_real_violation_keeps_fail_status_and_retry_path(tmp_path: Path) -> None:
+    config = QualityGatesConfig(
+        pipeline=[
+            GatePipelineStep(name="lint", required=True, condition="always", command_override="exit 1"),
+        ],
+        cache_enabled=False,
+    )
+    runner = GateRunner(config, tmp_path)
+    task = _make_task()
+
+    report = asyncio.run(runner.run_all(task, tmp_path))
+    legacy = _legacy_result_from_report(report)
+
+    assert report.results[0].status == "fail"
+    assert report.results[0].reason is None
+    assert report.results[0].blocked is True
+    assert len(_repairable_gate_failures(legacy)) == 1
+
+
+def test_timeout_classification_is_unchanged(tmp_path: Path) -> None:
+    config = QualityGatesConfig(
+        pipeline=[GatePipelineStep(name="lint", required=True, condition="always", command_override="sleep 5")],
+        timeout_s=1,
+        cache_enabled=False,
+    )
+    runner = GateRunner(config, tmp_path)
+    task = _make_task()
+
+    report = asyncio.run(runner.run_all(task, tmp_path))
+
+    assert report.results[0].status == "timeout"
+    assert report.results[0].reason is None
+    assert report.results[0].blocked is True
 
 
 def test_cache_hit_and_invalidation_by_content_hash(tmp_path: Path) -> None:

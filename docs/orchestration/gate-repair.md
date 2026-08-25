@@ -17,6 +17,7 @@ being thrown away.
 | Step | Outcome |
 |---|---|
 | Gate fails, no prior repair attempt on this task | One repair task is created. Its description is the tail (~40 lines) of the real gate output plus "make the existing tests and lint pass; do not rewrite the feature; keep the diff as small as possible". The failing worktree is preserved so the repair task resumes the same branch instead of starting a fresh one from main. |
+| Every blocking gate is `inconclusive` (e.g. the gate's command is not installed) | No repair task is created -- there is no code-side defect to hand a repair agent, so retrying would just re-run the same broken command. Falls through to the normal reopen/permanent-fail budget. |
 | Repair task's own gate check passes | The branch proceeds through the normal gate/merge path -- no special-casing, it is just a task that passed. |
 | Repair task's own gate check also fails | No second repair is scheduled (the repair task's metadata already carries `gate_repair_attempted`); it goes through the existing reopen/permanent-fail budget unchanged. |
 | Original (pre-repair) task | Failed with a reason pointing at the repair task id, so the same failure never runs through the generic reopen budget *and* the repair task concurrently. |
@@ -40,6 +41,7 @@ gate_repair_enabled: true
 | Symbol | Purpose |
 |---|---|
 | `_gate_repair_enabled` | Resolves the switch (env override, then config). |
+| `_repairable_gate_failures` | Blocked, non-passed gate results excluding `inconclusive` ones -- the set a repair agent could plausibly fix. |
 | `_build_gate_repair_goal` | Builds the repair task's description from a quality-gate result. |
 | `_maybe_schedule_gate_repair` | Creates the repair task and preserves its worktree; returns the new task id or `None`. |
 
@@ -52,6 +54,9 @@ gate_repair_enabled: true
 - a task whose metadata already carries a repair attempt schedules no
   second one.
 - a passing gate result schedules nothing.
+- a gate blocked only by `inconclusive` results (e.g. its command is not
+  installed) schedules nothing, and is left out of the repair goal when
+  mixed with a real failure.
 - the switch, off via config or the env override, disables scheduling.
 - `_reap_and_cleanup_session` preserves the worktree when a repair was
   scheduled, and still cleans up when one was not.

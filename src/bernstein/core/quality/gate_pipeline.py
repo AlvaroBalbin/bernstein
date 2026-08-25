@@ -14,6 +14,15 @@ NO_PYTHON_FILES = "No Python files changed."
 # this prefix to ``inconclusive`` (reason ``evidence-missing``) — see
 # ``_command_failure_result``.
 COMMAND_ERROR_PREFIX = "Command error: "
+# Prefix emitted by ``quality_gates._run_command`` when the subprocess ran
+# (the shell started fine) but exited 127 with output corroborating that the
+# configured command itself does not exist. Distinct from
+# ``COMMAND_ERROR_PREFIX`` (the shell never started at all) and from a
+# non-zero exit with real tool output, which is a genuine violation. The
+# gate runner maps this prefix to ``inconclusive`` (reason
+# ``evidence-missing``) as well -- see ``_command_failure_result`` -- since a
+# missing command produced no evidence about the code either.
+COMMAND_NOT_FOUND_PREFIX = "Command not found: "
 
 if TYPE_CHECKING:
     from bernstein.core.quality.quality_gates import QualityGatesConfig

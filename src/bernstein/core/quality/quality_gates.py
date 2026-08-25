@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 
 _TRUNCATED_SUFFIX = "\n... (truncated)"
 
+# Prefix mirrored by ``gate_pipeline.COMMAND_NOT_FOUND_PREFIX`` (kept as a
+# literal here, same as ``COMMAND_ERROR_PREFIX`` and ``TIMED_OUT_PREFIX``, to
+# avoid importing the higher layer from this one).
+_COMMAND_NOT_FOUND_PREFIX = "Command not found: "
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -517,6 +522,13 @@ def _run_command(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str]:
         output = (proc.stdout + proc.stderr).strip()
         if len(output) > 2000:
             output = output[:2000] + _TRUNCATED_SUFFIX
+        # Exit 127 is the shell's command-not-found convention, but a script
+        # can legitimately exit 127 on its own. Corroborate with the shell's
+        # own wording ("not found" / "command not found" across sh/bash/zsh)
+        # before trusting the exit code, so a real exit-127 violation still
+        # reports as a failure.
+        if proc.returncode == 127 and "not found" in output.lower():
+            return False, f"{_COMMAND_NOT_FOUND_PREFIX}{output}"
         return proc.returncode == 0, output or "(no output)"
     except subprocess.TimeoutExpired:
         return False, f"Timed out after {timeout_s}s"

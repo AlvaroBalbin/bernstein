@@ -24,6 +24,9 @@ from bernstein.core.quality.gate_pipeline import (
     COMMAND_ERROR_PREFIX as _COMMAND_ERROR_PREFIX,
 )
 from bernstein.core.quality.gate_pipeline import (
+    COMMAND_NOT_FOUND_PREFIX as _COMMAND_NOT_FOUND_PREFIX,
+)
+from bernstein.core.quality.gate_pipeline import (
     NO_PYTHON_FILES as _NO_PYTHON_FILES,
 )
 from bernstein.core.quality.gate_pipeline import (
@@ -484,28 +487,18 @@ class GateRunner:
         from bernstein.core import quality_gates as qg
 
         ok, detail = await asyncio.to_thread(qg.run_command_sync, command, run_dir, timeout_s)
-        status: GateStatus
-        blocked = False
-        normalized_detail = detail
-        if detail.startswith(_TIMED_OUT_PREFIX):
-            status = "timeout"
-            blocked = step.required
-        elif ok:
-            status = "pass"
-            normalized_detail = pass_detail or detail
-        else:
-            status = "fail"
-            blocked = step.required
-        return GateResult(
-            name=step.name,
-            status=status,
-            required=step.required,
-            blocked=blocked,
-            cached=False,
-            duration_ms=0,
-            details=normalized_detail,
-            metadata={"command": command},
-        )
+        if ok:
+            return GateResult(
+                name=step.name,
+                status="pass",
+                required=step.required,
+                blocked=False,
+                cached=False,
+                duration_ms=0,
+                details=pass_detail or detail,
+                metadata={"command": command},
+            )
+        return self._command_failure_result(step, detail, command)
 
     async def _run_tests_gate(
         self,
@@ -1257,6 +1250,29 @@ class GateRunner:
             return GateResult(
                 name=step.name,
                 status="timeout",
+                required=step.required,
+                blocked=step.required,
+                cached=False,
+                duration_ms=0,
+                details=detail,
+                metadata={"command": command},
+            )
+        if detail.startswith(_COMMAND_NOT_FOUND_PREFIX):
+            # The shell started but exit 127 says the configured command
+            # itself is not installed (issue #4548). That is a
+            # misconfiguration no code change can fix, not evidence about
+            # the diff -- log it distinctly from the generic "gate blocked"
+            # warning so an operator can find it by gate and command instead
+            # of reading it as a lint/type/security violation.
+            logger.error(
+                "Quality gate %r command not found: %s",
+                step.name,
+                command,
+            )
+            return GateResult(
+                name=step.name,
+                status="inconclusive",
+                reason="evidence-missing",
                 required=step.required,
                 blocked=step.required,
                 cached=False,

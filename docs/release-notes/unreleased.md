@@ -16,3 +16,11 @@ rather than as its own attribution is exempted by hand there, with the reason.
   every run, blocking merges for a reason no code change could fix. The seed now
   invokes ruff through `uv run`, and a test holds every gate command that names
   a venv-resident tool to that form. (#4547)
+- A quality gate whose command was not installed (shell exit 127) reported
+  as an ordinary lint/type/security failure, so the orchestrator spawned
+  `[GATE-REPAIR]` tasks to "fix" code that was never the problem. Such a
+  gate now reports `inconclusive` (reason `evidence-missing`) instead of
+  `fail`: it still blocks the merge, but no repair task is spawned and the
+  missing command is logged by name against the gate it belongs to. A real
+  violation from the same command still reports `fail` and keeps its
+  retry path. (#4548)
