@@ -99,8 +99,10 @@ from bernstein.core.orchestration.adaptive_parallelism import AdaptiveParallelis
 from bernstein.core.orchestration.evolution import EvolutionCoordinator
 from bernstein.core.orchestration.run_stall import (
     ACTIVE_UNFINISHED_STATUSES,
+    PROGRESS_STUCK_CLAIM_FAIL_REASON,
     STUCK_TASK_FAIL_REASON,
     RunStallState,
+    evaluate_progress_stall,
     evaluate_run_stall,
     resolve_grace_s,
     resolve_min_ticks,
@@ -2115,6 +2117,15 @@ class Orchestrator:
         # 8. Replenish backlog in evolve mode when tasks run out
         self._replenish_backlog(result)
 
+        # 7c. A run that already finished work (done/failed > 0) but is
+        # wedged on a task claimed by an agent that no longer exists can
+        # never reach the quiescence gate below - ``open`` may still be
+        # non-zero, so step 8b's `open_tasks == active_agents == 0` branch
+        # is never entered. Checked every tick regardless of quiescence;
+        # see core.orchestration.run_stall.evaluate_progress_stall (#4453).
+        if not self._config.evolve_mode:
+            self._check_progress_stall(tasks_by_status, base)
+
         # 8b. Generate run completion summary for non-evolve runs.
         #
         # Bug (2026-07-02 D2 openrouter final leg,
@@ -2699,6 +2710,159 @@ class Orchestrator:
         self._run_stall_stopped = True
         self._closure_outcome = RunClosureOutcome.FAILED
         self._regenerate_final_retrospective(trigger_path="tick-stalled-run-self-stop")
+        self._running = False
+
+    def _check_progress_stall(
+        self,
+        tasks_by_status: dict[str, list[Task]],
+        base: str,
+    ) -> None:
+        """End a run wedged on a dead claim after it already finished work (#4453).
+
+        Sibling of :meth:`_check_zero_terminal_stall` for the shape where the
+        run *has* produced a terminal task but is stuck anyway: a task is
+        ``claimed`` by an agent that no longer exists, and nothing ever
+        converts that claim back to ``open`` or fails it, so ``claimed``,
+        ``open`` and ``agents`` all sit stable forever. Unlike the
+        zero-terminal check, this one does not wait for quiescence - a
+        non-zero ``open`` count does not make the wedged claim any less
+        stuck, and step 8b's ``open_tasks == active_agents == 0`` gate would
+        never see this shape at all.
+
+        The decision itself lives in
+        :func:`~bernstein.core.orchestration.run_stall.evaluate_progress_stall`
+        (pure, unit-testable). This method owns only the IO around it: the
+        settle-window confirmation, the holds check, and failing the wedged
+        claim so the run's own reporting is honest.
+
+        Args:
+            tasks_by_status: Task snapshot fetched at the top of this tick.
+            base: Task-server base URL.
+
+        Side effects:
+            On a confirmed stall: fails every wedged claimed task with
+            :data:`~bernstein.core.orchestration.run_stall.PROGRESS_STUCK_CLAIM_FAIL_REASON`,
+            regenerates the final retrospective, and sets ``_running`` False.
+            Never raises - a backstop that can crash the tick loop is worse
+            than the idling it prevents.
+        """
+        if self._progress_stall_stopped:
+            return
+
+        grace_s = resolve_grace_s(self._config.stalled_run_grace_s)
+        min_ticks = resolve_min_ticks(self._config.stalled_run_ticks)
+        active_agents = sum(1 for a in self._agents.values() if a.status != "dead")
+
+        self._progress_stall_state, verdict = evaluate_progress_stall(
+            self._progress_stall_state,
+            tasks_by_status,
+            active_agents=active_agents,
+            now=time.time(),
+            grace_s=grace_s,
+            min_ticks=min_ticks,
+        )
+        if not verdict.stalled:
+            logger.debug(
+                "progress_stall_check: tick=#%d -> continue (%s)",
+                self._tick_count,
+                verdict.reason,
+            )
+            return
+
+        # Confirmation pass, mirroring the zero-terminal stall's settle
+        # window: a claim that gets released or re-claimed during the wait
+        # aborts the stop.
+        _settle_s = float(os.environ.get("BERNSTEIN_QUIESCENCE_SETTLE_S", "2.0"))
+        if _settle_s > 0:
+            time.sleep(_settle_s)
+        try:
+            settled = fetch_all_tasks(self._client, base)
+        except httpx.HTTPError:
+            logger.exception(
+                "progress_stall_check: settle re-check failed (tick #%d) - not stopping; "
+                "an unreachable server is the server-failure path's business, not a stall",
+                self._tick_count,
+            )
+            self._progress_stall_state = RunStallState()
+            return
+
+        settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
+        settled_claimed = settled.get("claimed", [])
+        if settled_agents or not settled_claimed:
+            logger.info(
+                "progress_stall_check: NOT confirmed after %.1fs settle window (tick #%d): "
+                "agents=%d claimed=%d - run continues",
+                _settle_s,
+                self._tick_count,
+                settled_agents,
+                len(settled_claimed),
+            )
+            self._progress_stall_state = RunStallState()
+            return
+
+        _stuck_ids = sorted(str(task.id) for task in settled_claimed)
+
+        # Holds outrank the progress-stall backstop exactly as they outrank
+        # the zero-terminal one.
+        try:
+            _active_holds = fetch_active_holds(self._client, base)
+        except Exception as exc:  # intentional-broad-except: must never crash the tick loop
+            logger.warning(
+                "fetch_active_holds raised during progress-stall check (tick #%d): %s - treating as no active holds",
+                self._tick_count,
+                exc,
+            )
+            _active_holds = []
+        if _active_holds:
+            logger.info(
+                "progress_stall_check: %d active hold(s) present (tick #%d) - not stopping: %s",
+                len(_active_holds),
+                self._tick_count,
+                [sanitize_log(str(h.get("reason", "<no reason>"))) for h in _active_holds],
+            )
+            return
+
+        logger.error(
+            "progress_stall_check: STALLED (tick #%d) - %s. Stopping the run and reporting it "
+            "as not having met its goal.",
+            self._tick_count,
+            verdict.reason,
+        )
+
+        _failed_ids: list[str] = []
+        for task_id in _stuck_ids:
+            try:
+                fail_task(self._client, base, task_id, reason=PROGRESS_STUCK_CLAIM_FAIL_REASON)
+                _failed_ids.append(task_id)
+            except Exception as exc:  # intentional-broad-except: keep stopping regardless
+                logger.warning(
+                    "progress_stall_check: could not fail wedged claimed task %s: %s",
+                    task_id,
+                    sanitize_log(str(exc)),
+                )
+        logger.error(
+            "progress_stall_check: marked %d of %d wedged claimed task(s) failed: %s",
+            len(_failed_ids),
+            len(_stuck_ids),
+            ", ".join(_failed_ids) or "<none>",
+        )
+
+        with contextlib.suppress(Exception):
+            self._post_bulletin("alert", f"run_stalled: {verdict.reason}")
+        with contextlib.suppress(Exception):
+            self._recorder.record(
+                "run_stalled",
+                run_id=self._run_id,
+                tick=self._tick_count,
+                quiet_for_s=round(verdict.quiet_for_s, 3),
+                observed_ticks=verdict.observed_ticks,
+                stuck_task_ids=_stuck_ids,
+                failed_task_ids=_failed_ids,
+            )
+
+        self._progress_stall_stopped = True
+        self._closure_outcome = RunClosureOutcome.FAILED
+        self._regenerate_final_retrospective(trigger_path="tick-progress-stalled-run-self-stop")
         self._running = False
 
     def _maybe_schedule_test_followup(self, done_tasks: list[Task]) -> bool:

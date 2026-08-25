@@ -42,6 +42,7 @@ from bernstein.core.spawner import AgentSpawner
 from bernstein.core.tick_pipeline import prioritize_starving_roles
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
+from bernstein.core.orchestration.run_stall import PROGRESS_STUCK_CLAIM_FAIL_REASON
 from bernstein.core.security.audit_chain import AuditChainStore
 from bernstein.core.security.run_closure import RunClosureOutcome, RunClosureStatus, project_run_closure
 
@@ -4559,6 +4560,110 @@ class TestShutdownFinalOnQuiescenceSelfStop:
         assert final_summary["tasks_failed"] == 1, (
             "the retry task's eventual failure must reach summary.json, not just the retrospective"
         )
+
+
+class TestProgressStallSelfStop:
+    """#4453: a claim held by an agent that no longer exists must not wedge the run forever."""
+
+    def test_claimed_wedge_with_open_and_zero_agents_self_stops(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive the ledger into done=2 claimed=1 open=1 agents=0 and assert the run leaves that state.
+
+        Reproduces the exact shape from the issue: two tasks finished, one is
+        claimed by an agent id this orchestrator process never spawned (its
+        claimant is simply gone), one is open but cannot be scheduled, and no
+        agent is alive. Before the fix nothing in the tick loop ever moved
+        those numbers -- ``open_tasks == active_agents == 0`` never held (the
+        open task keeps ``open`` at 1), so the zero-terminal quiescence gate
+        was never entered either. The run must instead self-stop and fail the
+        wedged claim with a distinguishable reason.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done_1 = _make_task(id="done-1", status="done")
+        done_2 = _make_task(id="done-2", status="done")
+        claimed = _make_task(id="claimed-1", status="claimed")
+        claimed.assigned_agent = "ghost-agent-does-not-exist"
+        # An unmet dependency keeps this task out of the scheduler's ready
+        # set (so it is never claimed/spawned by this process) while still
+        # reporting as a raw "open" task, matching the issue's `open=1`.
+        stuck_open = _make_task(id="open-1", status="open")
+        stuck_open.depends_on = ["never-finishes"]
+
+        fixed_tasks = [_task_as_dict(t) for t in (done_1, done_2, claimed, stuck_open)]
+
+        failed_task_ids: list[str] = []
+        failed_reasons: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/tasks":
+                return httpx.Response(200, json=list(fixed_tasks))
+            if request.method == "POST" and request.url.path == "/tasks/claimed-1/fail":
+                failed_task_ids.append("claimed-1")
+                failed_reasons.append(json.loads(request.content).get("reason", ""))
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={})
+
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+            stalled_run_grace_s=0.0,
+            stalled_run_ticks=1,
+        )
+        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=cfg)
+        orch._running = True  # as run() sets before its tick loop
+
+        r1 = orch.tick()
+        assert r1.active_agents == 0
+        assert orch._running is True, "a single tick must not be enough -- the grace window needs a second look"
+
+        orch.tick()
+
+        assert orch._running is False, "the run must self-stop once the wedge is confirmed, not idle forever"
+        assert orch._progress_stall_stopped is True
+        assert failed_task_ids == ["claimed-1"], "the wedged claim, and only the wedged claim, must be failed"
+        assert failed_reasons == [PROGRESS_STUCK_CLAIM_FAIL_REASON]
+        assert orch._closure_outcome == RunClosureOutcome.FAILED
+
+        retro_content = (tmp_path / ".sdd" / "runtime" / "retrospective.md").read_text()
+        assert "**Verdict:** UNHEALTHY" in retro_content
+
+    def test_holds_still_defer_the_progress_stall(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An active hold outranks the progress-stall backstop, exactly like the zero-terminal one."""
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done_1 = _make_task(id="done-1", status="done")
+        claimed = _make_task(id="claimed-1", status="claimed")
+        claimed.assigned_agent = "ghost-agent-does-not-exist"
+        fixed_tasks = [_task_as_dict(t) for t in (done_1, claimed)]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/tasks":
+                return httpx.Response(200, json=list(fixed_tasks))
+            if request.method == "GET" and request.url.path == "/orchestrator/holds":
+                return httpx.Response(
+                    200,
+                    json={"holds": [{"id": "hold-1", "reason": "dashboard review in progress"}]},
+                )
+            return httpx.Response(200, json={})
+
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+            stalled_run_grace_s=0.0,
+            stalled_run_ticks=1,
+        )
+        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=cfg)
+        orch._running = True
+
+        orch.tick()
+        orch.tick()
+
+        assert orch._running is True, "an active hold must keep the run alive even once the wedge is confirmed"
+        assert orch._progress_stall_stopped is False
 
 
 # --- DryRun ---
