@@ -205,6 +205,40 @@ def test_merged_work_reaches_the_changes_section(tmp_path: Path) -> None:
     assert "_No changes recorded for this session._" not in changes
 
 
+def test_completed_task_titles_and_summaries_reach_the_changes_section(tmp_path: Path) -> None:
+    """The run's own journal, not a task server that may have stopped, names the work."""
+    record_run_goal(tmp_path, GOAL)
+    _write_run_dir(
+        tmp_path,
+        rows=(
+            {"event": "run_started", "run_id": RUN_ID, "git_branch": "agent/run-1"},
+            {
+                "event": "task_merged",
+                "task_id": "T-42",
+                "agent_id": "eng-1",
+                "title": "Fix the flaky retry loop",
+                "result_summary": "Added a jittered backoff to the retry loop",
+            },
+            {
+                "event": "task_merged",
+                "task_id": "T-43",
+                "agent_id": "eng-2",
+                "title": "Cover the retry loop with a regression test",
+                "result_summary": "Added test_retry_backoff_is_jittered",
+            },
+        ),
+    )
+
+    body = build_pr_body(load_session_summary(None, workdir=tmp_path))
+    changes = body.split("## Change", 1)[1].split("## Verification", 1)[0]
+
+    assert "Fix the flaky retry loop" in changes
+    assert "Added a jittered backoff to the retry loop" in changes
+    assert "Cover the retry loop with a regression test" in changes
+    assert "Added test_retry_backoff_is_jittered" in changes
+    assert "No tasks completed this session" not in body
+
+
 def test_the_projected_event_names_match_the_journal_writers() -> None:
     """``pr_gen`` names these events itself; drift would empty the section."""
     from bernstein.core.integrations import pr_gen

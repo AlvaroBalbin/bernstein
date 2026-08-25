@@ -392,7 +392,14 @@ def list_board_runs(sdd_dir: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def record_task_merged(recorder: EventJournal | None, *, task_id: str, agent_id: str | None) -> None:
+def record_task_merged(
+    recorder: EventJournal | None,
+    *,
+    task_id: str,
+    agent_id: str | None,
+    title: str = "",
+    result_summary: str = "",
+) -> None:
     """Record a ``task_merged`` event into the run journal.
 
     Called by the task lifecycle right after a verified task's work is
@@ -400,14 +407,27 @@ def record_task_merged(recorder: EventJournal | None, *, task_id: str, agent_id:
     board's ``merged`` column projects from. ``None`` *recorder* is a
     no-op so detached callers and minimal test harnesses need no journal.
 
+    ``title`` and ``result_summary`` are carried along so a pull-request
+    body can name what the task was and what it did without going back to
+    the task server, which may already be stopped by the time one is
+    opened.
+
     Args:
         recorder: The run's :class:`EventJournal` (or ``None``).
         task_id: The merged task's identifier.
         agent_id: The producing agent session id, when known.
+        title: The task's title, when known.
+        result_summary: What the agent reported on completion, when known.
     """
     if recorder is None:
         return
-    recorder.record(EVENT_TASK_MERGED, task_id=task_id, agent_id=agent_id)
+    recorder.record(
+        EVENT_TASK_MERGED,
+        task_id=task_id,
+        agent_id=agent_id,
+        title=title,
+        result_summary=result_summary,
+    )
 
 
 # ---------------------------------------------------------------------------

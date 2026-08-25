@@ -264,12 +264,16 @@ class MergedChange:
 
     Attributes:
         task_id: The task that was merged.
+        title: The task's title, or ``""`` when the journal predates it.
+        result_summary: What the agent reported on completion, or ``""``.
         files: Files its captured diff touched (0 when none was captured).
         added: Lines added by that diff.
         removed: Lines removed by that diff.
     """
 
     task_id: str
+    title: str = ""
+    result_summary: str = ""
     files: int = 0
     added: int = 0
     removed: int = 0
@@ -883,7 +887,11 @@ def _format_merged_changes(merged: tuple[MergedChange, ...]) -> str:
             counts = f"{change.files} file{plural}, +{change.added}/-{change.removed}"
         else:
             counts = "no diff captured"
-        lines.append(f"- `{change.task_id}` - {counts}")
+        label = f"`{change.task_id}` {change.title}".rstrip() if change.title else f"`{change.task_id}`"
+        line = f"- {label} - {counts}"
+        if change.result_summary:
+            line += f" - {change.result_summary}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -1319,10 +1327,12 @@ def _run_dir(root: Path, session_id: str | None) -> Path | None:
 def _merged_changes_from_journal(run_dir: Path) -> tuple[MergedChange, ...]:
     """Project the run journal's merge rows into per-task change records.
 
-    ``task_merged`` says which tasks landed; ``task_diff_captured`` carries
-    the size of the diff each one produced. Reading them here means the
-    Changes section describes what the run actually merged rather than
-    whatever ``git diff`` happens to still show.
+    ``task_merged`` says which tasks landed, with their title and result
+    summary; ``task_diff_captured`` carries the size of the diff each one
+    produced. Reading them here means the Changes section describes what
+    the run actually merged rather than whatever ``git diff`` happens to
+    still show, or a task-server query that may find nothing once the
+    server has stopped.
 
     Args:
         run_dir: The run's directory under ``.sdd/runs/``.
@@ -1338,6 +1348,7 @@ def _merged_changes_from_journal(run_dir: Path) -> tuple[MergedChange, ...]:
         return ()
 
     merged_order: list[str] = []
+    merged_info: dict[str, tuple[str, str]] = {}
     diffs: dict[str, tuple[int, int, int]] = {}
     for line in lines:
         if not line.strip():
@@ -1353,8 +1364,10 @@ def _merged_changes_from_journal(run_dir: Path) -> tuple[MergedChange, ...]:
         if not isinstance(task_id, str) or not task_id:
             continue
         event = typed.get("event")
-        if event == _EVENT_TASK_MERGED and task_id not in merged_order:
-            merged_order.append(task_id)
+        if event == _EVENT_TASK_MERGED:
+            if task_id not in merged_order:
+                merged_order.append(task_id)
+            merged_info[task_id] = (str(typed.get("title") or ""), str(typed.get("result_summary") or ""))
         elif event == _EVENT_TASK_DIFF_CAPTURED:
             diffs[task_id] = (
                 _as_count(typed.get("diff_files")),
@@ -1365,7 +1378,17 @@ def _merged_changes_from_journal(run_dir: Path) -> tuple[MergedChange, ...]:
     changes: list[MergedChange] = []
     for task_id in merged_order:
         files, added, removed = diffs.get(task_id, (0, 0, 0))
-        changes.append(MergedChange(task_id=task_id, files=files, added=added, removed=removed))
+        title, result_summary = merged_info.get(task_id, ("", ""))
+        changes.append(
+            MergedChange(
+                task_id=task_id,
+                title=title,
+                result_summary=result_summary,
+                files=files,
+                added=added,
+                removed=removed,
+            )
+        )
     return tuple(changes)
 
 

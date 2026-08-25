@@ -3600,7 +3600,13 @@ def _reap_and_cleanup_session(
         # issue #2365: chain the merge decision into the run journal so the
         # review board's merged column is a projection of the journal, not a
         # side inference. No-op when the orchestrator has no recorder.
-        record_task_merged(getattr(orch, "_recorder", None), task_id=task.id, agent_id=session.id)
+        record_task_merged(
+            getattr(orch, "_recorder", None),
+            task_id=task.id,
+            agent_id=session.id,
+            title=getattr(task, "title", "") or "",
+            result_summary=getattr(task, "result_summary", "") or "",
+        )
 
     # issue #2559: reconcile what the task declared it would produce against what
     # this run's spine actually carries, and record an artifact-keyed attempt for
