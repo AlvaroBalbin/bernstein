@@ -64,6 +64,12 @@ from bernstein.core.replay.journal import (
     run_journal_path,
     verify_events,
 )
+from bernstein.core.security.key_derivation import (
+    DOMAIN_LINEAGE,
+    SCHEME_V1,
+    SCHEME_V2,
+    domain_tag,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -415,6 +421,12 @@ def _walk_spine_rows(rows: list[dict[str, Any]]) -> tuple[str, int | None, str]:
             return prev, i, f"spine entry {i}: missing fields {sorted(missing)}"
         if str(row["prev_hash"]) != prev:
             return prev, i, f"spine entry {i}: prev_hash break"
+        # v2 entries hash a domain-tagged preimage; v1 entries (no ``v`` or
+        # ``v: 1``) hash the bare preimage.
+        entry_version = row.get("v")
+        if entry_version not in (None, SCHEME_V1, SCHEME_V2):
+            return prev, i, f"spine entry {i}: unsupported scheme version {entry_version!r}"
+        hash_prefix = domain_tag(DOMAIN_LINEAGE, SCHEME_V2) if entry_version == SCHEME_V2 else ""
         try:
             expected = compute_entry_hash(
                 prev_hash=str(row["prev_hash"]),
@@ -427,6 +439,7 @@ def _walk_spine_rows(rows: list[dict[str, Any]]) -> tuple[str, int | None, str]:
                 traceparent=row.get("traceparent"),
                 tracestate=row.get("tracestate"),
                 baggage=row.get("baggage"),
+                domain_prefix=hash_prefix,
             )
         except (TypeError, ValueError):
             return prev, i, f"spine entry {i}: unhashable field types"

@@ -33,6 +33,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from bernstein.core.security.key_derivation import (
+    DOMAIN_AUDIT,
+    SCHEME_V1,
+    SCHEME_V2,
+    derive_store_key,
+    domain_tag,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -345,11 +353,51 @@ class AuditEvent:
     details: dict[str, Any] = field(default_factory=_empty_details)
     prev_hmac: str = _GENESIS_HMAC
     hmac: str = ""
+    scheme: int | None = None
 
 
-def _compute_hmac(key: bytes, prev_hmac: str, entry: dict[str, Any]) -> str:
-    """Compute HMAC-SHA256 over the previous HMAC concatenated with the canonical JSON payload."""
-    payload = prev_hmac + json.dumps(entry, sort_keys=True)
+def _scheme_material(key: bytes, scheme: Any) -> tuple[bytes, str] | None:
+    """The MAC key and domain prefix a scheme authenticates with.
+
+    ``None`` means the scheme is unknown to this build. An unknown scheme is
+    never treated as v1: the verifier could not pick the right key, so it
+    cannot authenticate the record and must say so rather than guess.
+
+    Every verifier resolves the scheme through here. A scheme that
+    authenticates on one code path and not on another is indistinguishable
+    from tampering to whoever reads the result.
+    """
+    if scheme == SCHEME_V2:
+        return derive_store_key(key, DOMAIN_AUDIT), domain_tag(DOMAIN_AUDIT, SCHEME_V2)
+    if scheme == SCHEME_V1:
+        return key, ""
+    return None
+
+
+def expected_entry_hmac(key: bytes, prev_hmac: str, entry: dict[str, Any]) -> str | None:
+    """The HMAC *entry* must carry to be authentic, or ``None`` for an unknown scheme.
+
+    ``prev_hmac`` is the caller's, not the entry's: a chain verifier
+    authenticates against the head it has walked to, while a local record
+    check passes the predecessor the record itself names. Any ``hmac`` already
+    on *entry* is excluded from the preimage.
+    """
+    material = _scheme_material(key, entry.get("scheme", SCHEME_V1))
+    if material is None:
+        return None
+    verify_key, verify_prefix = material
+    body = {k: v for k, v in entry.items() if k != "hmac"}
+    return _compute_hmac(verify_key, prev_hmac, body, domain_prefix=verify_prefix)
+
+
+def _compute_hmac(key: bytes, prev_hmac: str, entry: dict[str, Any], domain_prefix: str = "") -> str:
+    """Compute HMAC-SHA256 over the previous HMAC concatenated with the canonical JSON payload.
+
+    ``domain_prefix`` is prepended to the payload before the HMAC when
+    non-empty (scheme v2 domain separation); for v1 entries it is empty and
+    the output is byte-identical to the legacy behaviour.
+    """
+    payload = domain_prefix + prev_hmac + json.dumps(entry, sort_keys=True)
     return _hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
 
 
@@ -728,6 +776,22 @@ def _verify_log_bytes(
             )
             continue
         entry = cast("dict[str, Any]", parsed_entry)
+        # Scheme v2 entries carry a ``scheme`` field and are MAC'd with the
+        # HKDF-derived per-store key and a domain-tagged preimage; v1 entries
+        # (no ``scheme`` field, or ``scheme: 1``) use the raw key with no
+        # domain prefix. The scheme stays in the entry so the canonical-byte
+        # check below and the HMAC computation both cover it.
+        scheme = entry.get("scheme", SCHEME_V1)
+        material = _scheme_material(key, scheme)
+        if material is None:
+            _fail(
+                line_no,
+                line_offset,
+                len(raw_line),
+                "unsupported_scheme",
+                (f"{display_name}:{line_no}: unsupported audit scheme {scheme!r}",),
+            )
+            continue
 
         # Tamper-evidence beyond JSON: ``json.loads`` accepts incidental
         # whitespace (e.g. a trailing ``\r`` after ``}``) which would
@@ -758,7 +822,8 @@ def _verify_log_bytes(
                 f"{display_name}:{line_no}: prev_hmac mismatch (expected {prev_hmac[:16]}…, got {entry_prev[:16]}…)"
             )
 
-        expected_hmac = _compute_hmac(key, prev_hmac, entry)
+        verify_key, verify_prefix = material
+        expected_hmac = _compute_hmac(verify_key, prev_hmac, entry, domain_prefix=verify_prefix)
         if not _hmac.compare_digest(stored_hmac, expected_hmac):
             line_messages.append(
                 f"{display_name}:{line_no}: HMAC mismatch (expected {expected_hmac[:16]}…, got {stored_hmac[:16]}…)"
@@ -830,7 +895,7 @@ def _read_archived_segment(gz_path: Path, errors: list[str]) -> bytes | None:
         return None
 
 
-def _record_is_locally_valid(key: bytes, entry: dict[str, Any]) -> bool:
+def _record_is_locally_valid(key: bytes, entry: dict[str, Any], scheme: int | None = None) -> bool:
     """Whether *entry*'s stored ``hmac`` matches its own stated ``prev_hmac``.
 
     A *local* check: it authenticates the record against the predecessor the
@@ -839,9 +904,21 @@ def _record_is_locally_valid(key: bytes, entry: dict[str, Any]) -> bool:
     producing a matching MAC requires the audit key. It deliberately does not
     prove the stated predecessor is the true chain head - that is ``verify``'s
     job - only that the record was minted by a key holder.
+
+    The key and domain prefix are chosen from the entry's ``scheme`` field
+    (v2 uses the HKDF-derived per-store key and a domain-tagged preimage; v1
+    uses the raw key with no prefix). ``scheme`` may be overridden to force a
+    specific scheme, which chain recovery uses to try both v1 and v2.
     """
+    if scheme is None:
+        scheme = entry.get("scheme", SCHEME_V1)
+    material = _scheme_material(key, scheme)
+    if material is None:
+        # An unknown scheme cannot be authenticated, so it is never valid.
+        return False
+    verify_key, verify_prefix = material
     body = {k: v for k, v in entry.items() if k != "hmac"}
-    expected = _compute_hmac(key, str(entry.get("prev_hmac", "")), body)
+    expected = _compute_hmac(verify_key, str(entry.get("prev_hmac", "")), body, domain_prefix=verify_prefix)
     return _hmac.compare_digest(str(entry.get("hmac", "")), expected)
 
 
@@ -902,8 +979,14 @@ def _chain_tail_from_bytes(raw_bytes: bytes, key: bytes | None = None) -> str | 
             continue
         if "hmac" not in entry:
             continue
-        if key is not None and not _record_is_locally_valid(key, entry):
-            continue
+        if key is not None:
+            # Try both schemes so recovery accepts a v1 or v2 tip regardless of
+            # whether the entry carries a ``scheme`` field; prefer v2 when both
+            # match (the stored hmac is identical either way).
+            valid_v1 = _record_is_locally_valid(key, entry, scheme=SCHEME_V1)
+            valid_v2 = _record_is_locally_valid(key, entry, scheme=SCHEME_V2)
+            if not (valid_v1 or valid_v2):
+                continue
         return str(entry["hmac"])
     return None
 
@@ -1353,6 +1436,7 @@ def _event_to_row(event: AuditEvent) -> dict[str, Any]:
         "details": event.details,
         "prev_hmac": event.prev_hmac,
         "hmac": event.hmac,
+        "scheme": event.scheme,
     }
 
 
@@ -1366,6 +1450,7 @@ def _row_to_event(row: dict[str, Any]) -> AuditEvent:
         details=row.get("details", {}),
         prev_hmac=row.get("prev_hmac", ""),
         hmac=row.get("hmac", ""),
+        scheme=row.get("scheme"),
     )
 
 
@@ -1441,6 +1526,7 @@ def _events_from_text(
                 details=entry.get("details", {}),
                 prev_hmac=entry.get("prev_hmac", ""),
                 hmac=entry.get("hmac", ""),
+                scheme=entry.get("scheme"),
             )
         )
     return events
@@ -1529,6 +1615,10 @@ class AuditLog:
             self._key = key
         else:
             self._key = load_or_create_audit_key(key_path)
+        # Scheme v2 entries are MAC'd with an HKDF-derived per-store key and a
+        # domain-tagged preimage; v1 entries keep the raw key with no prefix.
+        # ``self._key`` stays the raw master key for v1 backward compatibility.
+        self._derived_key = derive_store_key(self._key, DOMAIN_AUDIT)
         self._prev_hmac = self._recover_chain_tail()
         # Tracks the day file and its identity+length stamp after this
         # instance's last append, so ``log`` can skip re-reading the tail from
@@ -1728,8 +1818,14 @@ class AuditLog:
             "resource_id": resource_id,
             "details": details,
             "prev_hmac": self._prev_hmac,
+            "scheme": SCHEME_V2,
         }
-        computed_hmac = _compute_hmac(self._key, self._prev_hmac, entry_dict)
+        computed_hmac = _compute_hmac(
+            self._derived_key,
+            self._prev_hmac,
+            entry_dict,
+            domain_prefix=domain_tag(DOMAIN_AUDIT, SCHEME_V2),
+        )
         entry_dict["hmac"] = computed_hmac
         event = AuditEvent(
             timestamp=ts,
@@ -1740,6 +1836,7 @@ class AuditLog:
             details=details,
             prev_hmac=self._prev_hmac,
             hmac=computed_hmac,
+            scheme=SCHEME_V2,
         )
         return event, json.dumps(entry_dict, sort_keys=True) + "\n"
 
