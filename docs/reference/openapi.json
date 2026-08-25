@@ -3706,63 +3706,6 @@
         }
       }
     },
-    "/dashboard": {
-      "get": {
-        "summary": "Dashboard Page",
-        "description": "Serve the single-page web dashboard.",
-        "operationId": "dashboard_page_dashboard_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/dashboard/static/{asset_name}": {
-      "get": {
-        "summary": "Dashboard Static Asset",
-        "description": "Serve allow-listed static assets used by the web dashboard.",
-        "operationId": "dashboard_static_asset_dashboard_static__asset_name__get",
-        "parameters": [
-          {
-            "name": "asset_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Asset Name"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/dashboard/data": {
       "get": {
         "summary": "Dashboard Data",
@@ -12516,63 +12459,6 @@
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dashboard": {
-      "get": {
-        "summary": "Dashboard Page",
-        "description": "Serve the single-page web dashboard.",
-        "operationId": "dashboard_page_api_v1_dashboard_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dashboard/static/{asset_name}": {
-      "get": {
-        "summary": "Dashboard Static Asset",
-        "description": "Serve allow-listed static assets used by the web dashboard.",
-        "operationId": "dashboard_static_asset_api_v1_dashboard_static__asset_name__get",
-        "parameters": [
-          {
-            "name": "asset_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Asset Name"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
               }
             }
           }

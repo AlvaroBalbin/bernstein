@@ -113,7 +113,7 @@ for a simple goal.
 ```bash
 bernstein status     # one-shot snapshot
 bernstein live       # full TUI dashboard (attach to a running session)
-bernstein dashboard  # opens http://127.0.0.1:8052/dashboard in your browser
+bernstein gui serve  # opens http://127.0.0.1:8052/ui/ in your browser
 ```
 
 `bernstein status` output looks like:

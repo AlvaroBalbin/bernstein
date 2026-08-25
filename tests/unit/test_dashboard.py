@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,8 +21,6 @@ from bernstein.cli.dashboard import (
     _summarize_agent_errors,
     _task_retry_count,
 )
-from bernstein.core.defaults import DASHBOARD_STATIC_ASSETS
-from bernstein.core.routes import status_dashboard
 from bernstein.core.routes.route_table import iter_route_paths
 from bernstein.core.server import create_app
 
@@ -58,85 +55,21 @@ async def client(app) -> AsyncClient:  # type: ignore[no-untyped-def]
         yield c  # type: ignore[misc]
 
 
-# -- GET /dashboard ---------------------------------------------------------
+# -- GET /dashboard (legacy route removed in #4395) --------------------------
 
 
 @pytest.mark.anyio
-async def test_dashboard_returns_200(client: AsyncClient) -> None:
-    """GET /dashboard returns 200 with HTML content."""
+async def test_legacy_dashboard_route_is_removed(client: AsyncClient) -> None:
+    """GET /dashboard is removed in favor of /ui and returns 404."""
     resp = await client.get("/dashboard")
-    assert resp.status_code == 200
-    assert "text/html" in resp.headers["content-type"]
-
-
-@pytest.mark.anyio
-async def test_dashboard_contains_key_elements(client: AsyncClient) -> None:
-    """Dashboard HTML contains the task table, agent section, and stats bar."""
-    resp = await client.get("/dashboard")
-    html = resp.text
-    assert "Bernstein" in html
-    assert "task" in html.lower()
-    assert "agent" in html.lower()
-    assert "cost" in html.lower() or "stat" in html.lower()
-
-
-@pytest.mark.anyio
-async def test_dashboard_contains_script(client: AsyncClient) -> None:
-    """Dashboard HTML includes JavaScript for auto-refresh."""
-    resp = await client.get("/dashboard")
-    html = resp.text
-    assert "<script" in html.lower()
-
-
-@pytest.mark.anyio
-async def test_dashboard_static_asset_is_served_from_package(client: AsyncClient) -> None:
-    """Dashboard static assets are served from an explicit allow-list."""
-    resp = await client.get("/dashboard/static/alpinejs-3.14.8.min.js")
-    assert resp.status_code == 200
-    assert "application/javascript" in resp.headers["content-type"]
-    assert resp.headers["x-content-type-options"] == "nosniff"
-    assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
-    assert "Alpine" in resp.text
-
-
-def test_dashboard_static_asset_metadata_is_immutable() -> None:
-    """Dashboard static asset metadata cannot be mutated in process."""
-    asset = DASHBOARD_STATIC_ASSETS["alpinejs-3.14.8.min.js"]
-
-    with pytest.raises(FrozenInstanceError):
-        asset.file_name = "mutated.js"
-
-
-@pytest.mark.anyio
-async def test_unknown_dashboard_static_asset_returns_404(client: AsyncClient) -> None:
-    """Unknown dashboard static assets are not resolved from arbitrary paths."""
-    resp = await client.get("/dashboard/static/missing.js")
     assert resp.status_code == 404
 
 
 @pytest.mark.anyio
-async def test_missing_packaged_dashboard_static_asset_returns_404(
-    client: AsyncClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Known dashboard assets return 404 when the packaged file is absent."""
-    monkeypatch.setattr(status_dashboard, "STATIC_DIR", tmp_path)
-
+async def test_legacy_dashboard_static_route_is_removed(client: AsyncClient) -> None:
+    """GET /dashboard/static/... is removed and returns 404."""
     resp = await client.get("/dashboard/static/alpinejs-3.14.8.min.js")
-
     assert resp.status_code == 404
-
-
-@pytest.mark.anyio
-async def test_dashboard_contains_cost_analytics_sections(client: AsyncClient) -> None:
-    """Dashboard HTML exposes the cost analytics view required by WEB-016."""
-    resp = await client.get("/dashboard")
-    html = resp.text
-    assert "Cost by Model" in html
-    assert "Cost Over Time" in html
-    assert "By Agent" in html
-    assert "budget" in html.lower()
 
 
 # -- GET /events (SSE) ------------------------------------------------------

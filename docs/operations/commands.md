@@ -65,7 +65,7 @@ For session monitoring commands (`live`, `dashboard`, `status`, `ps`, `cost`, `d
 
 ```bash
 bernstein live       # TUI dashboard
-bernstein dashboard  # web dashboard
+bernstein gui serve  # web GUI
 bernstein status     # task summary
 bernstein ps         # running agents (PID files + a live process-table cross-check, so it still lists survivors after stop --force removed the PID files)
 bernstein cost       # spend by model/task

@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any
 
 import click
-import httpx
 
 from bernstein.cli.helpers import (
     ServerAuthError,
@@ -177,64 +176,16 @@ def _build_live_splash_context(seed_path: Path | None, seed_cfg: Any) -> dict[st
 # ---------------------------------------------------------------------------
 
 
-@click.command("dashboard")
-@click.option("--port", default=8052, show_default=True, help="Server port.")
-@click.option("--no-open", is_flag=True, default=False, help="Do not open browser.")
-def dashboard(port: int, no_open: bool) -> None:
-    """Open the web dashboard in your browser.
-
-    Requires the Bernstein server to be running. If it is not,
-    prints instructions on how to start it.
-    """
-    import webbrowser
-
-    url = f"http://localhost:{port}/dashboard"
-    # Check if server is alive
-    try:
-        resp = httpx.get(f"http://localhost:{port}/health", timeout=2.0)
-        if resp.status_code != 200:
-            console.print(
-                f"[red]Server returned {resp.status_code}.[/red]\nStart the server first: [cyan]bernstein run[/cyan]"
-            )
-            sys.exit(1)
-    except httpx.ConnectError:
-        console.print(
-            "[red]Cannot connect to Bernstein server.[/red]\n"
-            f"Start the server first: [cyan]bernstein run[/cyan]\n"
-            f"Then open: [link={url}]{url}[/link]"
-        )
-        sys.exit(1)
-
-    # Probe /dashboard exactly as a browser would (no Authorization header). A
-    # detached run gates every non-public route behind an auto-generated Bearer
-    # token that a plain browser navigation cannot supply, so opening the URL
-    # would dead-end on a raw 401 JSON body. Guide the operator to a surface
-    # that authenticates on its own instead of launching a broken page (#2794).
-    try:
-        probe = httpx.get(url, timeout=2.0)
-        browser_reachable = probe.status_code != 401
-    except httpx.HTTPError:
-        # Probe failure is inconclusive; fall through to the normal open path
-        # rather than blocking on a transient error.
-        browser_reachable = True
-
-    if not browser_reachable:
-        from bernstein.core.defaults import SDD_AUTH_TOKEN
-
-        console.print(
-            "[yellow]The web dashboard requires authentication a browser cannot supply on its own.[/yellow]\n"
-            "This run auto-generated a Bearer token, so a plain browser navigation to the dashboard is "
-            "rejected with 401.\n"
-            "Use the terminal dashboard instead: [cyan]bernstein live[/cyan] (or [cyan]bernstein status[/cyan]), "
-            "which authenticate automatically from this workspace.\n"
-            f"The run token lives in [cyan]{SDD_AUTH_TOKEN}[/cyan] if you front the server with your own "
-            "authenticating proxy."
-        )
-        sys.exit(1)
-
-    console.print(f"[green]Dashboard:[/green] [link={url}]{url}[/link]")
-    if not no_open:
-        webbrowser.open(url)
+@click.command("dashboard", hidden=True)
+def dashboard() -> None:
+    """The legacy dashboard has been removed in favor of 'bernstein gui serve' (#4395)."""
+    console.print(
+        "[yellow]'bernstein dashboard' has been removed in favor of the GUI surface.[/yellow]\n"
+        "Run [cyan]bernstein gui serve[/cyan] to open the maintained web UI at [cyan]/ui[/cyan].\n"
+        "Note: Requires the GUI extra: [cyan]pip install 'bernstein\\[gui]'[/cyan]\n"
+        "(or [cyan]uv add 'bernstein\\[gui]'[/cyan])."
+    )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

@@ -337,7 +337,7 @@ hand-assembled as a request with a bearer header.
 |---|---|---|
 | `bernstein status` | Task summary + agent health. | `cli/commands/status_cmd.py:147` |
 | `bernstein live` | Interactive Textual TUI dashboard. | `cli/commands/advanced_cmd.py:47` |
-| `bernstein dashboard` | Open the web dashboard. | `cli/commands/advanced_cmd.py:180` |
+| `bernstein gui serve` | Serve the maintained web GUI at `/ui`. | `gui/cli.py` |
 | `bernstein ps` | Running agent processes. | `cli/commands/status_cmd.py:241` |
 | `bernstein watch` | Stream task events. | `cli/watch_cmd.py:252` |
 | `bernstein logs` | Tail agent logs (group). | `cli/logs_group_cmd.py:45` |
@@ -376,13 +376,6 @@ The default is the 3-column Textual TUI: Agents | Tasks | Activity feed. `--clas
 Both views resolve the task server the same way as the rest of the CLI: `BERNSTEIN_SERVER_URL`, then the port the running orchestrator persisted in `.sdd/runtime/server.port`, then `http://localhost:8052`. When the poll cannot reach that server the header says `No connection to <url>` rather than drawing empty panels, which would be indistinguishable from an orchestrator with nothing to do. That state means *every* read failed: one route erroring while the others answer is a broken route, not a dead server, so the dashboard keeps rendering the panels that did load.
 
 The run token the orchestrator persists under `.sdd/runtime` is only ever sent to a loopback address: it is a credential this machine minted for its own run, and `BERNSTEIN_SERVER_URL` can name any host. A token you set in `BERNSTEIN_AUTH_TOKEN` yourself goes wherever you point the dashboard.
-
-#### `bernstein dashboard`
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--port N` | 8052 | Server port. |
-| `--no-open` | off | Do not open the browser. |
 
 #### `bernstein logs`
 

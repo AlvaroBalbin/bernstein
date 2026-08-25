@@ -443,7 +443,6 @@ def print_rich_help() -> None:
             "monitor",
             [
                 ("live", "interactive TUI dashboard (2 columns + activity panel)"),
-                ("dashboard", "open web dashboard in browser"),
                 ("status", "task summary and agent health"),
                 ("ps", "running agent processes"),
                 ("cost", "spend breakdown by model and task"),
